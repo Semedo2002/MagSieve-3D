@@ -3,11 +3,11 @@
 # Parametric sweeps to prove the linear relationship between B_crit and
 # the impulsive hydrodynamic growth velocity.
 #
-# Strategy for ~15 min/run on Quadro P1000:
+# outcomes from ~18 min/run on Quadro P1000:
 #   - Sweep runs use 200x100 resolution (~3-4 min each)
 #   - Bisection search for B_crit (4-5 iterations per parameter point)
 #   - Total: ~30 runs = ~2 hours
-#   - Full-resolution showcase runs (400x200) for the 4 key cases
+#   - Full-resolution2 runs (400x200) for the 4 key cases
 
 import time
 import os
