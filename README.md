@@ -27,6 +27,8 @@ This solver provides the computational proof for the Magnetic Sieve Scaling Law.
 The critical locking threshold is defined by the balance of local Alfvén velocity and the impulsive hydrodynamic growth rate:
 
 $$B_{critical} = \Psi \cdot \sqrt{\rho_{avg}} \cdot (k_{int} \cdot \Delta U \cdot A^+ \cdot a_0^+)$$
+<img width="3600" height="540" alt="anim_jets" src="https://github.com/user-attachments/assets/94fc28d0-7cad-487b-a263-b43bd325f39d" />
+
 
 # V&V
 
