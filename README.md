@@ -1,5 +1,7 @@
 
 # MagSieve-3D
+<img width="3600" height="540" alt="anim_density" src="https://github.com/user-attachments/assets/d08222f1-6143-43a1-8ed0-2e1b94dce9d4" />
+
 3D Ideal Magnetohydrodynamics solver engineered in Python/CUDA. Designed specifically to simulate hypersonic shock interface interactions and verify the Magnetic Sieve scaling law for directional plasma transport.
 # MagSieve-3D: GPU-Accelerated MHD Solver
 
