@@ -198,7 +198,17 @@ class MHDSolver3D:
         self.U = prim_to_cons(W, cfg.gamma)
         self._inflow_U = self.U[:, :self.ng, :, :].copy()
         # in the shifted frame the upstream gas enters at x_max (supersonic for U > c_s upstream)
-        self._inflow_R = self.U[:, -self.ng:, :, :].copy() if cfg.frame_velocity > 0 else None
+        right_inflow = cfg.x_max_bc in ("inflow", "plateau") or (cfg.x_max_bc == "auto" and cfg.frame_velocity > 0)
+        if cfg.x_max_bc not in ("auto", "inflow", "transmissive", "plateau"):
+            raise ValueError(f"x_max_bc must be auto, inflow, transmissive or plateau, got {cfg.x_max_bc!r}")
+        self._plateau_captured = False
+        self._p_upstream = float(xp.mean(W[iPR, -self.ng - 1]))
+        if cfg.x_min_bc not in ("inflow", "plateau"):
+            raise ValueError(f"x_min_bc must be inflow or plateau, got {cfg.x_min_bc!r}")
+        self._left_captured = False
+        self._p_inflow = float(xp.mean(W[iPR, self.ng]))
+        self._inflow_R = self.U[:, -self.ng:, :, :].copy() if right_inflow else None
+        self._setup_sponge()
         if self._vz_pattern is not None:
             Win = cons_to_prim(self._inflow_U, cfg.gamma)
             Win[iVZ] = self._vz_pattern
@@ -206,6 +216,53 @@ class MHDSolver3D:
         self.t, self.step = 0.0, 0
         self._acc_boundary = xp.zeros(())
         self._acc_powell = xp.zeros(())
+
+    def _update_plateau(self):
+        """x_max_bc = "plateau": upstream inflow until the transmitted shock reaches x_max, then hold the
+        shocked state found just inside the domain (the exterior behind the departing shock).
+        x_min_bc = "plateau": the same at x_min for the reflected shock."""
+        ng = self.ng
+        if self.cfg.x_min_bc == "plateau" and not self._left_captured:
+            p_edge = float(xp.mean(cons_to_prim(self.U[:, ng:ng + 1], self.cfg.gamma)[iPR]))
+            if p_edge > 1.3 * self._p_inflow:
+                self._inflow_U = xp.repeat(self.U[:, ng + 9:ng + 10].copy(), ng, axis=1)
+                self._left_captured = True
+                self.left_plateau_time = self.t
+        if self.cfg.x_max_bc != "plateau" or self._plateau_captured:
+            return
+        p_edge = float(xp.mean(cons_to_prim(self.U[:, -ng - 1:-ng], self.cfg.gamma)[iPR]))
+        if p_edge > 3.0 * self._p_upstream:
+            plateau = self.U[:, -ng - 10:-ng - 9].copy()       # 10 cells behind the boundary
+            self._inflow_R = xp.repeat(plateau, ng, axis=1)
+            self._plateau_captured = True
+            self.plateau_time = self.t
+
+    def _setup_sponge(self):
+        """sigma(x): zero in the interior, rising quadratically to sponge_rate at each x end."""
+        cfg = self.cfg
+        self._sigma = None
+        if cfg.sponge_width <= 0 or cfg.sponge_rate <= 0:
+            return
+        x = self.x
+        d_left = (cfg.x_min + cfg.sponge_width - x) / cfg.sponge_width
+        d_right = (x - (cfg.x_max - cfg.sponge_width)) / cfg.sponge_width
+        depth = xp.clip(xp.maximum(d_left, d_right), 0.0, 1.0)
+        self._sigma = (cfg.sponge_rate * depth**2)[None, :, None, None]
+        self._U_mean = self.U.copy()
+        self._acc_sponge = xp.zeros(())
+
+    def _apply_sponge(self, dt):
+        """relax toward a running mean (time constant sponge_tau); energy removed is booked in the budget"""
+        if self._sigma is None:
+            return
+        a = min(dt / self.cfg.sponge_tau, 1.0)
+        self._U_mean += a * (self.U - self._U_mean)
+        self.U[...] = self._U_mean + (self.U - self._U_mean) * xp.exp(-self._sigma * dt)
+        ng = self.ng
+        I = (slice(ng, -ng),) * 3
+        dV = self.cfg.dx * self.cfg.dy * self.cfg.dz
+        # only interior cells enter the energy diagnostic
+        self._acc_sponge += (xp.sum(self.U[EN][I]) - xp.sum(self._U_before_sponge[EN][I])) * dV
 
     @staticmethod
     def _smooth_noise(rng, shape, kmax=6):
@@ -315,6 +372,10 @@ class MHDSolver3D:
         self.U[...] = U0 / 3 + 2.0 / 3.0 * (self.U_stage + dt * self.dU)
         rho = xp.maximum(self.U[RHO], FLOOR_RHO)
         self.U[RHOC] = rho * xp.clip(self.U[RHOC] / rho, 0.0, 1.0)
+        if self._sigma is not None:
+            self._U_before_sponge = self.U.copy()
+            self._apply_sponge(dt)
+        self._update_plateau()
         self.apply_bc(self.U)
         if self._ch > 0:
             h = min(self.cfg.dx, self.cfg.dy, self.cfg.dz)
@@ -370,6 +431,7 @@ class MHDSolver3D:
             "E": E,
             "inflow": float(self._acc_boundary),
             "powell": float(self._acc_powell),
+            "sponge": float(self._acc_sponge) if getattr(self, "_sigma", None) is not None else 0.0,
         }
 
     def _sheet_xmod(self, J, C):
@@ -440,5 +502,6 @@ class MHDSolver3D:
         return self.diag
 
     def energy_error(self):
+        """|E(t) - E(0) - boundary inflow - Powell - sponge| / E(0)"""
         d = self.diag
-        return abs(d["E"][-1] - d["E"][0] - d["inflow"][-1] - d["powell"][-1]) / abs(d["E"][0])
+        return abs(d["E"][-1] - d["E"][0] - d["inflow"][-1] - d["powell"][-1] - d["sponge"][-1]) / abs(d["E"][0])

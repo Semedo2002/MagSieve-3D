@@ -12,6 +12,12 @@ Expected tearing rate in the heavy gas: half-thickness a ~ 0.3, v_A = B0/sqrt(rh
 S_a = a v_A / eta ~ 26, gamma ~ S_a^(-1/2) v_A / a ~ 1.1 per unit time, i.e. ~5 e-foldings by t = 5
 (resistive spreading of the sheet, a^2 / eta ~ 4.5, competes with it).
 
+Boundaries: x_min_bc = x_max_bc = "plateau". Each end supplies the inflow state until the outgoing
+shock (reflected at x_min, transmitted at x_max) has left, then the shocked plateau behind it, i.e. the
+true exterior state. Fixed inflow states reflect those shocks (interface reversal at t ~ 3 in the
+first attempt); zero-gradient drains the subsonic shocked gas. A gate stops the sweep if the control's
+interface drifts by more than 0.25 over the run.
+
 Tearing signature: |J| along the sheets breaks up along x (J_xmod grows) in the z-invariant control
 as well (tearing is a 2D mode, k along B); a 3D effect is anything the seeded run adds beyond it.
 Results: experiments/data/exp_3d3.npz, exp_3d3.png.
@@ -43,13 +49,14 @@ T_END = 1.5 if args.quick else 5.0
 h = Lx / nx
 BASE = dict(nx=nx, ny=ny, nz=nz, x_max=Lx, y_max=Ly, z_max=Lz, t_end=T_END, cfl=0.3, mach=10.0,
             interface_x=4.0, perturbation_amp=0.02, perturbation_mode=4, density_ratio=3.0,
-            bc_x_type="inflow_outflow", diag_interval=20, B_modulation_mode=1)
+            bc_x_type="inflow_outflow", diag_interval=20, B_modulation_mode=1,
+            x_min_bc="plateau", x_max_bc="plateau")
 STRIPES = dict(B_field_type="striped", B_transverse=B0, eta_resistivity=ETA, frame_velocity=U_MHD)
 SEED = dict(z_pert_vel=0.01, z_pert_amp=0.005, z_pert_mode=4, z_pert_seed=1)
-CASES = {
-    "hydro 3D": dict(B_transverse=0.0, frame_velocity=U_HYD, **SEED),
+CASES = {                                       # control first: it gates the expensive runs
     "z-invariant": dict(**STRIPES, nz=4, z_max=4 * h),
     "stripes 3D": dict(**STRIPES, **SEED),
+    "hydro 3D": dict(B_transverse=0.0, frame_velocity=U_HYD, **SEED),
 }
 SNAP_T = tuple(np.round(np.linspace(T_END / 5, T_END, 5), 3))
 
@@ -65,6 +72,12 @@ for name, c in CASES.items():
     print(f"[3d3] {name:<12} {s.step} steps {time.time() - t0:.0f}s  energy error {d['energy_error']:.1e}  "
           f"interface x {d['x_int'][0]:.2f} -> {d['x_int'][-1]:.2f}", flush=True)
     del s
+    if name == "z-invariant":
+        t, xi = d["t"], d["x_int"]
+        drift = xi[-1] - xi[np.argmin(np.abs(t - 0.5))]
+        if abs(drift) > 0.25:
+            sys.exit(f"[3d3] gate failed: interface drifted {drift:+.2f} after t = 0.5; boundaries not clean")
+        print(f"[3d3] gate passed: interface drift {drift:+.3f} after t = 0.5", flush=True)
 
 os.makedirs(DATA, exist_ok=True)
 np.savez(os.path.join(DATA, "exp_3d3.npz"),

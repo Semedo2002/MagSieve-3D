@@ -90,6 +90,19 @@ class PhysicsConfig:
     # Galilean frame (solver3d): velocity subtracted from v_x everywhere; with frame_velocity > 0 the
     # x_max boundary becomes a fixed inflow of upstream gas moving at -frame_velocity
     frame_velocity: float = 0.0
+    # x_max boundary in solver3d: "auto" (upstream inflow when frame_velocity > 0, else transmissive),
+    # "inflow", "transmissive" or "plateau". In the co-moving frame use "plateau": upstream inflow until
+    # the transmitted shock arrives, then the shocked state behind it. Holding the upstream state
+    # reflects a compression; zero-gradient lets the subsonic shocked gas drain and sends a rarefaction.
+    x_max_bc: str = "auto"
+    # x_min boundary in solver3d: "inflow" (fixed post-shock inflow) or "plateau" (inflow until the
+    # reflected shock leaves through x_min, then the post-reflected state behind it)
+    x_min_bc: str = "inflow"
+    # absorbing layer (solver3d): over sponge_width at each x end, relax U toward a running time-average
+    # of the local state at rate sponge_rate * (depth into the layer)^2; damps waves, not the mean state
+    sponge_width: float = 0.0
+    sponge_rate: float = 0.0
+    sponge_tau: float = 0.5
     equilibrium_closure: str = "uniform_density"
     glm_ch: float = 0.0
     # GLM damping, psi *= exp(-glm_alpha * ch * dt / h). Values in [0, 1] keep the
