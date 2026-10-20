@@ -1,0 +1,6 @@
+* text=auto
+*.npz binary
+*.png binary
+*.gif binary
+*.docx binary
+*.vti binary

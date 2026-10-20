@@ -1,8 +1,8 @@
-# Magnetic sieve: striped magnetic fields and the Richtmyer-Meshkov instability
+# MagSieve-3D: striped magnetic fields and the Richtmyer-Meshkov instability
 
-A 2D compressible MHD solver (CuPy + a custom CUDA HLLD kernel) and the parameter study built on it. The study asks whether a spatially striped magnetic field can suppress ("lock") the Richtmyer-Meshkov instability of a shocked density interface while channelling the flow through the weak-field gaps.
+A 2D and 3D compressible MHD solver (CuPy + a custom CUDA HLLD kernel) and the parameter study built on it. The study asks whether a spatially striped magnetic field can suppress ("lock") the Richtmyer-Meshkov instability of a shocked density interface while channelling the flow through the weak-field gaps.
 
-**Result in one paragraph.** A uniform shock-parallel field locks the interface, in line with earlier work on magnetised RMI. Striped fields lock only when the bar/gap field contrast is small (about 10%). A shock-parallel field is not compressed by the shock while the gas is, so a striped field that is in pressure balance upstream produces a steady field-aligned shear downstream. Magnetic tension does not resist this shear, and it deforms the interface at the stripe scale. Suppression and collimation therefore work against each other in this regime. Aligning the stripe phase with the interface ripple produces a predictable zero crossing of the RMI mode, but not a lock. See `paper/` for the write-up and its limitations.
+**Result in one paragraph.** A uniform shock-parallel field locks the interface, in line with earlier work on magnetised RMI. Striped fields roughen the interface in proportion to their bar/gap contrast: the stripe-scale mode grows as a8 ~ 0.027 dP_B, converged over three resolutions. (An earlier "10% contrast" lock threshold did not survive the convergence study: it was measured against hydrodynamic enstrophy, which keeps growing with resolution.) A shock-parallel field is not compressed by the shock while the gas is, so a striped field that is in pressure balance upstream produces a steady field-aligned shear downstream. Magnetic tension does not resist this shear, and it deforms the interface at the stripe scale. Suppression and collimation therefore work against each other in this regime. Aligning the stripe phase with the interface ripple produces a predictable zero crossing of the RMI mode, but not a lock. In 3D, at the Lundquist number this grid resolves (S ~ 75), the field-aligned shear layers neither tear nor break down. See `paper/` for the 2D write-up and its limitations; the paper still states the superseded 10% threshold and is due for revision.
 
 ## Layout
 
@@ -21,13 +21,17 @@ paper/            figure and .docx generators, figures/, magnetic_sieve.docx
 rmi_output_gpu/   figures and GIFs written by the solver
 ```
 
-## Requirements
+## Installation
 
-An NVIDIA GPU with CUDA 12 and the packages in `requirements.txt`:
+An NVIDIA GPU with CUDA 12 is required.
 
 ```
-pip install -r requirements.txt
+pip install -e .                  # package + dependencies (pyproject.toml)
+pip install -e .[paper]          # also python-docx, for paper/make_paper.py
+pip install -r requirements.txt  # or the exact tested versions
 ```
+
+See `CONTRIBUTING.md` for the development workflow.
 
 ## Usage
 
@@ -127,5 +131,15 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 - Cell-centred magnetic field with GLM cleaning; the divergence error at shocks is a few percent (no constrained transport).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.
 - Shock-parallel stripes are restricted to the fast-shock regime, B0 < 6.55 sqrt(p_bar) at Mach 10; switch-on shocks are not modelled.
-- Most sweeps use one resolution and one realisation. Sweep G shows deep-stripe metrics are resolution sensitive; the hydrodynamic reference is converged.
+- Most sweeps use one resolution and one realisation. The lock boundary was rechecked at 2x and 4x resolution (`experiments/convergence_lock.py`): interface roughness converges, mixing-layer enstrophy of the hydrodynamic reference does not (no physical viscosity), so enstrophy ratios against hydro are not grid-converged.
 - The legacy campaign in `main.py --campaign` uses locking criteria (window enstrophy, raw gap/bar momentum) that this study found unreliable for MHD. It is kept for reference and should not be run as is.
+
+## Citation
+
+If you use this code or its results, please cite it; GitHub shows a "Cite this repository" button generated
+from `CITATION.cff`.
+
+## License
+
+No license has been chosen yet. Until one is added, the code is all rights reserved: you may read it, but
+not reuse, modify or redistribute it without the author's permission.

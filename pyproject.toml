@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "magsieve"
+version = "0.1.0"
+description = "GPU finite-volume MHD solver (HLLD, CUDA via CuPy) and the magnetic sieve / Richtmyer-Meshkov study"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Abdelrahman Shaltout" }]
+keywords = ["magnetohydrodynamics", "Richtmyer-Meshkov", "HLLD", "CUDA", "CuPy", "shock physics"]
+dependencies = [
+    "numpy>=1.26",
+    "cupy-cuda12x>=13",
+    "matplotlib>=3.8",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+paper = ["python-docx>=1.1"]
+
+[tool.setuptools]
+packages = ["sieve", "sieve.problems"]
+
+[tool.setuptools.package-data]
+sieve = ["hlld_kernel.cu"]
