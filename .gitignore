@@ -7,3 +7,4 @@ rmi_output_gpu/
 results/**/vtk/
 results/**/frames.npz
 results/rmi_mhd_quick/
+results/*_quick/
