@@ -6,6 +6,8 @@ authors:
   - family-names: Shaltout
     given-names: Abdelrahman
 version: 0.1.0
+repository-code: "https://github.com/Semedo2002/MagSieve-3D"
+url: "https://github.com/Semedo2002/MagSieve-3D"
 date-released: 2026-10-20
 abstract: >-
   GPU finite-volume MHD solver (HLLD Riemann solver in CUDA via CuPy, MUSCL, SSP-RK3, GLM divergence

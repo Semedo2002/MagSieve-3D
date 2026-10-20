@@ -597,11 +597,15 @@ para(
     "An enstrophy threshold measured against the hydrodynamic run therefore cannot converge."
 )
 para(
-    "The interface roughness does converge. The hydrodynamic value changes from 0.132 to 0.140 between the two "
-    "finest grids, and the striped values by at most 4%; relative to the hydrodynamic run they settle at 0.20, "
-    "0.25 and 0.32 for increasing contrast. The stripe-scale mode is proportional to the magnetic-pressure "
+    "The interface roughness of the hydrodynamic and striped runs converges. The hydrodynamic value changes from "
+    "0.132 to 0.140 between the two finest grids, and the striped values by at most 4%; relative to the "
+    "hydrodynamic run they settle at 0.20, 0.25 and 0.32 for increasing contrast. The uniform field is the "
+    "exception: its roughness keeps decreasing (0.0269, 0.0208, 0.0178, roughly first order), so the excess "
+    "roughness of the stripes over a uniform field widens with resolution, from 1.1-1.4 times at the base grid "
+    "to 1.6-2.5 times at the finest. The stripe-scale mode is proportional to the magnetic-pressure "
     "contrast at every resolution, a₈ = κΔP_B, with κ = 0.0176, 0.0250 and 0.0270 at the three grids. "
-    "Richardson extrapolation of κ (observed order 1.9) gives κ ≈ 0.028. This linear law, not a threshold, is "
+    "Richardson extrapolation of κ (observed order 1.9) gives κ ≈ 0.028, and even the small residual a₈ of the "
+    "nearly uniform field (ε = 0.99, ΔP_B = 0.09) follows it, with a₈/ΔP_B = 0.029. This linear law, not a threshold, is "
     "the converged statement of the trade-off: the interface deformation produced by the stripes scales with the "
     "contrast that makes them collimate."
 )
@@ -609,12 +613,12 @@ figure("fig13_convergence.png",
        "Figure 13. Grid convergence at 1×, 2× and 4× the base resolution. (a) Mixing-layer enstrophy: the "
        "hydrodynamic value keeps growing, the striped values do not. (b) Interface roughness, which converges. "
        "(c) Stripe-scale amplitude a₈ against the bar-gap magnetic-pressure contrast, with the least-squares "
-       "line a₈ = κΔP_B at each resolution. The uniform field and B₀ = 3 were not run at 4×.")
+       "line a₈ = κΔP_B at each resolution. B₀ = 3 was not run at 4×.")
 table("Table 2", "Interface roughness relative to the hydrodynamic run and stripe-scale amplitude at t = 0.8, at "
       "three resolutions. Dashes: not run at that resolution.",
       ["Field (B₀, ε)", "ΔP_B", "rough./hydro 1×", "2×", "4×", "a₈ (4×)",
        "a₈/ΔP_B (4×)"],
-      [["uniform, B = 3", "0.09", "0.274", "0.158", "-", "-", "-"],
+      [["uniform, B = 3", "0.09", "0.274", "0.158", "0.127", "0.0026", "0.029"],
        ["3, 0.9", "0.86", "0.310", "0.199", "-", "-", "-"],
        ["3.5, 0.9", "1.16", "0.298", "0.216", "0.204", "0.0315", "0.027"],
        ["4, 0.9", "1.52", "0.309", "0.253", "0.245", "0.0424", "0.028"],
@@ -656,8 +660,8 @@ para(
     "The results apply to ideal MHD with shock-parallel stripes, uniform upstream density, Mach 10, density "
     "ratio 3 and the fast-shock regime of Eq. (3); stronger fields with switch-on shocks, other closures and "
     "oblique fields were not examined. The convergence study covered the cases nearest the former boundary at "
-    "three resolutions, but the uniform-field reference was not run at the finest grid, the other sweeps used "
-    "one resolution, and all used one realisation; the zero-crossing times in particular are base-resolution "
+    "three resolutions, but the uniform-field roughness was still decreasing at the finest grid, the other "
+    "sweeps used one resolution, and all used one realisation; the zero-crossing times in particular are base-resolution "
     "values. Thresholds based on enstrophy would need a viscous treatment in which enstrophy converges. "
     "Divergence errors of a few percent remain at shocks because the scheme does not use constrained transport."
 )
@@ -688,9 +692,13 @@ para(
 
 heading("Code and data availability")
 para("The solver, sweeps A-H, the convergence study, the three-dimensional sweeps, saved time series and the "
-     "scripts that generate the figures and this document are available at [repository URL].")
+     "scripts that generate the figures and this document are available at https://github.com/Semedo2002/MagSieve-3D.",
+     align=WD_ALIGN_PARAGRAPH.LEFT)
 heading("Acknowledgements")
-para("[Computing resources, and any disclosure of tools used, as required by the target venue.]")
+para("The author thanks Professor Emeritus Kenneth Morgan (Swansea University) for sharing his work, which has "
+     "led the way towards a better future for computational fluid dynamics and computational engineering, and "
+     "for a mentorship that continued long beyond the author's time at Swansea University and into his "
+     "retirement. All simulations were run on the author's own workstation with a single NVIDIA GPU.")
 
 heading("References")
 refs = [

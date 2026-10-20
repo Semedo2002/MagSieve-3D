@@ -17,6 +17,9 @@ dependencies = [
     "pillow>=10",
 ]
 
+[project.urls]
+Repository = "https://github.com/Semedo2002/MagSieve-3D"
+
 [project.optional-dependencies]
 paper = ["python-docx>=1.1"]
 

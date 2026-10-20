@@ -3,6 +3,7 @@
     python experiments/convergence_lock.py --res 1 2      # 400x100 and 800x200 (~1.5 h)
     python experiments/convergence_lock.py --res 4        # 1600x400, boundary cases only (~7 h)
     python experiments/convergence_lock.py --summary      # table from saved results
+    python experiments/convergence_lock.py --res 4 --cases "uniform Bx=3" --merge   # add a case to saved results
 
 Cases straddle the boundary found in sweeps C/D at the base grid: uniform B = 3 (locked reference),
 B0 = 3 and 3.5 with eps = 0.9 (locked, 10%), B0 = 4 with eps = 0.9 (just failed, 10%), B0 = 3.5 with
@@ -62,6 +63,29 @@ def ratios(S):
     return out
 
 
+def export_csv(path):
+    """All cases and resolutions: absolute and hydro-relative enstrophy, roughness, a4, a8."""
+    import csv
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["resolution", "nx", "ny", "case", "dP_B", "emix", "emix_over_hydro", "roughness",
+                    "roughness_over_hydro", "a4", "a8", "a4_growth_over_hydro"])
+        for r in (1, 2, 4):
+            S = load(r)
+            if S is None:
+                continue
+            h = S["hydro"]
+            eh, rh = tail(h["emix"], h["t"]), h["rms"][-1]
+            gh = h["a"][-1] / h["a"][np.argmin(np.abs(h["t"] - 0.05))]
+            for n, d in S.items():
+                e = tail(d["emix"], d["t"])
+                g = d["a"][-1] / d["a"][np.argmin(np.abs(d["t"] - 0.05))]
+                w.writerow([f"{r}x", 400 * r, 100 * r, n, "" if n == "hydro" else f"{contrast(n):.4f}",
+                            f"{e:.6g}", f"{e / eh:.6g}", f"{d['rms'][-1]:.6g}", f"{d['rms'][-1] / rh:.6g}",
+                            f"{d['m4'][-1]:.6g}", f"{d['m8'][-1]:.6g}", f"{g / gh:.6g}"])
+
+
 def summary():
     data = {r: load(r) for r in (1, 2, 4)}
     data = {r: ratios(S) for r, S in data.items() if S is not None}
@@ -95,9 +119,24 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--res", type=int, nargs="*", default=[])
     ap.add_argument("--summary", action="store_true")
+    ap.add_argument("--cases", nargs="*", help="run only these cases")
+    ap.add_argument("--merge", action="store_true",
+                    help="add the results to the existing exp_conv<res>.npz instead of replacing it")
     args = ap.parse_args()
     for r in args.res:
-        names = CASES_4X if r >= 4 else tuple(CASES)
+        names = args.cases or (CASES_4X if r >= 4 else tuple(CASES))
         grid = {"nx": 400 * r, "ny": 100 * r}
-        run_sweep(f"conv{r}", {"B_field_type": "striped", **grid}, {n: CASES[n] for n in names})
+        tag = f"conv{r}"
+        old = os.path.join(DATA_DIR, f"exp_{tag}.npz")
+        keep = dict(np.load(old)) if args.merge and os.path.exists(old) else {}
+        run_sweep(f"{tag}_new" if keep else tag, {"B_field_type": "striped", **grid}, {n: CASES[n] for n in names})
+        if keep:
+            new_path = os.path.join(DATA_DIR, f"exp_{tag}_new.npz")
+            new = dict(np.load(new_path))
+            np.savez(old, **{**keep, **new})
+            os.remove(new_path)
+            print(f"merged {sorted({k.split('__')[0] for k in new})} into {old}")
     summary()
+    out_csv = os.path.join(os.path.dirname(DATA_DIR), "..", "results", "convergence", "convergence_summary.csv")
+    export_csv(os.path.normpath(out_csv))
+    print(f"wrote {os.path.normpath(out_csv)}")
