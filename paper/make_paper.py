@@ -268,22 +268,26 @@ p = para(
     "We examine whether a spatially striped magnetic field can suppress the Richtmyer-Meshkov "
     "instability (RMI) of a shocked density interface while channelling the post-shock flow through the "
     "weak-field gaps between the stripes, a configuration we refer to as a magnetic sieve. The study uses a "
-    "two-dimensional, GPU-based finite-volume MHD solver with an HLLD Riemann solver, MUSCL reconstruction, "
+    "GPU-based finite-volume MHD solver in two and three dimensions with an HLLD Riemann solver, MUSCL reconstruction, "
     "SSP-RK3 time integration and GLM divergence cleaning. An audit of the first implementation found a "
     "non-solenoidal initial field, an upstream state that was not in pressure balance, a resistive energy "
     "source that created energy, and an energy diagnostic that confused boundary inflow with conservation "
     "error. After correction, the discrete energy budget closes to round-off, and initial states are restricted "
     "to the fast-shock regime, which for a shock-parallel field at Mach 10 requires B₀ < 6.55√p̅. A "
-    "uniform shock-parallel field of strength B ≥ 2 reduces the mixing-layer enstrophy to 0.03 of the "
-    "hydrodynamic value. Striped fields meet the same criterion only when the bar-to-gap field contrast is about "
-    "10% or less. Larger contrast produces a steady, field-aligned shear behind the shock, because the shock "
-    "compresses the gas but not a shock-parallel field; magnetic tension does not oppose this shear, and it "
-    "deforms the interface at the stripe scale. The contrast needed to steer flow into the gaps therefore "
-    "prevents suppression. When the stripe wavenumber is half the interface wavenumber, the stripe-induced "
+    "uniform shock-parallel field suppresses the instability. Striped fields leave the interface rougher than a "
+    "uniform field: a grid-convergence study at three resolutions shows that the stripe-scale deformation grows "
+    "linearly with the bar-gap magnetic-pressure contrast, a₈ ≈ κΔP_B with κ converging to about 0.028. "
+    "A lock threshold defined by mixing-layer enstrophy relative to the hydrodynamic run is not grid-converged, "
+    "because the inviscid hydrodynamic enstrophy keeps growing with resolution. The deformation comes from a "
+    "steady, field-aligned shear behind the shock: the shock compresses the gas but not a shock-parallel field, "
+    "and magnetic tension does not oppose shear along the field. The contrast needed to steer flow into the gaps "
+    "therefore roughens the interface in proportion. When the stripe wavenumber is half the interface wavenumber, the stripe-induced "
     "displacement interferes with the RMI mode with the phase dependence predicted from the jump conditions, "
     "producing a zero crossing of the mode followed by inverted growth rather than a sustained lock. This "
     "zero crossing is the magnetic counterpart of the phase-dependent interaction between non-uniform shocks "
-    "and interface perturbations known from hydrodynamic studies; we report it as an observation.",
+    "and interface perturbations known from hydrodynamic studies; we report it as an observation. "
+    "Three-dimensional resistive runs at Lundquist number S ≈ 75 show no tearing or breakdown of the "
+    "shear layers.",
     after=6)
 p.paragraph_format.left_indent = p.paragraph_format.right_indent = Cm(1.0)
 para("*Keywords:* Richtmyer-Meshkov instability; magnetohydrodynamics; magnetic suppression; "
@@ -443,10 +447,11 @@ figure("fig04_enstrophy_location.png",
        "Figure 4. Enstrophy (a) in a fixed window around the interface and (b) in the mixing layer only, for "
        "the hydrodynamic run, a uniform field and deep stripes.")
 para(
-    "A case is locked if, relative to the hydrodynamic run with identical settings, the late-time mixing-layer "
-    "enstrophy is below 0.2 and the interface growth is below 0.5. Sweeps A-D measure growth as "
-    "a₄(t_end)/a₄(0.05); from sweep E onwards the roughness over all modes is used, so that "
-    "stripe-scale deformation cannot hide outside the seeded mode."
+    "In sweeps A-F a case was called locked if, relative to the hydrodynamic run with identical settings, the "
+    "late-time mixing-layer enstrophy was below 0.2 and the interface growth below 0.5 (growth measured as "
+    "a₄(t_end)/a₄(0.05) in sweeps A-D and as the roughness over all modes from sweep E). Section 4.6 shows that "
+    "the enstrophy part of this criterion is not grid-converged, so the converged comparison uses the interface "
+    "roughness and the stripe-scale amplitude a₈ instead."
 )
 heading("3.6 Configuration and verification", 2)
 para(
@@ -501,37 +506,28 @@ figure("fig06_growth.png",
        width_cm=FIG_SINGLE)
 heading("4.3 Suppression and collimation", 2)
 para(
-    "A uniform field locks the interface: at B = 2 and B = 3 the mixing-layer enstrophy is 0.03 of the "
-    "hydrodynamic value, while at B = 1 the growth criterion fails (0.73). Figure 7 shows sweeps C and D against "
-    "the bar-gap magnetic-pressure contrast ΔP_B = B₀²(1 − ε²)/2. Every striped field "
-    "reduces seeded-mode growth to 0.21-0.32 of the hydrodynamic value, but the mixing-layer enstrophy rises "
-    "monotonically with ΔP_B; the criterion is met only for ΔP_B ≲ 1.2, a field contrast of about "
-    "10% at B₀ = 3-3.5 (Table 2)."
+    "A uniform field suppresses the instability: at the base resolution, B = 2 and B = 3 reduce the "
+    "mixing-layer enstrophy to 0.03 of the hydrodynamic value, while B = 1 does not halve the growth (0.73). "
+    "Figure 7 shows sweeps C and D against the bar-gap magnetic-pressure contrast ΔP_B = B₀²(1 − ε²)/2. Every "
+    "striped field reduces seeded-mode growth to 0.21-0.32 of the hydrodynamic value, but the mixing-layer "
+    "enstrophy rises monotonically with ΔP_B. At this resolution the enstrophy criterion is met for "
+    "ΔP_B ≲ 1.2; Section 4.6 shows that this crossing moves to higher contrast on refinement, so it is not a "
+    "physical threshold. The monotonic increase with contrast is robust at every resolution."
 )
 figure("fig07_lock_map.png",
        "Figure 7. Late-time mixing-layer enstrophy relative to the hydrodynamic run, against the bar-gap "
-       "magnetic-pressure contrast (sweeps C and D). Green: locked. The red point at the smallest contrast is a "
-       "uniform field B = 1, which meets the enstrophy criterion but not the growth criterion.",
+       "magnetic-pressure contrast, at the base resolution (sweeps C and D). Green: meets the original lock "
+       "criterion. The red point at the smallest contrast is a uniform field B = 1, which meets the enstrophy "
+       "criterion but not the growth criterion. The position of the crossing depends on resolution (Section 4.6).",
        width_cm=FIG_SINGLE)
 para(
     "The interface spectrum shows where the excess vorticity goes (Fig. 8). At t = 0.8 the hydrodynamic run "
-    "has a₄ = 0.137 and roughness 0.098; a uniform field B = 3 gives 0.038 and 0.027, and the 10% stripes "
-    "0.035 and 0.029. Deep stripes (B₀ = 6, ε = 0.3) also give a₄ = 0.035, but the stripe-scale mode "
+    "has a₄ = 0.137 and roughness 0.098; a uniform field B = 3 gives 0.038 and 0.027, and stripes with 10% "
+    "field contrast (B₀ = 3.5, ε = 0.9) 0.035 and 0.029. Deep stripes (B₀ = 6, ε = 0.3) also give a₄ = 0.035, but the stripe-scale mode "
     "a₈ grows to 0.255 and the roughness to 0.200, twice the hydrodynamic value."
 )
 figure("fig08_spectrum.png",
        "Figure 8. Interface spectrum: (a) seeded mode a₄ and (b) stripe-scale mode a₈.")
-table("Table 2", "Selected cases at t = 0.8, relative to the hydrodynamic run. Contrast is (B\u2080 - \u03b5B\u2080)/B\u2080.",
-      ["Field", "Contrast", "Mixing-layer enstrophy", "Growth of a\u2084", "Locked"],
-      [["uniform, B = 2", "0", "0.029", "0.40", "yes"],
-       ["uniform, B = 3", "0", "0.031", "0.28", "yes"],
-       ["B\u2080 = 3, \u03b5 = 0.9", "10%", "0.064", "0.29", "yes"],
-       ["B\u2080 = 3.5, \u03b5 = 0.9", "10%", "0.126", "0.26", "yes"],
-       ["B\u2080 = 4, \u03b5 = 0.9", "10%", "0.213", "0.24", "no"],
-       ["B\u2080 = 3.5, \u03b5 = 0.8", "20%", "0.367", "0.27", "no"],
-       ["B\u2080 = 4, \u03b5 = 0.7", "30%", "1.35", "0.26", "no"],
-       ["B\u2080 = 6, \u03b5 = 0.3", "70%", "23.6", "0.24", "no"]],
-      [4.0, 2.4, 4.0, 2.8, 2.2])
 
 heading("4.4 Mechanism", 2)
 para(
@@ -543,8 +539,8 @@ para(
     "opposes it. Its vorticity enters the mixing layer continuously and scales with ΔP_B."
 )
 figure("fig09_snapshots.png",
-       "Figure 9. Density (left) and vorticity (right) at t = 0.8 for the hydrodynamic run (top), 10% stripes "
-       "B₀ = 3.5, ε = 0.9 (middle) and deep stripes B₀ = 6, ε = 0.3 (bottom). The bands in the "
+       "Figure 9. Density (left) and vorticity (right) at t = 0.8 for the hydrodynamic run (top), stripes "
+       "with 10% field contrast, B₀ = 3.5, ε = 0.9 (middle) and deep stripes B₀ = 6, ε = 0.3 (bottom). The bands in the "
        "bottom-right panel are field-aligned shear layers between bars and gaps.", width_cm=TEXT_W)
 para(
     "The same contrast produces collimation. The normalised gap-to-bar momentum flux increases with field "
@@ -578,10 +574,10 @@ figure("fig11_zero_crossing.png",
        "Figure 11. Seeded-mode amplitude for phase-aligned (φ = π/4) and anti-aligned (φ = 3π/4) "
        "stripes with k_m/k = 0.5 (sweep F). The aligned cases pass through zero and then grow with inverted sign.",
        width_cm=FIG_SINGLE)
-heading("4.6 Resolution sensitivity", 2)
+heading("4.6 Resolution and grid convergence", 2)
 para(
-    "The hydrodynamic reference is converged: doubling the cells in y changes a₄(0.8) from 0.137 to 0.143. "
-    "Deep-stripe cases are not (Fig. 12). For k_m/k = 2 the stripe pattern has about six cells per wavelength; "
+    "Doubling the cells in y changes the hydrodynamic a₄(0.8) only from 0.137 to 0.143. "
+    "Deep-stripe cases are more sensitive (Fig. 12). For k_m/k = 2 the stripe pattern has about six cells per wavelength; "
     "at twice the resolution the roughness rose from 0.62 to 1.87 times the hydrodynamic value and the "
     "mixing-layer enstrophy from about 10 to 212 times. The apparent benefit of k_m/k = 2 in sweep E was "
     "numerical smoothing. Higher resolution sharpens the shear layers and strengthens the conclusion that deep "
@@ -591,6 +587,39 @@ figure("fig12_resolution.png",
        "Figure 12. Resolution check for k_m/k = 2, B₀ = 6, ε = 0.3 at n_y = 100 and 200. (a) Hydrodynamic "
        "a₄ and stripe roughness relative to hydrodynamic. (b) Stripe mixing-layer enstrophy relative to "
        "hydrodynamic.")
+para(
+    "To test the base-resolution lock boundary, the cases nearest it were rerun at two and four times the "
+    "resolution (800 × 200 and 1600 × 400 cells; Fig. 13, Table 2). Under the original criterion every case "
+    "locks at the finer grids, including 20% field contrast, and the enstrophy ratios roughly halve with each "
+    "refinement. The cause is the reference rather than the stripes: the mixing-layer enstrophy of the "
+    "hydrodynamic run grows from 9.7 to 23.9 to 61.6, because without physical viscosity the inviscid mixing "
+    "layer keeps forming finer vortices, while the striped runs stay between 1.1 and 4.5 at all resolutions. "
+    "An enstrophy threshold measured against the hydrodynamic run therefore cannot converge."
+)
+para(
+    "The interface roughness does converge. The hydrodynamic value changes from 0.132 to 0.140 between the two "
+    "finest grids, and the striped values by at most 4%; relative to the hydrodynamic run they settle at 0.20, "
+    "0.25 and 0.32 for increasing contrast. The stripe-scale mode is proportional to the magnetic-pressure "
+    "contrast at every resolution, a₈ = κΔP_B, with κ = 0.0176, 0.0250 and 0.0270 at the three grids. "
+    "Richardson extrapolation of κ (observed order 1.9) gives κ ≈ 0.028. This linear law, not a threshold, is "
+    "the converged statement of the trade-off: the interface deformation produced by the stripes scales with the "
+    "contrast that makes them collimate."
+)
+figure("fig13_convergence.png",
+       "Figure 13. Grid convergence at 1×, 2× and 4× the base resolution. (a) Mixing-layer enstrophy: the "
+       "hydrodynamic value keeps growing, the striped values do not. (b) Interface roughness, which converges. "
+       "(c) Stripe-scale amplitude a₈ against the bar-gap magnetic-pressure contrast, with the least-squares "
+       "line a₈ = κΔP_B at each resolution. The uniform field and B₀ = 3 were not run at 4×.")
+table("Table 2", "Interface roughness relative to the hydrodynamic run and stripe-scale amplitude at t = 0.8, at "
+      "three resolutions. Dashes: not run at that resolution.",
+      ["Field (B₀, ε)", "ΔP_B", "rough./hydro 1×", "2×", "4×", "a₈ (4×)",
+       "a₈/ΔP_B (4×)"],
+      [["uniform, B = 3", "0.09", "0.274", "0.158", "-", "-", "-"],
+       ["3, 0.9", "0.86", "0.310", "0.199", "-", "-", "-"],
+       ["3.5, 0.9", "1.16", "0.298", "0.216", "0.204", "0.0315", "0.027"],
+       ["4, 0.9", "1.52", "0.309", "0.253", "0.245", "0.0424", "0.028"],
+       ["3.5, 0.8", "2.21", "0.386", "0.332", "0.324", "0.0586", "0.027"]],
+      [3.0, 1.6, 2.4, 1.8, 1.8, 2.2, 2.7])
 
 # ---------------------------------------------------------------- 5 discussion
 
@@ -617,18 +646,28 @@ para(
     "The trade-off follows from two properties that do not depend on the numerical details: a shock-parallel "
     "field is not compressed by the shock, and magnetic tension does not resist shear along the field. Any "
     "stripe pattern strong enough to redirect the post-shock flow therefore also drives the shear that deforms "
-    "the interface. A field that locks the interface must be nearly uniform, and a field that collimates the "
-    "flow cannot lock it. Phase alignment can choose the time at which the seeded mode is flat but cannot hold "
+    "the interface, and the converged deformation grows in proportion to the contrast (a₈ = κΔP_B). A field "
+    "that leaves the interface as smooth as a uniform field must be nearly uniform, and a field that collimates "
+    "the flow cannot do so. Phase alignment can choose the time at which the seeded mode is flat but cannot hold "
     "it there."
 )
 heading("5.3 Limitations", 2)
 para(
-    "The results apply to two-dimensional ideal MHD with shock-parallel stripes, uniform upstream density, "
-    "Mach 10, density ratio 3 and the fast-shock regime of Eq. (3). Stronger fields with switch-on shocks, "
-    "three-dimensional flow, other closures and oblique fields were not examined. Most sweeps used one "
-    "resolution and one realisation, and Section 4.6 shows that deep-stripe metrics depend on resolution; the "
-    "10% lock boundary and the zero-crossing times need a convergence study before quantitative use. Divergence "
-    "errors of a few percent remain at shocks because the scheme does not use constrained transport."
+    "The results apply to ideal MHD with shock-parallel stripes, uniform upstream density, Mach 10, density "
+    "ratio 3 and the fast-shock regime of Eq. (3); stronger fields with switch-on shocks, other closures and "
+    "oblique fields were not examined. The convergence study covered the cases nearest the former boundary at "
+    "three resolutions, but the uniform-field reference was not run at the finest grid, the other sweeps used "
+    "one resolution, and all used one realisation; the zero-crossing times in particular are base-resolution "
+    "values. Thresholds based on enstrophy would need a viscous treatment in which enstrophy converges. "
+    "Divergence errors of a few percent remain at shocks because the scheme does not use constrained transport."
+)
+para(
+    "A three-dimensional extension of the solver (verified against the two-dimensional solver to 10⁻¹⁴ for "
+    "z-invariant states) was used to ask whether the field-aligned shear layers break down through secondary "
+    "Kelvin-Helmholtz or tearing instabilities. With explicit resistivity at the largest Lundquist number the grid "
+    "resolves (S ≈ 75), field-reversing stripes and a frame moving with the interface to t = 5, the seeded "
+    "three-dimensional runs were indistinguishable from their z-invariant controls: the z-velocity decayed, the "
+    "current sheets stayed z-uniform and did not tear. Tearing at plasma-like S ≥ 10³ remains untested."
 )
 
 # ---------------------------------------------------------------- 6 conclusion
@@ -638,15 +677,18 @@ para(
     "Deep magnetic stripes cannot both hold a shocked interface and channel the flow through their gaps when the "
     "field is shock-parallel and the shock is in the fast regime. Reaching this result required correcting the "
     "initial field, the upstream equilibrium, the resistive energy term and the energy diagnostic, and "
-    "restricting initial states to admissible shocks. A uniform field locks the interface; stripes lock only at "
-    "about 10% contrast; larger contrast creates a field-aligned shear that tension cannot oppose, so suppression "
-    "and collimation compete. Phase-aligned stripes produce a zero crossing of the seeded mode at a time set by "
-    "the contrast, the magnetic analogue of known hydrodynamic phase interference, but no sustained lock."
+    "restricting initial states to admissible shocks. A uniform field suppresses the instability; stripes "
+    "create a field-aligned shear that tension cannot oppose, and the resulting stripe-scale deformation of the "
+    "interface grows linearly with the bar-gap magnetic-pressure contrast, converged over three resolutions to "
+    "a₈ ≈ 0.028 ΔP_B. Suppression and collimation therefore compete. Phase-aligned stripes produce a zero crossing of the seeded mode at a time set by "
+    "the contrast, the magnetic analogue of known hydrodynamic phase interference, but no sustained lock. "
+    "A lock threshold measured by enstrophy relative to the hydrodynamic case is not a converged quantity in "
+    "inviscid simulations and should not be used to compare magnetized and unmagnetized runs."
 )
 
 heading("Code and data availability")
-para("The solver, sweeps A-H, saved time series and the scripts that generate the figures and this document "
-     "are available at [repository URL].")
+para("The solver, sweeps A-H, the convergence study, the three-dimensional sweeps, saved time series and the "
+     "scripts that generate the figures and this document are available at [repository URL].")
 heading("Acknowledgements")
 para("[Computing resources, and any disclosure of tools used, as required by the target venue.]")
 

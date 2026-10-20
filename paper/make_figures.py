@@ -277,6 +277,66 @@ def fig12_resolution():
     return vals, en
 
 
+CONV_CASES = (("uniform Bx=3", 3.0, 0.99), ("B0=3 eps=0.9", 3.0, 0.9), ("B0=3.5 eps=0.9", 3.5, 0.9),
+              ("B0=4 eps=0.9", 4.0, 0.9), ("B0=3.5 eps=0.8", 3.5, 0.8))
+
+
+def convergence_data():
+    """Interface metrics at 1x, 2x, 4x resolution (experiments/convergence_lock.py)."""
+    out = {}
+    for r in (1, 2, 4):
+        S = load(f"conv{r}")
+        h = S["hydro"]
+        row = {"hydro": {"emix": tail(h["emix"], h["t"]), "rough": float(h["rms"][-1])}}
+        for name, b, e in CONV_CASES:
+            if name in S:
+                d = S[name]
+                row[name] = {"emix": tail(d["emix"], d["t"]), "rough": float(d["rms"][-1]),
+                             "a8": float(d["m8"][-1]), "dP": 0.5 * b**2 * (1 - e**2)}
+        out[r] = row
+    kappa = {}
+    for r, row in out.items():
+        pts = [(v["dP"], v["a8"]) for k, v in row.items() if k != "hydro" and not k.startswith("uniform")]
+        x, y = np.array(pts).T
+        kappa[r] = float(np.sum(x * y) / np.sum(x * x))      # least squares through the origin
+    k1, k2, k4 = kappa[1], kappa[2], kappa[4]
+    ratio = (k2 - k1) / (k4 - k2)
+    kappa_inf = k4 + (k4 - k2) / (ratio - 1)
+    return out, kappa, kappa_inf, np.log2(ratio)
+
+
+def fig13_convergence():
+    out, kappa, kappa_inf, order = convergence_data()
+    res = (1, 2, 4)
+    fig, (a, b, c) = plt.subplots(1, 3, figsize=(WIDE, 2.4))
+    cols = {"hydro": INK, "uniform Bx=3": C3, "B0=3 eps=0.9": "#f0a04b", "B0=3.5 eps=0.9": C1,
+            "B0=4 eps=0.9": C4, "B0=3.5 eps=0.8": C2}
+    labs = {"hydro": "hydrodynamic", "uniform Bx=3": "uniform $B=3$", "B0=3 eps=0.9": r"$3, 0.9$",
+            "B0=3.5 eps=0.9": r"$3.5, 0.9$", "B0=4 eps=0.9": r"$4, 0.9$", "B0=3.5 eps=0.8": r"$3.5, 0.8$"}
+    for name in ("hydro",) + tuple(n for n, _, _ in CONV_CASES):
+        rs = [r for r in res if name in out[r]]
+        a.semilogy(rs, [out[r][name]["emix"] for r in rs], "o-", color=cols[name], ms=3.5, lw=1.1, label=labs[name])
+        b.plot(rs, [out[r][name]["rough"] for r in rs], "o-", color=cols[name], ms=3.5, lw=1.1)
+    for ax in (a, b):
+        ax.set_xscale("log", base=2); ax.set_xticks(res); ax.set_xticklabels(["1x", "2x", "4x"]); ax.minorticks_off()
+        ax.set_xlabel("resolution")
+    title(a, "(a) mixing-layer enstrophy"); title(b, "(b) interface roughness")
+    b.legend(*a.get_legend_handles_labels(), frameon=False, fontsize=6.5, title=r"$B_0, \epsilon$",
+             title_fontsize=6.5, loc="center", bbox_to_anchor=(0.62, 0.56))
+    for r, mk, cc in ((1, "s", "#bbbbbb"), (2, "^", "#888888"), (4, "o", INK)):
+        pts = [(v["dP"], v["a8"]) for k, v in out[r].items() if k != "hydro"]
+        x, y = np.array(pts).T
+        c.plot(x, y, mk, color=cc, ms=4.5, label=f"{r}x, $\\kappa$ = {kappa[r]:.4f}")
+        xx = np.linspace(0, 2.4, 10)
+        c.plot(xx, kappa[r] * xx, color=cc, lw=0.9)
+    c.set_xlabel(r"$\Delta P_B$"); c.set_ylabel("$a_8$ at $t=0.8$")
+    c.legend(frameon=False, fontsize=6.5, loc="upper left")
+    title(c, r"(c) stripe-scale mode, $a_8 = \kappa\,\Delta P_B$")
+    fig.tight_layout(w_pad=1.2)
+    save(fig, "fig13_convergence.png")
+    return out, kappa, kappa_inf, order
+
+
 if __name__ == "__main__":
     fig01_setup()
     fig02_equilibrium_admissibility()
@@ -290,5 +350,12 @@ if __name__ == "__main__":
     fig10_phase()
     fig11_zero_crossing()
     vals, en = fig12_resolution()
+    out, kappa, kappa_inf, order = fig13_convergence()
+    print("kappa per resolution:", {r: round(k, 5) for r, k in kappa.items()},
+          f"Richardson kappa_inf = {kappa_inf:.4f} (observed order {order:.2f})")
+    for r, row in out.items():
+        h = row["hydro"]
+        print(f"{r}x hydro emix {h['emix']:.2f} rough {h['rough']:.4f} | " + "; ".join(
+            f"{k}: rough/h {v['rough'] / h['rough']:.3f} a8 {v['a8']:.4f}" for k, v in row.items() if k != "hydro"))
     print("resolution:", {k: tuple(round(float(x), 4) for x in v) for k, v in vals.items()},
           "emix ratio", tuple(round(float(x), 1) for x in en))
