@@ -323,6 +323,30 @@ def galilean_test(U=6.49):
     return ok
 
 
+def rmi_mhd_smoke_test():
+    """High-Mach RMI benchmark at low resolution: no crash, positive pressure/density, energy closes,
+    all output files written, and the shock-parallel field reduces the amplitude."""
+    print("\n--- RMI-MHD benchmark smoke test ---"); sys.stdout.flush()
+    import json
+    import tempfile
+    from sieve.problems.rmi_mhd import RMIParams, run
+    out = tempfile.mkdtemp(prefix="rmi_smoke_")
+    res = {}
+    for name, field, B0 in (("hydro", "none", 0.0), ("mhd_parallel", "parallel", 2.5)):
+        p = RMIParams(name=name, field=field, B0=B0, nx=256, ny=32, t_end=0.5, n_frames=3)
+        with contextlib.redirect_stdout(io.StringIO()):
+            res[name] = run(p, os.path.join(out, name))["result"]
+    files = all(os.path.exists(os.path.join(out, n, f)) for n in res
+                for f in ("diagnostics.csv", "summary.json", "frames.npz", "rmi.pvd", "vtk/frame_0002.vti"))
+    ok = (files and all(r["p_min"] > 0 and r["rho_min"] > 0 and r["energy_error_max"] < 1e-10 for r in res.values())
+          and res["mhd_parallel"]["a_final"] < res["hydro"]["a_final"])
+    print(f"  a(t_end): hydro {res['hydro']['a_final']:.4f}, B_x=2.5 {res['mhd_parallel']['a_final']:.4f}; "
+          f"min p {min(r['p_min'] for r in res.values()):.3g}; energy error "
+          f"{max(r['energy_error_max'] for r in res.values()):.1e}; files {'ok' if files else 'MISSING'}  "
+          f"[{'PASS' if ok else 'FAIL'}]")
+    return ok
+
+
 VERIFICATION_TESTS = {
     "brio_wu": brio_wu_test,
     "alfven": alfven_convergence_test,
@@ -333,6 +357,7 @@ VERIFICATION_TESTS = {
     "alfven_z": alfven_z_test,
     "resistive_z": resistive_z_test,
     "galilean": galilean_test,
+    "rmi_mhd": rmi_mhd_smoke_test,
 }
 
 
