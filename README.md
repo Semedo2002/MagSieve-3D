@@ -1,6 +1,6 @@
-# Magnetic sieve: striped magnetic fields and the Richtmyer–Meshkov instability
+# Magnetic sieve: striped magnetic fields and the Richtmyer-Meshkov instability
 
-A 2D compressible MHD solver (CuPy + a custom CUDA HLLD kernel) and the parameter study built on it. The study asks whether a spatially striped magnetic field can suppress ("lock") the Richtmyer–Meshkov instability of a shocked density interface while channelling the flow through the weak-field gaps.
+A 2D compressible MHD solver (CuPy + a custom CUDA HLLD kernel) and the parameter study built on it. The study asks whether a spatially striped magnetic field can suppress ("lock") the Richtmyer-Meshkov instability of a shocked density interface while channelling the flow through the weak-field gaps.
 
 **Result in one paragraph.** A uniform shock-parallel field locks the interface, in line with earlier work on magnetised RMI. Striped fields lock only when the bar/gap field contrast is small (about 10%). A shock-parallel field is not compressed by the shock while the gas is, so a striped field that is in pressure balance upstream produces a steady field-aligned shear downstream. Magnetic tension does not resist this shear, and it deforms the interface at the stripe scale. Suppression and collimation therefore work against each other in this regime. Aligning the stripe phase with the interface ripple produces a predictable zero crossing of the RMI mode, but not a lock. See `paper/` for the write-up and its limitations.
 
@@ -45,7 +45,7 @@ python main.py --help
 
 | test | checks |
 |---|---|
-| brio_wu | Brio–Wu shock tube structure |
+| brio_wu | Brio-Wu shock tube structure |
 | alfven | Alfvén wave convergence order (measured 1.96) |
 | reflection | residual of fast and Alfvén pulses after leaving through the outflow boundary (3.5e-5, 7e-10) |
 | conservation | energy budget closes to round-off (~1e-14); div B = 0 for Bz stripes, < 3% (h max\|div B\|/max\|B\|) otherwise |
@@ -81,27 +81,45 @@ python ../paper/make_paper.py
 | G | resolution check (ny = 100 vs 200) |
 | H | figure set: spectrum, enstrophy location, energy budget |
 
-## Benchmark: high-Mach RMI with magnetic suppression
+## Benchmark: high-Mach MHD Richtmyer-Meshkov instability
 
-A standalone problem in `sieve/problems/rmi_mhd.py`: a Mach-5 shock in a light gas hits a single-mode
-interface x(y) = x0 + eta0 cos(k y) with a gas 10 times denser (A ~ 0.82), with no field, a uniform field
-along the shock normal (B_x) or across it (B_y). Repo convention: the shock travels in +x.
+A Mach-5 shock hits a single-mode interface between a light gas and one ten times denser. Baroclinic
+vorticity deposited at the interface drives Richtmyer-Meshkov growth, spike roll-up and mixing. A uniform
+field along the shock normal (B_x) suppresses it: the vorticity is carried away from the interface along
+field lines by Alfven waves (Wheatley, Pullin & Samtaney 2005), so the interface amplitude stays bounded.
+
+| | Hydro (B = 0) | MHD (B_x = 2.5) |
+| :--- | :--- | :--- |
+| Shock and interface | Mach 5, ρ₂/ρ₁ = 10, A = 0.82 (0.73 after compression) | same |
+| Amplitude a(t) at t = 1.5 | 0.317, still growing | 0.064 (peak 0.092 at t ≈ 0.6), 80% below hydro |
+| Interface | spike roll-up (mushroom) | bounded single mode |
+| max \|ω\| at t = 1.5 (peak after impact) | 17.5 (57.8) | 11.6 (55.3) |
+| Energy conservation error | 2.9 × 10⁻¹² | 1.6 × 10⁻¹² |
+| h max\|∇·B\|/max\|B\| | n/a | 2.4% at shock passage, ~0.2% after |
+
+2D, 1024 × 128 cells, single realization; no resolution study yet for this benchmark. Reproduce with
+`python scripts/run_rmi_mhd.py && python scripts/plot_rmi_mhd.py`.
+
+![RMI density and field lines](results/rmi_mhd/rmi_density_fieldlines.gif)
+*Log density at matching times, hydrodynamic (left) and B_x = 2.5 (right); white lines are magnetic field
+lines, the cyan line is the interface (heavy fraction 0.5).*
+
+### Running it
 
 ```
-python scripts/run_rmi_mhd.py            # configs/rmi_mhd.json: hydro and B_x = 2.5, 1024 x 128, ~30 min
+python scripts/run_rmi_mhd.py            # configs/rmi_mhd.json: hydro and B_x = 2.5, 1024 x 128, ~20 min
 python scripts/run_rmi_mhd.py --quick    # 256 x 32 check, ~1 min (results/rmi_mhd_quick)
 python scripts/plot_rmi_mhd.py           # PNG/GIF into results/rmi_mhd
 python main.py --test rmi_mhd            # smoke test
 ```
 
-- The jumps come from Rankine-Hugoniot conditions. The shock-interface interaction is solved exactly in 1D
-  (contact velocity, post-shock Atwood number) for the Richtmyer and Meyer-Blewett reference growth rates.
-- With B_x, the incident, reflected and transmitted shocks must all be fast MHD shocks. Inadmissible B0 is
-  rejected; at Mach 5 and rho2/rho1 = 10 the incident shock is the binding one (B0 < ~3.4).
-- Per case, `results/rmi_mhd/<case>/` holds `diagnostics.csv` (a(t), bubble/spike positions, max vorticity,
-  energy error, div B norms, minimum pressure and density), `summary.json`, `frames.npz`, and
-  `vtk/frame_NNNN.vti` with `rmi.pvd` for ParaView (density, pressure, heavy fraction, velocity, B).
-- `.gitignore` excludes the VTK frames and `frames.npz` (about 150 MB per case at full resolution).
+The set-up is in `sieve/problems/rmi_mhd.py`; the shock travels in +x and the interface is
+x(y) = x0 + eta0 cos(k y). Jumps come from the Rankine-Hugoniot conditions, and the shock-interface
+interaction is solved exactly in 1D for the Richtmyer and Meyer-Blewett reference growth rates. With B_x,
+the incident, reflected and transmitted shocks must all be fast MHD shocks, so B0 above ~3.4 is rejected at
+these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.npz` and VTK frames
+(`vtk/frame_NNNN.vti`, `rmi.pvd` for ParaView) to `results/rmi_mhd/<case>/`. The VTK frames and
+`frames.npz` (about 140 MB per case) are not tracked in git.
 
 ## Model and numerical limitations
 

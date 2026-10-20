@@ -1,4 +1,4 @@
-# config.py — Structured solver configuration.
+# config.py - Structured solver configuration.
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import List, Optional
