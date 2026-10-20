@@ -41,7 +41,7 @@ python main.py --help
 
 ## Verification
 
-`python main.py --test all` runs eight checks and exits non-zero on failure:
+`python main.py --test all` runs the full suite and exits non-zero on failure:
 
 | test | checks |
 |---|---|
@@ -80,6 +80,28 @@ python ../paper/make_paper.py
 | F | phase-aligned stripes at 20% and 30% modulation |
 | G | resolution check (ny = 100 vs 200) |
 | H | figure set: spectrum, enstrophy location, energy budget |
+
+## Benchmark: high-Mach RMI with magnetic suppression
+
+A standalone problem in `sieve/problems/rmi_mhd.py`: a Mach-5 shock in a light gas hits a single-mode
+interface x(y) = x0 + eta0 cos(k y) with a gas 10 times denser (A ~ 0.82), with no field, a uniform field
+along the shock normal (B_x) or across it (B_y). Repo convention: the shock travels in +x.
+
+```
+python scripts/run_rmi_mhd.py            # configs/rmi_mhd.json: hydro and B_x = 2.5, 1024 x 128, ~30 min
+python scripts/run_rmi_mhd.py --quick    # 256 x 32 check, ~1 min (results/rmi_mhd_quick)
+python scripts/plot_rmi_mhd.py           # PNG/GIF into results/rmi_mhd
+python main.py --test rmi_mhd            # smoke test
+```
+
+- The jumps come from Rankine-Hugoniot conditions. The shock-interface interaction is solved exactly in 1D
+  (contact velocity, post-shock Atwood number) for the Richtmyer and Meyer-Blewett reference growth rates.
+- With B_x, the incident, reflected and transmitted shocks must all be fast MHD shocks. Inadmissible B0 is
+  rejected; at Mach 5 and rho2/rho1 = 10 the incident shock is the binding one (B0 < ~3.4).
+- Per case, `results/rmi_mhd/<case>/` holds `diagnostics.csv` (a(t), bubble/spike positions, max vorticity,
+  energy error, div B norms, minimum pressure and density), `summary.json`, `frames.npz`, and
+  `vtk/frame_NNNN.vti` with `rmi.pvd` for ParaView (density, pressure, heavy fraction, velocity, B).
+- `.gitignore` excludes the VTK frames and `frames.npz` (about 150 MB per case at full resolution).
 
 ## Model and numerical limitations
 
