@@ -9,7 +9,7 @@ import contextlib
 import numpy as np
 from typing import Dict, List, Tuple
 
-from sieve.config import Config, NVAR, iRHO, iVX, iVY, iBX, iBY, iBZ, iPR, iCLR
+from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iCLR
 from sieve.physics import xp, cp, cons_to_prim, prim_to_cons, mhd_rankine_hugoniot
 from sieve.solver import MHDSolver, PostProcessor, save_figure, to_numpy, OUTPUT_DIR
 
@@ -213,16 +213,19 @@ def equilibrium_test(B0=5.0, nx=200, ny=100, t_end=0.05, tol=1e-2):
 def z_invariance_test(tol=1e-8):
     """3D runs with a z-invariant initial state must reproduce the 2D solver (ideal and resistive)."""
     print("\n--- 3D: z-invariance against the 2D solver ---"); sys.stdout.flush()
-    return all(_z_invariance_case(eta, tol) for eta in (0.0, 0.02))
+    # constant eta, and eta varying 8x across the interface through the material model
+    cases = ({"eta_resistivity": 0.0}, {"eta_resistivity": 0.02},
+             {"eta_model": "material", "eta_fuel": 0.005, "eta_liner": 0.04})
+    return all([_z_invariance_case(kw, tol) for kw in cases])
 
 
-def _z_invariance_case(eta, tol):
+def _z_invariance_case(eta_kw, tol):
     from sieve.solver3d import MHDSolver3D
     nx, ny = 128, 32
     dx, dy = 6.0 / nx, 2.0 / ny
     common = dict(nx=nx, ny=ny, x_max=6.0, t_end=0.1, mach=10.0, B_transverse=3.0, B_field_type="striped",
                   B_gap_fraction=0.9, perturbation_amp=0.02, bc_x_type="inflow_outflow",
-                  eta_resistivity=eta, diag_interval=10**9, snapshot_times=[])
+                  diag_interval=10**9, snapshot_times=[], **eta_kw)
     s2 = MHDSolver(Config(**common))
     with contextlib.redirect_stdout(io.StringIO()):
         s2.initialize(); s2.run()
@@ -235,7 +238,8 @@ def _z_invariance_case(eta, tol):
     zvar = float(xp.max(xp.abs(r3 - r3[:, :, :1])))
     err = s3.energy_error()
     ok = diff < tol and zvar == 0.0 and err < 1e-10 and s2.step == s3.step
-    print(f"  eta={eta:g}: steps 2D/3D {s2.step}/{s3.step}, max rel diff in rho {diff:.1e}, z-variation {zvar:.1e}, "
+    label = ", ".join(f"{k}={v:g}" if not isinstance(v, str) else v for k, v in eta_kw.items())
+    print(f"  {label}: steps 2D/3D {s2.step}/{s3.step}, max rel diff in rho {diff:.1e}, z-variation {zvar:.1e}, "
           f"energy error {err:.1e}  [{'PASS' if ok else 'FAIL'}]")
     return ok
 
@@ -293,6 +297,115 @@ def resistive_z_test(eta=0.01, tol=0.01):
     ok = rel < tol and err < 1e-12
     print(f"  amplitude {amp:.4e} vs exp(-eta k^2 t) {expected:.4e} (rel. error {rel:.1e}); "
           f"energy error {err:.1e}  [{'PASS' if ok else 'FAIL'}]")
+    return ok
+
+
+def _march(s, t_end):
+    """Plain time loop for hand-built 2D states (energy budget accumulates inside step_ssprk3)."""
+    g = s.cfg.gamma
+    while s.t < t_end - 1e-14:
+        s.dt = min(s.compute_dt(cons_to_prim(s.U, g)), t_end - s.t)
+        s.step_ssprk3(); s.t += s.dt; s.step += 1
+
+
+def _energy(s):
+    ng = s.ng
+    return float(xp.sum(s.U[EN, ng:-ng, ng:-ng])) * s.cfg.dx * s.cfg.dy
+
+
+def _two_layer_run(face_mean, nx, eta1, eta2, b, t_end):
+    # static plasma, Bz(x) held at b on x = 0 and 0 on x = 1, eta1 left of x = 0.5, eta2 right
+    class Dirichlet(MHDSolver):
+        def apply_bc(self, U):
+            super().apply_bc(U)
+            ng = self.ng
+            for sl, mirror, val in ((slice(0, ng), slice(2 * ng - 1, ng - 1, -1), b),
+                                    (slice(-ng, None), slice(-ng - 1, -2 * ng - 1, -1), 0.0)):
+                bz = 2 * val - U[iBZ, mirror]                  # face value = val
+                U[EN, sl] += 0.5 * (bz**2 - U[iBZ, sl]**2)     # keep the ghost pressure unchanged
+                U[iBZ, sl] = bz
+            return U
+    cfg = Config(nx=nx, ny=4, x_max=1.0, y_max=4.0 / nx, t_end=t_end, cfl=0.3, mach=1.0, B_transverse=0.0,
+                 powell_source=False, bc_x_type="extrapolation", bc_y_type="periodic", eta_model="material",
+                 eta_fuel=eta1, eta_liner=eta2, eta_face_mean=face_mean, diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = Dirichlet(cfg)
+    x = s.x[:, None] * xp.ones((1, s.ny_tot))
+    W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+    W[iRHO] = 1.0
+    W[iBZ] = b * (1 - x)
+    W[iPR] = 1.0 - 0.5 * W[iBZ]**2
+    W[iCLR] = xp.where(x > 0.5, 1.0, 0.0)
+    s.U = prim_to_cons(W, cfg.gamma); s.t = 0.0; s.step = 0
+    E0 = _energy(s)
+    _march(s, t_end)
+    ng = s.ng
+    xc = to_numpy(s.x[ng:-ng])
+    Bz = to_numpy(cons_to_prim(s.U, cfg.gamma)[iBZ, ng:-ng, ng])
+    s1 = -2 * b / (1 + eta1 / eta2); s2 = eta1 * s1 / eta2
+    exact = np.where(xc < 0.5, b + s1 * xc, b + 0.5 * s1 + s2 * (xc - 0.5))
+    err = np.max(np.abs(Bz - exact)) / b
+    budget = abs(_energy(s) - E0 - s._cumulative_boundary_energy) / abs(E0)
+    return err, budget, s.step
+
+
+def resistive_layers_test(tol=1e-3):
+    """Two-layer steady magnetic diffusion: eta jumps 4x at x = 0.5 (on a cell face). The steady Bz is
+    piecewise linear with eta dBz/dx continuous (continuity of E_y). With harmonic face averaging the
+    discrete steady state is exact, so the error is only the decay of the transient; the arithmetic mean
+    misplaces the kink and is reported for comparison."""
+    print("\n--- Resistive: two-layer steady diffusion ---"); sys.stdout.flush()
+    eta1, eta2, b, nx, t_end = 0.04, 0.01, 1e-3, 16, 40.0
+    err_h, bud_h, steps = _two_layer_run("harmonic", nx, eta1, eta2, b, t_end)
+    err_a, bud_a, _ = _two_layer_run("arithmetic", nx, eta1, eta2, b, t_end)
+    ok = err_h < tol and err_a > 10 * err_h and max(bud_h, bud_a) < 1e-12
+    print(f"  eta {eta1:g} | {eta2:g}, nx={nx}, {steps} steps: max |Bz - exact|/b harmonic {err_h:.1e}, "
+          f"arithmetic {err_a:.1e}; energy budget residual {max(bud_h, bud_a):.1e}  [{'PASS' if ok else 'FAIL'}]")
+    return ok
+
+
+def ohmic_heating_test(tol=0.01):
+    """Periodic box, all three B components, eta varying smoothly by 10x through the material model.
+    Total energy must close to round-off, and the thermal energy gained must match the accumulated
+    Ohmic heating integral of eta |J|^2 (to the time-stepping error). The field is not force-free, so
+    the magnetic loss is Ohmic heat plus work done by the Lorentz force (reported, not asserted)."""
+    print("\n--- Resistive: Ohmic heating energy closure ---"); sys.stdout.flush()
+    n, b = 64, 0.05
+    cfg = Config(nx=n, ny=n, x_max=1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, B_transverse=0.0,
+                 powell_source=False, bc_x_type="periodic", bc_y_type="periodic", eta_model="material",
+                 eta_fuel=0.002, eta_liner=0.02, diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(cfg)
+    X, Y = s.X, s.Y
+    k = 2 * np.pi
+    W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+    W[iRHO] = 1.0
+    W[iBX] = b * xp.sin(k * Y)
+    W[iBY] = b * xp.sin(k * X)
+    W[iBZ] = b * xp.sin(k * X) * xp.sin(k * Y)
+    W[iPR] = 1.0 - 0.5 * (W[iBX]**2 + W[iBY]**2 + W[iBZ]**2)
+    W[iCLR] = 0.5 + 0.5 * xp.cos(k * (X + Y))
+    s.U = prim_to_cons(W, cfg.gamma); s.t = 0.0; s.step = 0
+    s.apply_bc(s.U)
+    ng = s.ng; dA = cfg.dx * cfg.dy
+
+    def parts():
+        Wi = cons_to_prim(s.U, cfg.gamma)[:, ng:-ng, ng:-ng]
+        mag = 0.5 * float(xp.sum(Wi[iBX]**2 + Wi[iBY]**2 + Wi[iBZ]**2)) * dA
+        th = float(xp.sum(Wi[iPR])) * dA / (cfg.gamma - 1)
+        kin = 0.5 * float(xp.sum(Wi[iRHO] * (Wi[iVX]**2 + Wi[iVY]**2 + Wi[iVZ]**2))) * dA
+        return mag, th, kin
+
+    E0 = _energy(s); m0, th0, k0 = parts()
+    _march(s, cfg.t_end)
+    m1, th1, k1 = parts()
+    Q = s.cumulative_ohmic_heating
+    err = abs(_energy(s) - E0) / E0
+    rel_th = abs((th1 - th0) - Q) / Q
+    ok = err < 1e-12 and rel_th < tol
+    print(f"  {s.step} steps: Ohmic heat {Q:.5e}, thermal gain {th1 - th0:.5e} ({100 * rel_th:.2f}% off); "
+          f"magnetic loss {m0 - m1:.5e} = Ohmic + kinetic gain {k1 - k0:.2e} + rest {m0 - m1 - Q - (k1 - k0):.1e}; "
+          f"total energy error {err:.1e}  [{'PASS' if ok else 'FAIL'}]")
     return ok
 
 
@@ -356,6 +469,8 @@ VERIFICATION_TESTS = {
     "z_invariance": z_invariance_test,
     "alfven_z": alfven_z_test,
     "resistive_z": resistive_z_test,
+    "resistive_layers": resistive_layers_test,
+    "ohmic": ohmic_heating_test,
     "galilean": galilean_test,
     "rmi_mhd": rmi_mhd_smoke_test,
 }

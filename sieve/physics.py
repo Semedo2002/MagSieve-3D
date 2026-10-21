@@ -449,26 +449,126 @@ def mhd_rankine_hugoniot_local_gpu(gamma, M, rho1, p1, By_field):
 # ============================================================
 # Resistive MHD (GPU-vectorised, conservative)
 # ============================================================
-def compute_resistive_terms(U, eta, dx, dy):
+def resistivity_field(W, cfg):
+    """Cell-centred eta for the configured model. Returns a float for "constant" (so the
+    uniform case runs exactly as before) and an array shaped like W[0] otherwise."""
+    model = cfg.eta_model
+    if model == "constant":
+        eta = cfg.eta_resistivity
+        return min(eta, cfg.eta_max) if cfg.eta_max > 0 else eta
+    C = xp.clip(W[iCLR], 0.0, 1.0)
+    if model == "material":
+        eta = _blend(cfg.eta_fuel, cfg.eta_liner, C)
+    else:
+        # Spitzer: eta ~ T^-3/2, with T floored so cold cells don't blow up
+        T = xp.maximum(W[iPR] / xp.maximum(W[iRHO], FLOOR_RHO), cfg.eta_T_min)
+        eta = xp.minimum(cfg.eta_spitzer * T**-1.5, cfg.eta_max)
+        if cfg.eta_liner > 0:
+            eta = _blend(eta, cfg.eta_liner, C)
+    if cfg.eta_max > 0:
+        eta = xp.minimum(eta, cfg.eta_max)
+    return eta
+
+
+def _blend(a, b, C):
+    # log blend keeps a mixed cell between two very different conductivities from being
+    # dominated by the larger eta; falls back to linear if either side is zero
+    if isinstance(a, float) and isinstance(b, float) and (a <= 0 or b <= 0):
+        return (1 - C) * a + C * b
+    a = xp.maximum(a, 1e-300); b = xp.maximum(b, 1e-300)
+    return xp.exp((1 - C) * xp.log(a) + C * xp.log(b))
+
+
+def eta_max_of(eta):
+    return float(eta) if isinstance(eta, (int, float)) else float(xp.max(eta))
+
+
+def face_eta(eta, axis, mean="harmonic"):
+    """eta on the faces between neighbouring cells along `axis`. Harmonic mean by default:
+    it gives the right series resistance across a conductivity jump (a face between a good
+    and a bad conductor carries the current the good one allows, not the average)."""
+    if isinstance(eta, (int, float)):
+        return eta
+    n = eta.shape[axis]
+    a = xp.take(eta, xp.arange(0, n - 1), axis=axis)
+    b = xp.take(eta, xp.arange(1, n), axis=axis)
+    if mean == "arithmetic":
+        return 0.5 * (a + b)
+    return 2.0 * a * b / xp.maximum(a + b, 1e-300)
+
+
+def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic"):
     """Resistive induction and energy terms in conservative form.
 
     Induction: dB/dt = -curl(eta J), J = curl(B), with all three current
     components of the 2.5D problem (dz = 0).
     Energy:    dE/dt = -div(eta J x B)   (resistive Poynting flux).
 
-    Both are written as differences of face quantities, so the energy update
-    telescopes exactly and Ohmic heating eta|J|^2 appears in the pressure
-    through the drop in magnetic energy -- it is not added to E separately.
+    eta is a float or a cell-centred array; on faces it is averaged with face_eta.
+    Both terms are differences of face quantities, so the energy update telescopes
+    exactly and Ohmic heating eta|J|^2 shows up in the pressure through the drop in
+    magnetic energy -- it is not added to E separately.
 
-    Returns (R, Gx, Gy): R has shape U.shape with nonzero BX, BY, BZ, EN
-    entries on cells [1:-1, 1:-1]; Gx (nx_tot-1, ny_tot) and Gy
-    (nx_tot, ny_tot-1) are the energy fluxes on x- and y-faces.
+    Returns (R, Gx, Gy, q): R has shape U.shape with nonzero BX, BY, BZ, EN
+    entries on cells [1:-1, 1:-1]; Gx (nx_tot-1, ny_tot) and Gy (nx_tot, ny_tot-1)
+    are the energy fluxes on x- and y-faces; q is the Ohmic heating density on cells
+    [1:-1, 1:-1] (diagnostic only), built from each current component on the faces
+    where its derivative is compact. In 1D it equals the discrete magnetic energy
+    loss exactly (summation by parts).
     """
     R = xp.zeros_like(U)
     Gx = xp.zeros((U.shape[1] - 1, U.shape[2]), dtype=U.dtype)
     Gy = xp.zeros((U.shape[1], U.shape[2] - 1), dtype=U.dtype)
-    if eta <= 0:
-        return R, Gx, Gy
+    q = xp.zeros(U.shape[1:], dtype=U.dtype)
+    if eta_max_of(eta) <= 0:
+        return R, Gx, Gy, q
+    ex = face_eta(eta, 0, face_mean)
+    ey = face_eta(eta, 1, face_mean)
+
+    Bx, By, Bz = U[BX], U[BY], U[BZ]
+
+    # Cell-centred transverse derivatives (zero on the outermost ring).
+    dBx_dy = xp.zeros_like(Bx); dBz_dy = xp.zeros_like(Bz)
+    dBy_dx = xp.zeros_like(By); dBz_dx = xp.zeros_like(Bz)
+    dBx_dy[:, 1:-1] = (Bx[:, 2:] - Bx[:, :-2]) / (2.0 * dy)
+    dBz_dy[:, 1:-1] = (Bz[:, 2:] - Bz[:, :-2]) / (2.0 * dy)
+    dBy_dx[1:-1, :] = (By[2:, :] - By[:-2, :]) / (2.0 * dx)
+    dBz_dx[1:-1, :] = (Bz[2:, :] - Bz[:-2, :]) / (2.0 * dx)
+
+    # Currents on x-faces (i+1/2, j): compact normal derivative, averaged transverse.
+    Jx_xf = 0.5 * (dBz_dy[1:, :] + dBz_dy[:-1, :])
+    Jy_xf = -(Bz[1:, :] - Bz[:-1, :]) / dx
+    Jz_xf = (By[1:, :] - By[:-1, :]) / dx - 0.5 * (dBx_dy[1:, :] + dBx_dy[:-1, :])
+
+    # Currents on y-faces (i, j+1/2).
+    Jx_yf = (Bz[:, 1:] - Bz[:, :-1]) / dy
+    Jz_yf = 0.5 * (dBy_dx[:, 1:] + dBy_dx[:, :-1]) - (Bx[:, 1:] - Bx[:, :-1]) / dy
+
+    # electric field E = eta J on the faces
+    Ex_yf, Ez_yf = ey * Jx_yf, ey * Jz_yf
+    Ey_xf, Ez_xf = ex * Jy_xf, ex * Jz_xf
+
+    # Induction, curl form: dBx/dt = -d(Ez)/dy, dBy/dt = d(Ez)/dx,
+    # dBz/dt = -d(Ey)/dx + d(Ex)/dy.
+    R[BX, 1:-1, 1:-1] = -(Ez_yf[1:-1, 1:] - Ez_yf[1:-1, :-1]) / dy
+    R[BY, 1:-1, 1:-1] = (Ez_xf[1:, 1:-1] - Ez_xf[:-1, 1:-1]) / dx
+    R[BZ, 1:-1, 1:-1] = (-(Ey_xf[1:, 1:-1] - Ey_xf[:-1, 1:-1]) / dx
+                         + (Ex_yf[1:-1, 1:] - Ex_yf[1:-1, :-1]) / dy)
+
+    # Resistive Poynting flux E x B on faces.
+    By_xf = 0.5 * (By[1:, :] + By[:-1, :]); Bz_xf = 0.5 * (Bz[1:, :] + Bz[:-1, :])
+    Bx_yf = 0.5 * (Bx[:, 1:] + Bx[:, :-1]); Bz_yf = 0.5 * (Bz[:, 1:] + Bz[:, :-1])
+    Gx[...] = Ey_xf * Bz_xf - Ez_xf * By_xf
+    Gy[...] = Ez_yf * Bx_yf - Ex_yf * Bz_yf
+    R[EN, 1:-1, 1:-1] = (-(Gx[1:, 1:-1] - Gx[:-1, 1:-1]) / dx
+                         - (Gy[1:-1, 1:] - Gy[1:-1, :-1]) / dy)
+
+    # Ohmic heating: Jy is compact on x-faces, Jx on y-faces, Jz on both (half weight each)
+    qx = Ey_xf * Jy_xf + 0.5 * Ez_xf * Jz_xf
+    qy = Ex_yf * Jx_yf + 0.5 * Ez_yf * Jz_yf
+    q[1:-1, 1:-1] = (0.5 * (qx[1:, 1:-1] + qx[:-1, 1:-1])
+                     + 0.5 * (qy[1:-1, 1:] + qy[1:-1, :-1]))
+    return R, Gx, Gy, q
 
     Bx, By, Bz = U[BX], U[BY], U[BZ]
 

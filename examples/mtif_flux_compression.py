@@ -7,6 +7,10 @@ div B = 0 holds exactly; flux surfaces are drawn as circles enclosing fixed frac
     python examples/mtif_flux_compression.py                 # 512 x 512, run + plots
     python examples/mtif_flux_compression.py --quick --check # 128 x 128 smoke test
     python examples/mtif_flux_compression.py --plot-only     # redo plots from saved data
+    python examples/mtif_flux_compression.py --sigma-liner 3.5e7   # resistive aluminium liner
+
+Conductivities are in S/m; the code units are tied to SI through --r-ref-mm (core radius) and
+--v-ref-kms (sqrt(p/rho) of the core), defaulting to the NearStar example's scales.
 
 Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
@@ -27,6 +31,7 @@ with contextlib.redirect_stdout(io.StringIO()):
     from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iBZ, iPR, iCLR
     from sieve.physics import xp, prim_to_cons, cons_to_prim
     from sieve.solver import MHDSolver, to_numpy
+    from sieve.units import add_resistivity_args, resistivity_from_args
 
 GAMMA = 5.0 / 3.0
 
@@ -34,7 +39,9 @@ GAMMA = 5.0 / 3.0
 def setup(a):
     """Build the solver and the initial state."""
     L = 1.0
-    cfg = Config(nx=a.n, ny=a.n, x_min=-L, x_max=L, y_min=-L, y_max=L, t_end=a.t_end, cfl=0.3,
+    L0 = a.r_ref_mm * 1e-3 / a.R0                               # code length unit in m
+    a.eta = resistivity_from_args(a, L0, a.v_ref_kms * 1e3)
+    cfg = Config(**a.eta, nx=a.n, ny=a.n, x_min=-L, x_max=L, y_min=-L, y_max=L, t_end=a.t_end, cfl=0.3,
                  gamma=GAMMA, B_transverse=a.B0, B_field_type="uniform", powell_source=True,
                  bc_x_type="extrapolation", bc_y_type="outflow", diag_interval=10**9, snapshot_times=[])
     s = MHDSolver(cfg)
@@ -84,7 +91,8 @@ def diag(s, a, E0=None):
     row = {
         "t": s.t, "step": s.step,
         "R": R, "B_max": float(xp.max(xp.abs(Bz))), "B_core_mean": core_flux / max(core_area, 1e-30),
-        "flux": flux,
+        "flux": flux, "core_flux": core_flux,
+        "ohmic": s.cumulative_ohmic_heating,
         "E_kin": float(xp.sum(0.5 * rho * v2)) * dA, "E_mag": float(xp.sum(0.5 * B2)) * dA,
         "E_th": float(xp.sum(p)) * dA / (GAMMA - 1), "E_tot": E,
         "divB_L2": float(xp.sqrt(xp.mean(divB**2))), "divB_max": float(xp.max(xp.abs(divB))),
@@ -105,6 +113,9 @@ def run(a, out):
     os.makedirs(out, exist_ok=True)
     s, V = setup(a)
     print(f"liner speed {V:.3f} (Mach {a.mach:g}), rho_liner {a.rho_liner:g}, grid {a.n}x{a.n}", flush=True)
+    if a.eta:
+        print(f"resistivity: {a.eta_model}, " + ", ".join(f"{k} {v:.3g}" for k, v in a.eta.items()
+                                                       if not isinstance(v, str)), flush=True)
     rows, E0 = [], None
     row, E0 = diag(s, a, E0)
     rows.append(row)
@@ -148,7 +159,12 @@ def run(a, out):
         "energy_error_max": float(np.max(np.abs(d["energy_error"]))),
         "p_min": float(d["p_min"].min()), "rho_min": float(d["rho_min"].min()),
         "divB_max": float(d["divB_max"].max()),
+        "eta_model": a.eta_model, "eta_code": a.eta,
+        "core_flux_retained_at_turnaround": float(d["core_flux"][i_turn] / d["core_flux"][0]),
+        "ohmic_heat_over_E0": float(d["ohmic"][-1] / d["E_tot"][0]),
     }
+    if a.eta.get("eta_liner", 0) > 0:
+        summary["Rm_liner"] = float(V * a.R0 / a.eta["eta_liner"])    # V R0 / eta
     with open(os.path.join(out, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=2)
     print(f"done: {s.step} steps, {summary['wall_s']:.0f}s | convergence ratio {summary['convergence_ratio']:.2f}, "
@@ -244,6 +260,9 @@ def main():
     ap.add_argument("--check", action="store_true", help="fail unless the run passes the smoke checks")
     ap.add_argument("--plot-only", action="store_true")
     ap.add_argument("--no-plot", action="store_true")
+    ap.add_argument("--r-ref-mm", dest="r_ref_mm", type=float, default=8.0, help="core radius in mm (SI scale)")
+    ap.add_argument("--v-ref-kms", dest="v_ref_kms", type=float, default=1.0, help="core sqrt(p/rho) in km/s")
+    add_resistivity_args(ap)
     a = ap.parse_args()
     a.rho_core, a.p_core, a.R0, a.R1, a.diag_every = 1.0, 1.0, 0.5, 0.7, 5
     if a.quick:
@@ -254,7 +273,9 @@ def main():
         summ = run(a, a.out)
         if a.check:
             ok = (summ["p_min"] > 0 and summ["rho_min"] > 0 and summ["energy_error_max"] < 1e-10
-                  and summ["flux_drift"] < 1e-10 and summ["B_max_over_B0"] > 2)
+                  # with resistivity, flux diffusing into the ambient can leave through the open boundary
+                  and summ["flux_drift"] < (1e-10 if a.eta_model == "ideal" else 1e-6)
+                  and summ["B_max_over_B0"] > 2)
             print("smoke check:", "PASS" if ok else "FAIL")
             if not ok:
                 sys.exit(1)

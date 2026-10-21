@@ -117,8 +117,29 @@ class PhysicsConfig:
     bc_y_type: str = "periodic"
     enable_smoothing: bool = False
     eta_resistivity: float = 0.0
+    # resistivity model: "constant" (eta_resistivity everywhere), "material" (eta_fuel where the
+    # tracer C = 0, eta_liner where C = 1, log blend in between) or "spitzer" (eta_spitzer * T^-3/2
+    # with T = p/rho floored at eta_T_min; blended toward eta_liner by C when eta_liner > 0).
+    # eta_max > 0 caps eta in any model (required for spitzer). Face values use eta_face_mean.
+    eta_model: str = "constant"
+    eta_fuel: float = 0.0
+    eta_liner: float = 0.0
+    eta_spitzer: float = 0.0
+    eta_T_min: float = 1e-2
+    eta_max: float = 0.0
+    eta_face_mean: str = "harmonic"
     localized_rh: bool = False
     enstrophy_locking_fraction: float = 0.20
+
+    def __post_init__(self):
+        if self.eta_model not in ("constant", "material", "spitzer"):
+            raise ValueError(f"eta_model must be constant, material or spitzer, not {self.eta_model!r}")
+        if self.eta_face_mean not in ("harmonic", "arithmetic"):
+            raise ValueError(f"eta_face_mean must be harmonic or arithmetic, not {self.eta_face_mean!r}")
+        if self.eta_model == "spitzer" and not (self.eta_T_min > 0 and self.eta_max > 0 and self.eta_spitzer > 0):
+            raise ValueError("eta_model='spitzer' needs eta_spitzer > 0, eta_T_min > 0 and eta_max > 0")
+        if min(self.eta_resistivity, self.eta_fuel, self.eta_liner, self.eta_max) < 0:
+            raise ValueError("resistivities must be non-negative")
 
     def get_bc_x(self) -> str:
         if self.bc_x_type == "characteristic":
@@ -134,7 +155,12 @@ class PhysicsConfig:
         return self.B_transverse > 0
 
     def is_resistive(self) -> bool:
-        return self.eta_resistivity > 0 and self.is_mhd()
+        # independent of B_transverse: a field set up by hand (e.g. axial Bz) still diffuses
+        if self.eta_model == "constant":
+            return self.eta_resistivity > 0
+        if self.eta_model == "material":
+            return max(self.eta_fuel, self.eta_liner) > 0
+        return True
 
 
 @dataclass(frozen=True)

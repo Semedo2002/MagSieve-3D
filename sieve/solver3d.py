@@ -12,7 +12,8 @@ from .config import (
     RHO, MX, MY, MZ, BX, BY, BZ, EN, PSI, RHOC,
     iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iPSI, iCLR,
 )
-from .physics import xp, cons_to_prim, prim_to_cons, hlld_flux_x, parallel_stripe_state
+from .physics import (xp, cons_to_prim, prim_to_cons, hlld_flux_x, parallel_stripe_state,
+                      resistivity_field, face_eta, eta_max_of)
 from .solver import MHDSolver, to_numpy
 
 # variable permutations that rotate the y or z face normal onto x for the HLLD kernel
@@ -56,12 +57,13 @@ def _levi(i, j, k):
     return 1.0 if (i, j, k) in ((0, 1, 2), (1, 2, 0), (2, 0, 1)) else -1.0
 
 
-def resistive_terms_3d(U, eta, h, ng, n):
+def resistive_terms_3d(U, eta, h, ng, n, face_mean="harmonic"):
     """Resistive induction and energy terms as differences of face fluxes.
 
     Induction -curl(eta J) is the divergence of F_j(B_i) = eps_ijk eta J_k; energy uses the
     resistive Poynting flux eta (J x B). J on a face: compact difference along the face normal,
-    averaged centred differences across it (reduces to the 2D form when d/dz = 0).
+    averaged centred differences across it (reduces to the 2D form when d/dz = 0). eta is a float
+    or a cell-centred array, averaged onto faces with face_eta (harmonic by default).
     Returns (R over all cells, net resistive energy inflow through the domain faces).
     """
     B = [U[BX], U[BY], U[BZ]]
@@ -87,6 +89,7 @@ def resistive_terms_3d(U, eta, h, ng, n):
             return 0.5 * (D[c][d][lo] + D[c][d][hi])
 
         J = (dface(2, 1) - dface(1, 2), dface(0, 2) - dface(2, 0), dface(1, 0) - dface(0, 1))
+        ef = face_eta(eta, ax, face_mean)
         Bf = [0.5 * (B[c][lo] + B[c][hi]) for c in range(3)]
         # face index k lies between cells k and k+1: interior cells use F[c] - F[c-1]
         a_hi = list(inner); a_hi[ax] = slice(ng, ng + n[ax]); a_hi = tuple(a_hi)
@@ -95,9 +98,9 @@ def resistive_terms_3d(U, eta, h, ng, n):
             if i == ax:
                 continue
             k = 3 - i - ax
-            F = _levi(i, ax, k) * eta * J[k]
+            F = _levi(i, ax, k) * ef * J[k]
             R[(BX + i,) + inner] -= (F[a_hi] - F[a_lo]) / h[ax]
-        G = eta * (J[(ax + 1) % 3] * Bf[(ax + 2) % 3] - J[(ax + 2) % 3] * Bf[(ax + 1) % 3])
+        G = ef * (J[(ax + 1) % 3] * Bf[(ax + 2) % 3] - J[(ax + 2) % 3] * Bf[(ax + 1) % 3])
         R[(EN,) + inner] -= (G[a_hi] - G[a_lo]) / h[ax]
         f_lo = list(inner); f_lo[ax] = ng - 1
         f_hi = list(inner); f_hi[ax] = ng + n[ax] - 1
@@ -139,6 +142,7 @@ class MHDSolver3D:
         self._ch = 0.0
         self._inflow_U = None
         self._inflow_R = None
+        self._sigma = None          # sponge off until initialize() sets it up (hand-built states skip that)
         self._acc_boundary = xp.zeros(())
         self._acc_powell = xp.zeros(())
         self._rate_boundary = xp.zeros(())
@@ -306,9 +310,10 @@ class MHDSolver3D:
         h = min(cfg.dx, cfg.dy, cfg.dz)
         inv = max(float(xp.max(xp.maximum(xp.maximum(sx / cfg.dx, sy / cfg.dy), sz / cfg.dz))), self._ch / h)
         dt = cfg.cfl / inv
-        if cfg.eta_resistivity > 0:
-            # explicit diffusion: dt <= 1 / (2 eta (1/dx^2 + 1/dy^2 + 1/dz^2))
-            dt = min(dt, 0.5 / (cfg.eta_resistivity * (cfg.dx**-2 + cfg.dy**-2 + cfg.dz**-2)))
+        if cfg.is_resistive():
+            # explicit diffusion: dt <= 1 / (2 eta_max (1/dx^2 + 1/dy^2 + 1/dz^2))
+            eta_max = max(eta_max_of(resistivity_field(W, cfg)), 1e-300)
+            dt = min(dt, 0.5 / (eta_max * (cfg.dx**-2 + cfg.dy**-2 + cfg.dz**-2)))
         return dt
 
     # ------------------------------------------------------------ right-hand side
@@ -351,8 +356,8 @@ class MHDSolver3D:
             S[EN] = -divB * vB
             out[inner] += S[inner]
             self._rate_powell = xp.sum(S[EN][inner[1:]]) * cfg.dx * cfg.dy * cfg.dz
-        if cfg.eta_resistivity > 0:
-            Rr, rate_r = resistive_terms_3d(U, cfg.eta_resistivity, h, ng, n)
+        if cfg.is_resistive():
+            Rr, rate_r = resistive_terms_3d(U, resistivity_field(W, cfg), h, ng, n, cfg.eta_face_mean)
             out[inner] += Rr[inner]
             self._rate_boundary = self._rate_boundary + rate_r
         return out

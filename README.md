@@ -10,12 +10,14 @@ A 2D and 3D compressible MHD solver (CuPy + a custom CUDA HLLD kernel) and the p
 sieve/            solver package
   config.py       typed configuration (unknown keys raise ValueError)
   physics.py      CUDA HLLD wrapper, MUSCL, jump conditions, resistive terms, stripe equilibrium
+  units.py        SI helpers: conductivity to code-unit diffusivity, Spitzer coefficient
   hlld_kernel.cu  HLLD Riemann solver (one thread per face)
   solver.py       MHDSolver (SSP-RK3, GLM + Powell, BCs, energy budget) and PostProcessor
   solver3d.py     MHDSolver3D: unsplit HLLD in x, y, z (same kernel, rotated), z-periodic, 3D seeding,
                   current-density and generated-field diagnostics
   diagnostics.py  mixing, enstrophy, interface spectrum, div B, energy
 main.py           CLI: verification tests, single cases, legacy campaign
+examples/         MTIF liner flux compression; synthetic magnetic probes (SI units)
 experiments/      sweeps A-H and analysis scripts; data/ holds the saved results
 paper/            figure and .docx generators, figures/, magnetic_sieve.docx
 rmi_output_gpu/   figures and GIFs written by the solver
@@ -36,12 +38,26 @@ See `CONTRIBUTING.md` for the development workflow.
 ## Usage
 
 ```
-python main.py --test all                     # verification suite, ~3 min
+python main.py --test all                     # verification suite, ~20 min on a Quadro P1000
 python main.py --case striped --B0 3.5 --gap-fraction 0.9 --compare-hydro
 python main.py --help
 ```
 
 `--case` runs a 12 x 2 domain to t = 0.8 and writes figures and 61-frame GIFs to `rmi_output_gpu/`.
+
+### Resistivity
+
+`eta_model` selects `constant` (`eta_resistivity` everywhere, the default), `material` (`eta_fuel` where the
+tracer is 0, `eta_liner` where it is 1, log blend between) or `spitzer` (`eta_spitzer` T^-3/2 with T = p/rho
+floored at `eta_T_min`, capped at `eta_max`). Face values use the harmonic mean, so a conductivity jump carries
+the series resistance of the two cells; the resistive terms stay in face-flux form and conserve energy exactly,
+and `cumulative_ohmic_heating` integrates eta J^2. The explicit time step uses the largest eta on the grid. The
+examples take SI conductivities:
+
+```
+python examples/mtif_flux_compression.py --sigma-liner 3.5e7          # aluminium liner, S/m
+python examples/nearstar_mtif3_validation.py --eta-model spitzer --sigma-liner 3.5e7
+```
 
 ## Verification
 
@@ -54,9 +70,11 @@ python main.py --help
 | reflection | residual of fast and Alfvén pulses after leaving through the outflow boundary (3.5e-5, 7e-10) |
 | conservation | energy budget closes to round-off (~1e-14); div B = 0 for Bz stripes, < 3% (h max\|div B\|/max\|B\|) otherwise |
 | equilibrium | upstream gas stays at rest for pressure-balanced x stripes; misspelled config keys are rejected |
-| z_invariance | z-invariant 3D runs reproduce the 2D solver, ideal and resistive (difference 1e-14) |
+| z_invariance | z-invariant 3D runs reproduce the 2D solver: ideal, constant eta, and eta varying 8x across the interface |
 | alfven_z | Alfven wave along z converges (orders 1.3, 1.9 at nz = 16-64) |
 | resistive_z | weak B_x(z) decays as exp(-eta k^2 t) (error 3e-4); Ohmic heating conserves energy |
+| resistive_layers | two-layer steady diffusion, eta jumps 4x: piecewise-linear B_z recovered to 3e-4 with harmonic face averaging (arithmetic: 1.7e-2) |
+| ohmic | periodic box, eta varying 10x: thermal energy gained matches the integral of eta J^2 to 0.14%, total energy to 2e-14 |
 
 ## Reproducing the study
 
@@ -127,7 +145,8 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 
 ## Model and numerical limitations
 
-- 2D, ideal gas (γ = 5/3), constant resistivity, no physical viscosity or conduction.
+- Ideal gas (γ = 5/3) for every material, no physical viscosity or thermal conduction, no radiation.
+- Resistivity is scalar (isotropic), with no Hall term. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
 - Cell-centred magnetic field with GLM cleaning; the divergence error at shocks is a few percent (no constrained transport).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.
 - Shock-parallel stripes are restricted to the fast-shock regime, B0 < 6.55 sqrt(p_bar) at Mach 10; switch-on shocks are not modelled.

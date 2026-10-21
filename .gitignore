@@ -8,3 +8,4 @@ results/**/vtk/
 results/**/frames.npz
 results/rmi_mhd_quick/
 results/*_quick/
+results/phase1_checks/

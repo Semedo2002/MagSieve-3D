@@ -35,6 +35,8 @@ from .physics import (
     parallel_stripe_limits,
     parallel_stripe_state,
     compute_resistive_terms,
+    resistivity_field,
+    eta_max_of,
     richtmyer_linear_theory,
     smooth,
 )
@@ -145,6 +147,9 @@ class MHDSolver:
         self._acc_powell_energy = xp.zeros(())
         self._stage_boundary_rate = xp.zeros(())
         self._stage_powell_rate = xp.zeros(())
+        # Ohmic heating integral (diagnostic; already inside E through the Poynting flux)
+        self._acc_ohmic = xp.zeros(())
+        self._stage_ohmic_rate = xp.zeros(())
         self._inflow_U = None
         self._inflow_superfast = None
         self._dt_limiter = "hyperbolic"
@@ -266,6 +271,7 @@ class MHDSolver:
         self.t = 0.0; self.step = 0
         self._acc_boundary_energy = xp.zeros(())
         self._acc_powell_energy = xp.zeros(())
+        self._acc_ohmic = xp.zeros(())
         self._rho_light = rho1; self._rho_heavy = rho_h
         # Post-shock state held fixed in the x_min ghost cells (driven shock).
         self._inflow_U = self.U[:, :self.ng, :].copy()
@@ -297,7 +303,11 @@ class MHDSolver:
         else:
             print(f"  B_y=0 (pure hydro)")
         if cfg.is_resistive():
-            print(f"  RESISTIVE MHD: eta = {cfg.eta_resistivity:.4e}")
+            if cfg.eta_model == "constant":
+                print(f"  RESISTIVE MHD: eta = {cfg.eta_resistivity:.4e}")
+            else:
+                print(f"  RESISTIVE MHD: eta model {cfg.eta_model}, fuel {cfg.eta_fuel:.3e}, liner "
+                      f"{cfg.eta_liner:.3e}, cap {cfg.eta_max:.3e}, {cfg.eta_face_mean} face mean")
         print(f"  Grid: {cfg.nx}x{cfg.ny}, dx={cfg.dx:.4f}, R-H: {'localized' if cfg.localized_rh else 'global'}")
         if cfg.powell_source:
             print(f"  Powell source terms: ENABLED")
@@ -410,7 +420,8 @@ class MHDSolver:
         if cfg.is_resistive():
             # Explicit diffusion of B: FTCS 2D limit dt <= 1 / (2 eta (1/dx^2 + 1/dy^2))
             # (= dx^2 / 4 eta for dx = dy); SSP-RK3 is stable to ~2.5x this.
-            dt_par = 0.5 / (cfg.eta_resistivity * (1.0 / cfg.dx**2 + 1.0 / cfg.dy**2))
+            eta_max = eta_max_of(resistivity_field(W, cfg))
+            dt_par = 0.5 / (max(eta_max, 1e-300) * (1.0 / cfg.dx**2 + 1.0 / cfg.dy**2))
             if dt_par < dt:
                 dt = dt_par
                 self._dt_limiter = "parabolic"
@@ -423,6 +434,11 @@ class MHDSolver:
     @property
     def _cumulative_powell_energy(self):
         return float(self._acc_powell_energy)
+
+    @property
+    def cumulative_ohmic_heating(self):
+        """Integral of eta |J|^2 over the domain and time so far."""
+        return float(self._acc_ohmic)
 
     def _compute_powell_source(self, U, W):
         cfg = self.cfg
@@ -465,6 +481,7 @@ class MHDSolver:
         boundary_rate = (xp.sum(Fx[EN, 0, ng:ng+ny] - Fx[EN, nx, ng:ng+ny]) * cfg.dy
                          + xp.sum(Fy[EN, ng:ng+nx, 0] - Fy[EN, ng:ng+nx, ny]) * cfg.dx)
         powell_rate = xp.zeros(())
+        ohmic_rate = xp.zeros(())
         # Powell source for ANY MHD case (uniform or striped)
         if cfg.powell_source and cfg.is_mhd():
             S = self._compute_powell_source(U, W)
@@ -472,18 +489,22 @@ class MHDSolver:
             powell_rate = xp.sum(S[EN, ng:ng+nx, ng:ng+ny]) * cfg.dx * cfg.dy
         # Resistive MHD: -curl(eta J) in induction, -div(eta J x B) in energy
         if cfg.is_resistive():
-            R_resist, Gx, Gy = compute_resistive_terms(U, cfg.eta_resistivity, cfg.dx, cfg.dy)
+            eta = resistivity_field(W, cfg)
+            R_resist, Gx, Gy, q = compute_resistive_terms(U, eta, cfg.dx, cfg.dy, cfg.eta_face_mean)
             R[:, ng:ng+nx, ng:ng+ny] += R_resist[:, ng:ng+nx, ng:ng+ny]
+            ohmic_rate = xp.sum(q[ng:ng+nx, ng:ng+ny]) * cfg.dx * cfg.dy
             boundary_rate = boundary_rate + (
                 xp.sum(Gx[ng-1, ng:ng+ny] - Gx[ng+nx-1, ng:ng+ny]) * cfg.dy
                 + xp.sum(Gy[ng:ng+nx, ng-1] - Gy[ng:ng+nx, ng+ny-1]) * cfg.dx)
         self._stage_boundary_rate = boundary_rate
         self._stage_powell_rate = powell_rate
+        self._stage_ohmic_rate = ohmic_rate
         return R
 
     def _accumulate_energy_budget(self, weight):
         self._acc_boundary_energy += weight * self._stage_boundary_rate
         self._acc_powell_energy += weight * self._stage_powell_rate
+        self._acc_ohmic += weight * self._stage_ohmic_rate
 
     def step_ssprk3(self):
         dt = self.dt; self._glm_ch_frozen = self.cfg.glm_ch

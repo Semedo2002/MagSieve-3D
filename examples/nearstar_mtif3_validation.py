@@ -4,13 +4,15 @@ A dense liner moving inward at >= 10 km/s compresses a pre-magnetized fuel colum
 in a 2D cross-section. Virtual probes at fixed radii record B(t) and dB/dt like b-dot channels.
 
 IMPORTANT: the default machine parameters below are illustrative placeholders, not NearStar's MTIF-3
-values, and the solver is ideal-gas MHD (no solid/liquid EOS for the projectile, no magnetic diffusion
-into the liner, no radiation). Use the traces for signal shape and scaling; replace the parameters with
+values, and the solver is ideal-gas MHD (no solid/liquid EOS for the projectile, no radiation; magnetic
+diffusion into the liner only with --sigma-liner). Use the traces for signal shape and scaling; replace the parameters with
 the real shot values, and add the missing physics, before comparing amplitudes with measured data.
 
     python examples/nearstar_mtif3_validation.py                  # 384 x 384, run + plots
     python examples/nearstar_mtif3_validation.py --quick --check  # smoke test
     python examples/nearstar_mtif3_validation.py --plot-only
+    python examples/nearstar_mtif3_validation.py --sigma-liner 3.5e7            # resistive Al liner
+    python examples/nearstar_mtif3_validation.py --eta-model spitzer --sigma-liner 3.5e7
 
 Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
@@ -31,6 +33,7 @@ with contextlib.redirect_stdout(io.StringIO()):
     from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iBZ, iPR, iCLR
     from sieve.physics import xp, prim_to_cons, cons_to_prim
     from sieve.solver import MHDSolver, to_numpy
+    from sieve.units import add_resistivity_args, resistivity_from_args
 
 GAMMA = 5.0 / 3.0
 MU0 = 4e-7 * np.pi
@@ -47,7 +50,8 @@ def units(a):
 
 
 def setup(a, u):
-    cfg = Config(nx=a.n, ny=a.n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=a.t_end_us * 1e-6 / u["t0"],
+    a.eta = resistivity_from_args(a, u["L0"], u["v0"])
+    cfg = Config(**a.eta, nx=a.n, ny=a.n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=a.t_end_us * 1e-6 / u["t0"],
                  cfl=0.3, gamma=GAMMA, B_transverse=1.0, B_field_type="uniform", powell_source=True,
                  bc_x_type="extrapolation", bc_y_type="outflow", diag_interval=10**9, snapshot_times=[])
     s = MHDSolver(cfg)
@@ -125,6 +129,10 @@ def run(a, out):
           f"(beta = {2 / B0**2:.3g}); time unit {u['t0'] * 1e6:.3g} us", flush=True)
     if a.v_liner_kms < 10 or mach < 5:
         print("warning: liner below 10 km/s or Mach 5", flush=True)
+    if a.eta:
+        Rm = V * R_CODE / a.eta["eta_liner"] if a.eta.get("eta_liner", 0) > 0 else float("inf")
+        print(f"resistivity: {a.eta_model}, liner eta {a.eta.get('eta_liner', 0) * u['L0'] * u['v0']:.3g} m^2/s "
+              f"(Rm = {Rm:.3g}), cap {a.eta['eta_max'] * u['L0'] * u['v0']:.3g} m^2/s", flush=True)
     probes = probe_index(s, a.probes_mm, u)
     rows = []
     R_min, rho_peak, t_peak = 1e9, None, 0.0
@@ -156,6 +164,8 @@ def run(a, out):
     t_us = T[:, 0]
     B = T[:, 2:]
     dB = np.gradient(B, t_us, axis=0)            # T/us
+    # Ohmic heat, J/m of column: code energy per unit length * p0 * L0^2
+    ohmic_J_per_m = s.cumulative_ohmic_heating * u["p0"] * u["L0"]**2
     head = ["t_us", "R_core_mm"] + [f"B_{r:g}mm_T" for r in a.probes_mm] + [f"dBdt_{r:g}mm_T_per_us" for r in a.probes_mm]
     with open(os.path.join(out, "synthetic_probes.csv"), "w", newline="") as fh:
         wr = csv.writer(fh)
@@ -172,7 +182,9 @@ def run(a, out):
     Rmm = T[:, 1]
     near = np.where(Rmm <= 1.1 * Rmm.min())[0]
     summary = {
-        "note": "illustrative parameters and ideal-gas MHD; not a prediction of MTIF-3 shot data",
+        "note": "illustrative parameters and ideal-gas MHD" + ("" if not a.eta else f" with {a.eta_model} resistivity")
+                + "; not a prediction of MTIF-3 shot data",
+        "eta_model": a.eta_model, "eta_code": a.eta, "ohmic_heat_J_per_m": ohmic_J_per_m,
         "params": vars(a), "units": u, "liner_mach": mach, "beta_seed": 2 / B0**2,
         "B_peak_T": float(B.max()), "B_peak_innermost_T": float(b1[k_pk]), "B_peak_over_seed": float(b1[k_pk] / a.b_seed_t),
         "t_peak_us": float(t_us[k_pk]), "rise_time_10_90_us": t90 - t10,
@@ -234,7 +246,8 @@ def plot(out):
     axR.set_xlabel("x (mm)"); axR.set_ylabel("y (mm)")
     axR.set_title(f"peak compression, $t$ = {float(pk['t_us']):.3f} $\\mu$s", loc="left", fontsize=10)
     fig.colorbar(im, ax=axR, shrink=0.85, label=r"$\log_{10}\rho$ (kg/m$^3$)")
-    fig.text(0.01, 0.005, "Illustrative parameters, ideal-gas MHD: signal shape and scaling only, not a prediction "
+    eta_note = "" if summ.get("eta_model", "ideal") == "ideal" else f" with {summ['eta_model']} resistivity"
+    fig.text(0.01, 0.005, f"Illustrative parameters, ideal-gas MHD{eta_note}: signal shape and scaling only, not a prediction "
              "of MTIF-3 shot data.", fontsize=8, color="#666666")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     fig.savefig(os.path.join(out, "nearstar_mtif3_probe_signals.png"), dpi=220)
@@ -263,6 +276,7 @@ def main():
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--plot-only", action="store_true")
     ap.add_argument("--no-plot", action="store_true")
+    add_resistivity_args(ap)
     a = ap.parse_args()
     if a.quick:
         a.n = 128
