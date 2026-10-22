@@ -140,6 +140,41 @@ python ../paper/make_paper.py
 | G | resolution check (ny = 100 vs 200) |
 | H | figure set: spectrum, enstrophy location, energy budget |
 
+## Multi-physics MTIF capabilities
+
+MagSieve-3D includes physics modules for magnetized target inertial fusion (MTIF) and magnetically driven
+shock compression, each verified against an analytic solution in `python main.py --test all`:
+
+- **Shock capturing and div B control:** HLLD Riemann solver, MUSCL reconstruction, GLM cleaning with Powell
+  source terms. The divergence error at shocks is a few percent (h max|div B|/max|B| of 1.3-2.5% in the
+  conservation test); in the MTIF examples the field is axial and div B = 0 exactly.
+- **Variable resistivity:** constant, material-blended (liner/fuel) or Spitzer (T^-3/2 with a temperature floor
+  and cap). The resistive terms are face fluxes, so energy is conserved exactly; harmonic face averaging gives
+  the correct series resistance across a conductivity jump (two-layer steady diffusion recovered to 3e-4).
+- **Two-material EOS:** ideal gas, stiffened gas and Mie-Gruneisen (linear Us-Up) for metallic liners. The
+  interface uses a volume fraction advected non-conservatively (Shyue 1998), which keeps a gas/aluminium
+  interface at uniform pressure to 1e-9. A 10 km/s aluminium impact matches the exact jump conditions to
+  within 0.5%.
+- **Optically thin bremsstrahlung:** an operator-split sink using the exact solution at fixed density, so it
+  is stable at any time step. In the decay test T(t) matches the analytic solution to 1e-14 and E + E_rad is
+  conserved to 7e-16.
+
+The EOS and radiation modules are 2D only. Liners have no strength or spall, and the example parameters are
+illustrative, not taken from any experiment.
+
+### Examples
+
+```bash
+# liner-driven flux compression: stiffened-gas aluminium liner with finite conductivity
+python examples/mtif_flux_compression.py --eos-liner stiffened --sigma-liner 3.5e7
+
+# the same at hot, dense core scales (~100 eV), where bremsstrahlung matters
+python examples/mtif_flux_compression.py --enable-rad --v-ref-kms 100 --rho-ref 100
+
+# synthetic b-dot probe signals for an MTIF-3-style implosion, Mie-Gruneisen aluminium liner
+python examples/nearstar_mtif3_validation.py --eos-liner mie_gruneisen --sigma-liner 3.5e7
+```
+
 ## Benchmark: high-Mach MHD Richtmyer-Meshkov instability
 
 A Mach-5 shock hits a single-mode interface between a light gas and one ten times denser. Baroclinic
