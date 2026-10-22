@@ -181,16 +181,17 @@ def diagnostics_for_solver(solver):
     }
 
 
-def enclosed_by_tracer(C, X, Y, n_theta=256):
-    """Mask of cells inside a ring marked by the tracer (C >= 0.5), e.g. the gas a liner encloses: per
-    angle bin, everything closer to the origin than the nearest marked cell. Works whatever the tracer
+def enclosed_by_tracer(C, X, Y, n_theta=256, threshold=0.5):
+    """Mask of cells inside a ring marked by the tracer (C >= threshold), e.g. the gas a liner encloses:
+    per angle bin, everything closer to the origin than the nearest marked cell. Works whatever the tracer
     marks outside the ring and for a non-circular ring. Bins with no marked cell use the largest radius
-    found elsewhere."""
+    found elsewhere. With a threshold near 1 and weights (1 - C), sums over the enclosed cells vary
+    smoothly as cells fill with tracer (no one-cell jumps)."""
     c, x, y = (xp.asnumpy(v) if hasattr(xp, "asnumpy") else np.asarray(v) for v in (C, X, Y))
     r = np.hypot(x, y)
     b = ((np.arctan2(y, x) + np.pi) / (2 * np.pi) * n_theta).astype(int) % n_theta
     R = np.full(n_theta, np.inf)
-    hit = c >= 0.5
+    hit = c >= threshold
     np.minimum.at(R, b[hit], r[hit])
     if np.all(np.isinf(R)):
         return np.zeros_like(c, dtype=bool)
@@ -205,3 +206,37 @@ def cavitation_split(margin, C, pure_tol=1e-6):
     pure = (C < pure_tol) | (C > 1 - pure_tol)
     m_pure = float(xp.min(xp.where(pure, margin, xp.inf)))
     return m_pure, int(xp.sum((margin <= 0) & ~pure))
+
+
+def hotspot_conduction(U, eos, cfg, h, periodic, core, frac=0.5):
+    """Conduction out of the hot spot. U: interior conservative array; core: boolean mask of the fuel the
+    liner encloses; hot spot = core cells hotter than frac x the hottest core cell.
+    Returns (P, suppression, E_th_hot):
+      P            conductive power leaving the hot spot (positive when heat leaves), from the scheme;
+      suppression  sum of grad T . K . grad T over the hot spot with the field off / with the field on,
+                   K = k_perp I + (k_par - k_perp) b b: how much the field cuts conduction for this state
+                   (>= 1; the gradient-weighted mean of k_par/k_perp when grad T is across B);
+      E_th_hot     thermal energy of the hot spot."""
+    from .physics import conduction_rate, internal_energy
+    W = cons_to_prim(U, eos)
+    rho = W[iRHO]
+    theta = xp.maximum(W[iPR], 0.0) / rho
+    tmax = float(xp.max(xp.where(core, theta, 0.0)))
+    hot = core & (theta > frac * tmax)
+    dV = float(np.prod(h))
+    r = conduction_rate(U, eos, cfg.cond_kappa0, cfg.cond_x0, cfg.cond_tracer_max, h, periodic)
+    P = -float(xp.sum(xp.where(hot, r, 0.0))) * dV
+    nd = theta.ndim
+    g = [xp.gradient(theta, h[k], axis=k) for k in range(nd)]
+    B = [W[iBX], W[iBY], W[iBZ]]
+    Bm = xp.sqrt(B[0]**2 + B[1]**2 + B[2]**2)
+    inv = xp.where(Bm > 0, 1.0 / xp.where(Bm > 0, Bm, 1.0), 0.0)
+    bg = sum(B[k] * inv * g[k] for k in range(nd))
+    g2 = sum(gk * gk for gk in g)
+    kpar = cfg.cond_kappa0 * theta**2.5
+    x = cfg.cond_x0 * Bm * theta**1.5 / rho
+    kperp = kpar / (1.0 + x * x)
+    on = float(xp.sum(xp.where(hot, kperp * g2 + (kpar - kperp) * bg * bg, 0.0)))
+    off = float(xp.sum(xp.where(hot, kpar * g2, 0.0)))
+    supp = off / on if on > 0 else 1.0
+    return P, supp, float(xp.sum(xp.where(hot, internal_energy(U), 0.0))) * dV

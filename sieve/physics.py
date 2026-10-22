@@ -310,6 +310,17 @@ def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5):
     return stages
 
 
+def conduction_rate(U, gamma, kappa0, x0, tracer_max, h, periodic):
+    """Instantaneous -div q (energy per volume per time) of the conduction model for a conservative
+    interior array U: a diagnostic (e.g. heat leaving a hot spot, or the same with x0 = 0 to see how much
+    the field insulates). The time integration is done by conduct()."""
+    W = cons_to_prim(U, gamma)
+    rho = xp.maximum(W[iRHO], FLOOR_RHO)
+    theta = xp.maximum(W[iPR], 0.0) / rho
+    return conduction_div(theta, (W[iBX], W[iBY], W[iBZ]), rho, xp.clip(W[iCLR], 0.0, 1.0), kappa0, x0,
+                          tracer_max, h, periodic)
+
+
 def sound_speed2(W, gamma):
     """squared sound speed of a primitive state"""
     rho = xp.maximum(W[iRHO], FLOOR_RHO)

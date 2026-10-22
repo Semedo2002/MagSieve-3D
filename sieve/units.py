@@ -142,3 +142,29 @@ def braginskii_kwargs(rho_unit, v_unit, L0, z=1.0, ion_mass_amu=2.0, coulomb_log
     B_unit = np.sqrt(MU0 * rho_unit * v_unit**2)
     x0 = (E_CHARGE / M_E) * tau_coef * T1**1.5 * B_unit * A * AMU / (Z * rho_unit)
     return dict(cond_kappa0=kappa0, cond_x0=x0, cond_tracer_max=tracer_max)
+
+
+def add_conduction_args(ap):
+    g = ap.add_argument_group("thermal conduction")
+    g.add_argument("--enable-conduction", dest="enable_conduction", action="store_true",
+                   help="magnetized electron conduction in the fuel (Spitzer k_par ~ T^5/2)")
+    g.add_argument("--braginskii", action="store_true",
+                   help="cross-field suppression from omega_ce tau_e (the default)")
+    g.add_argument("--kappa-ratio", dest="kappa_ratio", type=float, default=None,
+                   help="instead: set k_par/k_perp to this value in the initial fuel; it then scales as "
+                        "1 + x^2 with x ~ |B| T^1.5 / rho")
+
+
+def conduction_from_args(a, rho_unit, v_unit, L0, B_fuel, T_fuel, rho_fuel):
+    """Config keywords for conduction; B_fuel, T_fuel (= p/rho), rho_fuel: initial fuel state, code units."""
+    if not a.enable_conduction:
+        return {}
+    if a.braginskii and a.kappa_ratio is not None:
+        raise SystemExit("--braginskii and --kappa-ratio are alternatives; give one")
+    kw = braginskii_kwargs(rho_unit, v_unit, L0, getattr(a, "z_eff", 1.0), getattr(a, "ion_mass_amu", 2.0),
+                           getattr(a, "coulomb_log", 10.0))
+    if a.kappa_ratio is not None:
+        if a.kappa_ratio < 1:
+            raise SystemExit("--kappa-ratio must be >= 1")
+        kw["cond_x0"] = np.sqrt(a.kappa_ratio - 1) * rho_fuel / (max(B_fuel, 1e-300) * T_fuel**1.5)
+    return kw

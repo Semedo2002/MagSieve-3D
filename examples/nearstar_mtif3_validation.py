@@ -15,6 +15,7 @@ the real shot values, and add the missing physics, before comparing amplitudes w
     python examples/nearstar_mtif3_validation.py --eta-model spitzer --sigma-liner 3.5e7
     python examples/nearstar_mtif3_validation.py --eos-liner stiffened --sigma-liner 3.5e7    # solid Al liner
     python examples/nearstar_mtif3_validation.py --enable-rad --t-rad-min-ev 10              # bremsstrahlung
+    python examples/nearstar_mtif3_validation.py --enable-conduction --braginskii             # conduction
 
 Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
@@ -35,9 +36,9 @@ with contextlib.redirect_stdout(io.StringIO()):
     from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iBZ, iPR, iCLR
     from sieve.physics import xp, prim_to_cons, cons_to_prim, pressure_margin
     from sieve.solver import MHDSolver, to_numpy
-    from sieve.diagnostics import enclosed_by_tracer, cavitation_split
+    from sieve.diagnostics import enclosed_by_tracer, cavitation_split, hotspot_conduction
     from sieve.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
-                             add_radiation_args, radiation_from_args)
+                             add_radiation_args, radiation_from_args, add_conduction_args, conduction_from_args)
     from sieve.physics import internal_energy
 
 GAMMA = 5.0 / 3.0
@@ -58,10 +59,12 @@ def setup(a, u):
     a.eta = resistivity_from_args(a, u["L0"], u["v0"])
     a.eos, rho_metal = eos_from_args(a, u["rho0"], u["v0"])
     a.rad = radiation_from_args(a, u["rho0"], u["v0"], u["L0"])
+    # fuel starts at code density 1, code temperature p/rho = 1, field b_seed
+    a.cond = conduction_from_args(a, u["rho0"], u["v0"], u["L0"], a.b_seed_t / u["B0"], 1.0, 1.0)
     if a.liner_ratio is None:
         a.liner_ratio = rho_metal or 10.0                       # solid density for a metal EOS
     # tracer = liner volume fraction in every run (also with an ideal-gas liner)
-    cfg = Config(**a.eta, **a.eos, **a.rad, material_tracer="volume_fraction", nx=a.n, ny=a.n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=a.t_end_us * 1e-6 / u["t0"],
+    cfg = Config(**a.eta, **a.eos, **a.rad, **a.cond, material_tracer="volume_fraction", nx=a.n, ny=a.n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=a.t_end_us * 1e-6 / u["t0"],
                  cfl=0.3, gamma=GAMMA, B_transverse=1.0, B_field_type="uniform", powell_source=True,
                  bc_x_type="extrapolation", bc_y_type="outflow", diag_interval=10**9, snapshot_times=[])
     s = MHDSolver(cfg)
@@ -121,6 +124,20 @@ def core_radius(s):
     return float(np.sqrt(float(xp.sum((1 - C) * inside)) * s.cfg.dx * s.cfg.dy / np.pi))
 
 
+def track_conduction(s):
+    """accumulate heat conducted out of the hot spot since the last call; record the suppression (field off /
+    field on) of the instantaneous conductive power"""
+    ng = s.ng
+    C = xp.clip(cons_to_prim(s.U, s.eos)[iCLR, ng:-ng, ng:-ng], 0, 1)
+    core = xp.asarray(enclosed_by_tracer(C, s.X[ng:-ng, ng:-ng], s.Y[ng:-ng, ng:-ng])) & (C < 0.5)
+    P, supp, E_hot = hotspot_conduction(s.U[:, ng:-ng, ng:-ng], s.eos, s.cfg, (s.cfg.dx, s.cfg.dy), (False, False), core)
+    dt = s.t - getattr(s, "_cond_t", s.t)
+    s._cond_loss = getattr(s, "_cond_loss", 0.0) + P * dt
+    s._E_hot_max = max(getattr(s, "_E_hot_max", 0.0), E_hot)
+    s._cond_t = s.t
+    s._cond_samples = getattr(s, "_cond_samples", []) + [(s.t, supp)]
+
+
 def check_state(s, E0):
     ng = s.ng
     U = s.U[:, ng:-ng, ng:-ng]
@@ -176,6 +193,8 @@ def run(a, out):
             if s.step % 5 == 0 or rho_peak is None:
                 rho_peak = to_numpy(s.U[0, s.ng:-s.ng, s.ng:-s.ng])
         if s.step % 10 == 0:
+            if a.cond:
+                track_conduction(s)
             pm, rm, err, E0 = check_state(s, E0)
             p_min, rho_min, err_max = min(p_min, pm), min(rho_min, rm), max(err_max, abs(err))
             if pm <= 0 or rm <= 0:
@@ -228,9 +247,23 @@ def run(a, out):
         "steps": s.step, "wall_s": time.time() - t0,
         "p_min_code": p_min, "rho_min_code": rho_min, "energy_error_max": err_max,
         "mixed_cells_at_floor_max": getattr(s, "_mixed_at_floor", 0),
+        "conduction": bool(a.cond), "cond_code": a.cond,
     }
+    if a.cond:
+        track_conduction(s)
+        Eh = max(s._E_hot_max, 1e-300)
+        ts = np.array([x[0] for x in s._cond_samples])
+        summary.update({
+            "cond_loss_pct_of_peak_hotspot_Eth": 100 * s._cond_loss / Eh,
+            "cond_suppression_at_peak_compression": float(s._cond_samples[int(np.argmin(np.abs(ts - t_peak)))][1]),
+            "cond_note": "heat conducted out of the hot spot (fuel above half the peak core temperature), integrated over the run, as a percentage of the hot spot's peak thermal energy; suppression = sum of grad T . K . grad T over the hot spot with the field off / with it on, for the state at peak compression (sampled every 10 steps) (instantaneous). In 2D the field is axial, so all in-plane conduction is across B; the liner wall is insulating. For an unmagnetized run to compare with, use --kappa-ratio 1.",
+        })
     with open(os.path.join(out, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=2)
+    if a.cond:
+        print(f"conduction: hot spot lost {summary['cond_loss_pct_of_peak_hotspot_Eth']:.3g}% of its peak thermal "
+              f"energy across B; at peak compression the field suppresses conduction in the hot spot "
+              f"{summary['cond_suppression_at_peak_compression']:.3g}x", flush=True)
     x_mm = to_numpy(s.x[s.ng:-s.ng]) * u["L0"] * 1e3
     np.savez_compressed(os.path.join(out, "peak_compression.npz"), x_mm=x_mm, rho=rho_peak * u["rho0"],
                         t_us=t_peak * u["t0"] * 1e6)
@@ -319,6 +352,7 @@ def main():
     add_resistivity_args(ap)
     add_eos_args(ap)
     add_radiation_args(ap)
+    add_conduction_args(ap)
     a = ap.parse_args()
     if a.quick:
         a.n = 128

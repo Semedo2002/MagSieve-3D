@@ -19,7 +19,7 @@ sieve/            solver package
                   current-density and generated-field diagnostics
   diagnostics.py  mixing, enstrophy, interface spectrum, div B, energy
 main.py           CLI: verification tests, single cases, legacy campaign
-examples/         MTIF liner flux compression; synthetic magnetic probes (SI units)
+examples/         MTIF liner flux compression; synthetic magnetic probes (SI units); 3D target asymmetries
 experiments/      sweeps A-H and analysis scripts; data/ holds the saved results
 paper/            figure and .docx generators, figures/, magnetic_sieve.docx
 rmi_output_gpu/   figures and GIFs written by the solver
@@ -192,7 +192,55 @@ python examples/mtif_flux_compression.py --enable-rad --v-ref-kms 100 --rho-ref 
 
 # synthetic b-dot probe signals for an MTIF-3-style implosion, Mie-Gruneisen aluminium liner
 python examples/nearstar_mtif3_validation.py --eos-liner mie_gruneisen --sigma-liner 3.5e7
+
+# magnetized conduction on a 0.5 mm target at ~100 eV (--braginskii: physical omega_ce tau_e, the
+# default; --kappa-ratio R: fix k_par/k_perp = R in the initial fuel instead; --kappa-ratio 1: unmagnetized)
+python examples/mtif_flux_compression.py --enable-conduction --v-ref-kms 100 --r-ref-mm 0.5
+
+# 3D target asymmetries: axis tilt and azimuthal liner modes against 2D and 3D references
+python examples/mtif_3d_asymmetry.py --tilts 0.5 1 2 --modes 2 4
 ```
+
+With conduction on, the summaries report the heat conducted out of the hot spot (core gas above half the
+peak core temperature) as a percentage of its peak thermal energy, and the field's suppression of conduction
+there: the sum of grad T . K . grad T over the hot spot with the field off divided by the sum with it on, for
+the state at turnaround. In 2D the field is axial, so all in-plane conduction is across B; the liner wall is
+insulating. On the 0.5 mm, 100 km/s target the hot spot loses 1.7% of its peak thermal energy with
+Braginskii magnetization and 2.8% unmagnetized (`--kappa-ratio 1`); at the examples' default scales (fuel near
+0.01 eV) conduction is negligible.
+
+### 3D multi-physics parity and magnetized conduction
+
+The two-material EOS with volume-fraction interfaces, bremsstrahlung and anisotropic conduction all run in
+the 3D solver, sharing their kernels with 2D; a z-invariant 3D slab reproduces the 2D solver to round-off
+(`--test parity3d`). Conduction follows k_par ~ T^5/2 along B and k_perp = k_par/(1 + (omega_ce tau_e)^2)
+across it, with Sharma & Hammett (2007) limited transverse gradients so that strongly anisotropic heat flow
+never runs from cold to hot, and RKL2 super-time-stepping so that it never limits the hydrodynamic time step.
+
+### 3D target asymmetries
+
+`examples/mtif_3d_asymmetry.py` implodes the liner in 3D (64^2 x 32, z periodic) with a uniform axial seed
+field, so div B = 0 for any target shape. A tilt is an axis displacement dx(z) = A sin(2 pi z/Lz) whose
+largest slope equals the tilt angle (a uniform tilt cannot be periodic); the modes are liner radii
+R (1 + 0.02 cos(m phi)). Conduction on, Braginskii magnetization, 0.5 mm / 100 km/s scales:
+
+| case | convergence ratio | peak mean core B / B0 | peak-B spread in z | field tilt (rms B_perp/B_z) | hot-spot conduction loss | field suppression at turnaround |
+|---|---|---|---|---|---|---|
+| 2D baseline | 5.01 | 20.73 | - | - | 0.95% | 9.2e4 |
+| 3D reference | 5.01 | 20.73 | 0 | 0 | 0.95% | 9.2e4 |
+| tilt 0.5 deg | 5.01 | 20.73 | 6.3e-4 | 3.6e-3 | 0.95% | 7.1e4 |
+| tilt 1 deg | 5.01 | 20.73 | 1.3e-3 | 7.1e-3 | 0.97% | 4.8e4 |
+| tilt 2 deg | 4.96 | 20.64 | 2.1e-3 | 1.4e-2 | 1.08% | 2.1e4 |
+| m = 2 | 4.73 | 20.24 | 0 | 0 | 1.29% | 1.8e5 |
+| m = 4 | 4.48 | 19.76 | 0 | 0 | 1.08% | 1.0e5 |
+
+The unperturbed 3D run matches the 2D baseline exactly. Up to 2 deg, tilt barely changes the compression
+(peak field -0.4% at 2 deg) but bends the core field lines in proportion to the tilt, which opens a parallel
+conduction path: the field's suppression of conduction in the hot spot falls 4.5x between 0 and 2 deg. The
+2% azimuthal modes cost more peak field (-2.4% for m = 2, -4.7% for m = 4) and raise the conductive loss
+through the larger hot-spot surface, while the field lines stay axial. The axis displacement is at most 0.18
+cells at this resolution, so it is invisible in density slices and shows only in these integrated metrics;
+energy closes to 1e-14 in every run.
 
 ## Benchmark: high-Mach MHD Richtmyer-Meshkov instability
 
