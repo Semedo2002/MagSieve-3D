@@ -12,7 +12,7 @@ sieve/            solver package
   physics.py      CUDA HLLD wrapper, MUSCL, jump conditions, resistive terms, stripe equilibrium
   eos.py          two-material EOS: ideal gas, stiffened gas, Mie-Gruneisen (linear Us-Up)
   units.py        SI helpers: conductivity to code-unit diffusivity, Spitzer coefficient, liner EOS,
-                  bremsstrahlung coefficient
+                  bremsstrahlung and Braginskii conduction coefficients
   hlld_kernel.cu  HLLD Riemann solver (one thread per face)
   solver.py       MHDSolver (SSP-RK3, GLM + Powell, BCs, energy budget) and PostProcessor
   solver3d.py     MHDSolver3D: unsplit HLLD in x, y, z (same kernel, rotated), z-periodic, 3D seeding,
@@ -55,7 +55,7 @@ Two materials, selected by the tracer: `eos_fuel` (where it is 0: `ideal` with `
 mixed cells blend phi1 and phi2 linearly in the tracer, which is then a volume fraction advected
 non-conservatively with the face values the energy flux uses (Shyue 1998), so a material interface at uniform
 p and u stays in equilibrium. The HLLD kernel takes each face state's internal energy and sound speed from the
-EOS; with one ideal gas the solver runs the original code path. Multi-material runs are 2D only. The examples
+EOS; with one ideal gas the solver runs the original code path. Both the 2D and 3D solvers support it. The examples
 take an aluminium liner in SI:
 
 ```
@@ -63,6 +63,19 @@ python examples/nearstar_mtif3_validation.py --eos-liner stiffened              
 python examples/nearstar_mtif3_validation.py --eos-liner mie_gruneisen            # Al: rho0 2700, c0 5328, s 1.338, Gamma0 2
 python examples/mtif_flux_compression.py --eos-liner stiffened --p-inf-gpa 20 --gamma-liner 3.8
 ```
+
+### Thermal conduction
+
+Magnetized electron conduction, q = -[k_perp I + (k_par - k_perp) b b] . grad T with k_par = `cond_kappa0` T^5/2
+and k_perp = k_par/(1 + x^2), x = omega_ce tau_e = `cond_x0` |B| T^3/2 / rho (T = p/rho), in the fuel only
+(liner fraction below `cond_tracer_max`; liner faces and non-periodic domain faces are insulating, so total
+energy is conserved exactly). Fluxes live on cell faces; the gradient normal to a face is a two-point
+difference and the transverse gradients are van Leer limited (Sharma & Hammett 2007), which keeps strongly
+anisotropic conduction from moving heat from cold to hot. It is a split step integrated with RKL2
+super-time-stepping (Meyer, Balsara & Aslam 2014), about sqrt(dt/dt_explicit) stages, so it never limits the
+hydrodynamic time step. `units.braginskii_kwargs` gives the Spitzer-Braginskii coefficients in code units (k_par
+at 1 keV within 1.1% of the Spitzer value). The k_perp interpolation is the simple 1/(1 + x^2) form, not the
+full Braginskii fit, and ion conduction is left out.
 
 ### Radiation
 
@@ -110,6 +123,8 @@ python examples/nearstar_mtif3_validation.py --eta-model spitzer --sigma-liner 3
 | ohmic | periodic box, eta varying 10x: thermal energy gained matches the integral of eta J^2 to 0.14%, total energy to 2e-14 |
 | eos_impact | 10 km/s Al impact: stiffened Al on stiffened Cu vs the exact impedance match, and Mie-Gruneisen Al on Al vs the Us-Up Hugoniot; shock speeds, pressure, densities and velocity within 0.5% |
 | eos_interface | Al slab in gas at uniform p and u: volume-fraction tracer keeps p uniform to 1e-9 (round-off times p_inf/p); mass-fraction blending, for comparison, is off by 3e5 p within 0.002 us |
+| conduction | hot spot in a field with k_par/k_perp = 1e4: grid-aligned, the spread along and across B equals 2 D t to 0.04% and 1%; at 45 deg the numerical cross-field leakage is 2.7% (64^2) and 0.7% (128^2) of the parallel spread, second order; no new extrema, energy conserved to round-off |
+| parity3d | 3D slabs reproduce the 2D solver to round-off for a stiffened Al/Cu impact (5e-14), bremsstrahlung decay (2e-15) and conduction in an oblique field (7e-15) |
 | radiation | uniform hydrogen plasma, T0 = 500 eV, n = 1e20 cm^-3: T(t) matches (sqrt(T0) - K t/2)^2 to 1e-14 down to the 10 eV cutoff; E + E_rad conserved to 1e-15; no cooling in liner material or below the cutoff |
 | eos_positivity | stiffened Al pulled apart at 5 and 8 km/s (cavitation) and a gas/Al interface: p + p_inf > 0, c^2 > 0, finite state |
 
@@ -158,9 +173,13 @@ shock compression, each verified against an analytic solution in `python main.py
 - **Optically thin bremsstrahlung:** an operator-split sink using the exact solution at fixed density, so it
   is stable at any time step. In the decay test T(t) matches the analytic solution to 1e-14 and E + E_rad is
   conserved to 7e-16.
+- **Magnetized thermal conduction:** anisotropic, k_par ~ T^5/2 along B and k_perp = k_par/(1 + (omega_ce
+  tau_e)^2) across it, with limited transverse gradients and RKL2 super-time-stepping. A hot spot with
+  k_par/k_perp = 1e4 spreads along B as 2 D t and stays confined across it; for an oblique field the numerical
+  cross-field leakage falls at second order with resolution.
 
-The EOS and radiation modules are 2D only. Liners have no strength or spall, and the example parameters are
-illustrative, not taken from any experiment.
+All four modules run in 2D and 3D; z-invariant 3D slabs reproduce the 2D solver to round-off. Liners have no
+strength or spall, and the example parameters are illustrative, not taken from any experiment.
 
 ### Examples
 
@@ -217,7 +236,7 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 
 ## Model and numerical limitations
 
-- Ideal gas (γ = 5/3) by default; stiffened-gas and Mie-Gruneisen liners have no strength, spall or phase change (tension is limited only by cavitation at c^2 = 0). The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. No physical viscosity or thermal conduction. Radiation is optically thin bremsstrahlung only (no line or recombination radiation, no opacity or reabsorption, T_e = T_i), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
+- Ideal gas (γ = 5/3) by default; stiffened-gas and Mie-Gruneisen liners have no strength, spall or phase change (tension is limited only by cavitation at c^2 = 0). The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. No physical viscosity; thermal conduction is electron-only with the simple k_perp = k_par/(1 + x^2) interpolation and insulating liner and domain faces, and at grid-oblique field angles the limited scheme adds numerical cross-field diffusion that falls at second order with resolution. Radiation is optically thin bremsstrahlung only (no line or recombination radiation, no opacity or reabsorption, T_e = T_i), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
 - Resistivity is scalar (isotropic), with no Hall term. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
 - Cell-centred magnetic field with GLM cleaning; the divergence error at shocks is a few percent (no constrained transport).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.

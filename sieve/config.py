@@ -152,6 +152,12 @@ class PhysicsConfig:
     rad_coeff: float = 0.0
     rad_T_min: float = 0.0
     rad_tracer_max: float = 0.1
+    # magnetized electron conduction (physics.conduction_div), 0 = off: k_par = cond_kappa0 T^5/2,
+    # k_perp = k_par/(1 + x^2), x = cond_x0 |B| T^3/2 / rho, T = p/rho; fuel only (tracer < cond_tracer_max).
+    # Split step integrated with RKL2 super-time-stepping, so it does not limit the time step.
+    cond_kappa0: float = 0.0
+    cond_x0: float = 0.0
+    cond_tracer_max: float = 0.1
     localized_rh: bool = False
     enstrophy_locking_fraction: float = 0.20
 
@@ -174,6 +180,8 @@ class PhysicsConfig:
             raise ValueError("p_inf is only used by the stiffened EOS; set eos_fuel/eos_liner='stiffened'")
         if min(self.p_inf, self.p_inf_liner) < 0:
             raise ValueError("p_inf must be non-negative")
+        if min(self.cond_kappa0, self.cond_x0) < 0 or not 0 < self.cond_tracer_max <= 1:
+            raise ValueError("cond_kappa0, cond_x0 must be >= 0 and 0 < cond_tracer_max <= 1")
         if min(self.rad_coeff, self.rad_T_min) < 0 or not 0 < self.rad_tracer_max <= 1:
             raise ValueError("rad_coeff, rad_T_min must be >= 0 and 0 < rad_tracer_max <= 1")
         if self.eos_liner == "mie_gruneisen" and min(self.mg_rho0, self.mg_c0, self.mg_s, self.mg_gamma0) <= 0:

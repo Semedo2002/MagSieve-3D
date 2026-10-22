@@ -13,7 +13,9 @@ from .config import (
     iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iPSI, iCLR,
 )
 from .physics import (xp, cons_to_prim, prim_to_cons, hlld_flux_x, parallel_stripe_state,
-                      resistivity_field, face_eta, eta_max_of)
+                      resistivity_field, face_eta, eta_max_of, sound_speed2, radiate, vf_advection_rate,
+                      conduct, _floor_faces)
+from .eos import make_eos
 from .solver import MHDSolver, to_numpy
 
 # variable permutations that rotate the y or z face normal onto x for the HLLD kernel
@@ -30,7 +32,7 @@ def _sl(ax, s):
     return tuple(idx)
 
 
-def muscl(W, ax):
+def muscl(W, ax, eos=None):
     """van Leer MUSCL along array axis ax (1, 2, 3); face k lies between cells k+1 and k+2."""
     dm = W[_sl(ax, slice(1, -1))] - W[_sl(ax, slice(None, -2))]
     dp = W[_sl(ax, slice(2, None))] - W[_sl(ax, slice(1, -1))]
@@ -38,9 +40,7 @@ def muscl(W, ax):
     d = xp.where(ab > 0, 2.0 * ab / (dm + dp + 1e-30), 0.0)
     WL = W[_sl(ax, slice(1, -2))] + 0.5 * d[_sl(ax, slice(None, -1))]
     WR = W[_sl(ax, slice(2, -1))] - 0.5 * d[_sl(ax, slice(1, None))]
-    for Wf in (WL, WR):
-        Wf[iRHO] = xp.maximum(Wf[iRHO], FLOOR_RHO)
-        Wf[iPR] = xp.maximum(Wf[iPR], FLOOR_PR)
+    _floor_faces(WL, WR, 1.4 if eos is None else eos)
     return WL, WR
 
 
@@ -125,11 +125,10 @@ class MHDSolver3D:
         cfg = config
         if cfg.nz < 4:
             raise ValueError("solver3d needs nz >= 4")
-        if cfg.is_multimaterial():
-            raise NotImplementedError("multi-material EOS is implemented in the 2D solver only")
-        if cfg.rad_coeff > 0:
-            raise NotImplementedError("radiative cooling is implemented in the 2D solver only")
         self.cfg = cfg
+        # float gamma for one ideal gas, eos.EOS for two materials (volume-fraction tracer)
+        self.eos = make_eos(cfg)
+        self._vf = not isinstance(self.eos, (int, float)) and self.eos.volume_fraction
         self.ng = ng = 2
         self.nx_tot, self.ny_tot, self.nz_tot = cfg.nx + 2 * ng, cfg.ny + 2 * ng, cfg.nz + 2 * ng
         self.x = xp.asarray(cfg.x_min + (np.arange(self.nx_tot) - ng + 0.5) * cfg.dx)
@@ -149,6 +148,7 @@ class MHDSolver3D:
         self._sigma = None          # sponge off until initialize() sets it up (hand-built states skip that)
         self._acc_boundary = xp.zeros(())
         self._acc_powell = xp.zeros(())
+        self._acc_rad = xp.zeros(())
         self._rate_boundary = xp.zeros(())
         self._rate_powell = xp.zeros(())
         self.diag = {}
@@ -166,7 +166,7 @@ class MHDSolver3D:
         s2 = MHDSolver(cfg)
         with contextlib.redirect_stdout(io.StringIO()):
             s2.initialize()
-        W2 = cons_to_prim(s2.U, cfg.gamma)
+        W2 = cons_to_prim(s2.U, self.eos)
         W = xp.repeat(W2[:, :, :, None], self.nz_tot, axis=3)
         self.equilibrium = getattr(s2, "_equilibrium", None)
         self._bar_mask_y, self._gap_mask_y = s2._bar_mask_y, s2._gap_mask_y
@@ -203,7 +203,7 @@ class MHDSolver3D:
 
         if cfg.frame_velocity != 0.0:
             W[iVX] = W[iVX] - cfg.frame_velocity      # Galilean shift to the interface frame
-        self.U = prim_to_cons(W, cfg.gamma)
+        self.U = prim_to_cons(W, self.eos)
         self._inflow_U = self.U[:, :self.ng, :, :].copy()
         # in the shifted frame the upstream gas enters at x_max (supersonic for U > c_s upstream)
         right_inflow = cfg.x_max_bc in ("inflow", "plateau") or (cfg.x_max_bc == "auto" and cfg.frame_velocity > 0)
@@ -218,12 +218,13 @@ class MHDSolver3D:
         self._inflow_R = self.U[:, -self.ng:, :, :].copy() if right_inflow else None
         self._setup_sponge()
         if self._vz_pattern is not None:
-            Win = cons_to_prim(self._inflow_U, cfg.gamma)
+            Win = cons_to_prim(self._inflow_U, self.eos)
             Win[iVZ] = self._vz_pattern
-            self._inflow_U = prim_to_cons(Win, cfg.gamma)
+            self._inflow_U = prim_to_cons(Win, self.eos)
         self.t, self.step = 0.0, 0
         self._acc_boundary = xp.zeros(())
         self._acc_powell = xp.zeros(())
+        self._acc_rad = xp.zeros(())
 
     def _update_plateau(self):
         """x_max_bc = "plateau": upstream inflow until the transmitted shock reaches x_max, then hold the
@@ -231,14 +232,14 @@ class MHDSolver3D:
         x_min_bc = "plateau": the same at x_min for the reflected shock."""
         ng = self.ng
         if self.cfg.x_min_bc == "plateau" and not self._left_captured:
-            p_edge = float(xp.mean(cons_to_prim(self.U[:, ng:ng + 1], self.cfg.gamma)[iPR]))
+            p_edge = float(xp.mean(cons_to_prim(self.U[:, ng:ng + 1], self.eos)[iPR]))
             if p_edge > 1.3 * self._p_inflow:
                 self._inflow_U = xp.repeat(self.U[:, ng + 9:ng + 10].copy(), ng, axis=1)
                 self._left_captured = True
                 self.left_plateau_time = self.t
         if self.cfg.x_max_bc != "plateau" or self._plateau_captured:
             return
-        p_edge = float(xp.mean(cons_to_prim(self.U[:, -ng - 1:-ng], self.cfg.gamma)[iPR]))
+        p_edge = float(xp.mean(cons_to_prim(self.U[:, -ng - 1:-ng], self.eos)[iPR]))
         if p_edge > 3.0 * self._p_upstream:
             plateau = self.U[:, -ng - 10:-ng - 9].copy()       # 10 cells behind the boundary
             self._inflow_R = xp.repeat(plateau, ng, axis=1)
@@ -291,6 +292,10 @@ class MHDSolver3D:
         if self.cfg.get_bc_x() == "periodic":
             U[:, :ng] = U[:, -2 * ng:-ng]
             U[:, -ng:] = U[:, ng:2 * ng]
+        elif self.cfg.get_bc_x() == "extrapolation":
+            for i in range(ng):                          # zero gradient at both x ends
+                U[:, i] = U[:, ng]
+                U[:, -(i + 1)] = U[:, -(ng + 1)]
         else:
             U[:, :ng] = self._inflow_U                   # driven inflow at x_min
             if self._inflow_R is not None:
@@ -307,8 +312,7 @@ class MHDSolver3D:
     def compute_dt(self, W):
         cfg = self.cfg
         rho = xp.maximum(W[iRHO], FLOOR_RHO)
-        p = xp.maximum(W[iPR], FLOOR_PR)
-        cf = xp.sqrt(cfg.gamma * p / rho + (W[iBX]**2 + W[iBY]**2 + W[iBZ]**2) / rho)
+        cf = xp.sqrt(sound_speed2(W, self.eos) + (W[iBX]**2 + W[iBY]**2 + W[iBZ]**2) / rho)
         sx, sy, sz = xp.abs(W[iVX]) + cf, xp.abs(W[iVY]) + cf, xp.abs(W[iVZ]) + cf
         self._ch = max(float(xp.max(xp.maximum(xp.maximum(sx, sy), sz))), 1e-12)
         h = min(cfg.dx, cfg.dy, cfg.dz)
@@ -324,7 +328,7 @@ class MHDSolver3D:
 
     def compute_rhs(self, U, out):
         cfg = self.cfg
-        ng, g, ch = self.ng, cfg.gamma, self._ch
+        ng, g, ch = self.ng, self.eos, self._ch
         n = (cfg.nx, cfg.ny, cfg.nz)
         h = (cfg.dx, cfg.dy, cfg.dz)
         U = self.apply_bc(U)
@@ -332,10 +336,17 @@ class MHDSolver3D:
         out[...] = 0.0
         inner = (slice(None),) + tuple(slice(ng, ng + m) for m in n)
         rate = xp.zeros(())
+        if self._vf:
+            vf_rate = xp.zeros(n)
         for ax in (1, 2, 3):
-            WL, WR = muscl(W, ax)
+            WL, WR = muscl(W, ax, g)
             F = hlld_flux(WL, WR, ax, g, ch)
             m = n[ax - 1]
+            if self._vf:
+                # volume fraction: da/dt + u.grad(a) = 0 from the same face values as the energy flux
+                a_c = W[iCLR][tuple(slice(ng, ng + m) if d == ax - 1 else slice(None) for d in range(3))]
+                rv = vf_advection_rate(F, WL, WR, a_c, ax - 1, h[ax - 1])
+                vf_rate += rv[tuple(slice(None) if d == ax - 1 else slice(ng, ng + n[d]) for d in range(3))]
             dF = F[_sl(ax, slice(1, 1 + m))] - F[_sl(ax, slice(0, m))]
             sel = list(inner)
             sel[ax] = slice(None)
@@ -345,6 +356,8 @@ class MHDSolver3D:
             lo = list(sel); lo[0] = EN; lo[ax] = 0
             hi = list(sel); hi[0] = EN; hi[ax] = m
             rate = rate + xp.sum(F[tuple(lo)] - F[tuple(hi)]) * face_area
+        if self._vf:
+            out[(RHOC,) + inner[1:]] = vf_rate
         self._rate_boundary = rate
         self._rate_powell = xp.zeros(())
         if cfg.powell_source and cfg.is_mhd():
@@ -366,6 +379,11 @@ class MHDSolver3D:
             self._rate_boundary = self._rate_boundary + rate_r
         return out
 
+    @property
+    def cumulative_radiated_energy(self):
+        """Energy radiated so far, integrated over the 3D domain."""
+        return float(self._acc_rad)
+
     def _acc(self, w):
         self._acc_boundary += w * self._rate_boundary
         self._acc_powell += w * self._rate_powell
@@ -379,8 +397,20 @@ class MHDSolver3D:
         self.U_stage[...] = 0.75 * U0 + 0.25 * (self.U_temp + dt * self.dU)
         self.compute_rhs(self.U_stage, self.dU); self._acc(2 * dt / 3)
         self.U[...] = U0 / 3 + 2.0 / 3.0 * (self.U_stage + dt * self.dU)
-        rho = xp.maximum(self.U[RHO], FLOOR_RHO)
-        self.U[RHOC] = rho * xp.clip(self.U[RHOC] / rho, 0.0, 1.0)
+        if self._vf:
+            self.U[RHOC] = xp.clip(self.U[RHOC], 0.0, 1.0)
+        else:
+            rho = xp.maximum(self.U[RHO], FLOOR_RHO)
+            self.U[RHOC] = rho * xp.clip(self.U[RHOC] / rho, 0.0, 1.0)
+        cfg, ng = self.cfg, self.ng
+        inner = (slice(None),) + tuple(slice(ng, ng + m) for m in (cfg.nx, cfg.ny, cfg.nz))
+        if cfg.rad_coeff > 0:
+            dE = radiate(self.U[inner], self.eos, cfg.rad_coeff, cfg.rad_T_min, cfg.rad_tracer_max, dt)
+            self._acc_rad += xp.sum(dE) * cfg.dx * cfg.dy * cfg.dz
+        if cfg.cond_kappa0 > 0:
+            per = (cfg.get_bc_x() == "periodic", True, True)
+            self.cond_stages = conduct(self.U[inner], self.eos, cfg.cond_kappa0, cfg.cond_x0, cfg.cond_tracer_max,
+                                       (cfg.dx, cfg.dy, cfg.dz), per, dt)
         if self._sigma is not None:
             self._U_before_sponge = self.U.copy()
             self._apply_sponge(dt)
@@ -396,7 +426,7 @@ class MHDSolver3D:
         cfg = self.cfg
         ng = self.ng
         I = (slice(ng, -ng),) * 3
-        W = cons_to_prim(self.U, cfg.gamma)
+        W = cons_to_prim(self.U, self.eos)
         rho, C = W[iRHO][I], xp.clip(W[iCLR][I], 0, 1)
         vx, vy, vz = W[iVX][I], W[iVY][I], W[iVZ][I]
         bx, by, bz = W[iBX][I], W[iBY][I], W[iBZ][I]
@@ -441,6 +471,7 @@ class MHDSolver3D:
             "inflow": float(self._acc_boundary),
             "powell": float(self._acc_powell),
             "sponge": float(self._acc_sponge) if getattr(self, "_sigma", None) is not None else 0.0,
+            "radiated": float(self._acc_rad),
         }
 
     def _sheet_xmod(self, J, C):
@@ -459,7 +490,7 @@ class MHDSolver3D:
         cfg = self.cfg
         ng = self.ng
         I = (slice(ng, -ng),) * 3
-        W = cons_to_prim(self.U, cfg.gamma)
+        W = cons_to_prim(self.U, self.eos)
         bx, by, bz = W[iBX][I], W[iBY][I], W[iBZ][I]
         vx, vy, vz = W[iVX][I], W[iVY][I], W[iVZ][I]
         jx, jy, jz = _curl(bx, by, bz, cfg.dx, cfg.dy, cfg.dz)
@@ -491,7 +522,7 @@ class MHDSolver3D:
         record()
         pending = sorted(snapshot_times)
         while self.t < cfg.t_end and self.step < cfg.max_steps:
-            self.dt = min(self.compute_dt(cons_to_prim(self.U, cfg.gamma)), cfg.t_end - self.t)
+            self.dt = min(self.compute_dt(cons_to_prim(self.U, self.eos)), cfg.t_end - self.t)
             if self.dt <= 1e-16:
                 break
             self.step_ssprk3()
@@ -511,6 +542,7 @@ class MHDSolver3D:
         return self.diag
 
     def energy_error(self):
-        """|E(t) - E(0) - boundary inflow - Powell - sponge| / E(0)"""
+        """|E(t) - E(0) - boundary inflow - Powell - sponge + radiated| / E(0)"""
         d = self.diag
-        return abs(d["E"][-1] - d["E"][0] - d["inflow"][-1] - d["powell"][-1] - d["sponge"][-1]) / abs(d["E"][0])
+        return abs(d["E"][-1] - d["E"][0] - d["inflow"][-1] - d["powell"][-1] - d["sponge"][-1]
+                   + d["radiated"][-1]) / abs(d["E"][0])

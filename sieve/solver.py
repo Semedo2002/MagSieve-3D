@@ -38,6 +38,8 @@ from .physics import (
     compute_resistive_terms,
     sound_speed2,
     radiate,
+    vf_advection_rate,
+    conduct,
     resistivity_field,
     eta_max_of,
     richtmyer_linear_theory,
@@ -526,17 +528,9 @@ class MHDSolver:
 
     def _vf_rate(self, F, WL, WR, W, axis, h):
         """-(div(u a) - a div u) along one axis, on interior cells along that axis"""
-        F0, Fa = F[RHO], F[RHOC]
-        rho_up = xp.where(F0 >= 0, WL[iRHO], WR[iRHO])
-        u_f = F0 / rho_up
-        a_f = xp.where(xp.abs(F0) > 1e-300, Fa / xp.where(F0 == 0, 1.0, F0), 0.5 * (WL[iCLR] + WR[iCLR]))
-        ua = u_f * a_f
         ng, n = self.ng, (self.cfg.nx if axis == 0 else self.cfg.ny)
-        if axis == 0:
-            a_c = W[iCLR, ng:ng+n, :]
-            return -((ua[1:1+n] - ua[:n]) - a_c * (u_f[1:1+n] - u_f[:n])) / h
-        a_c = W[iCLR, :, ng:ng+n]
-        return -((ua[:, 1:1+n] - ua[:, :n]) - a_c * (u_f[:, 1:1+n] - u_f[:, :n])) / h
+        a_c = W[iCLR, ng:ng+n, :] if axis == 0 else W[iCLR, :, ng:ng+n]
+        return vf_advection_rate(F, WL, WR, a_c, axis, h)
 
     def _accumulate_energy_budget(self, weight):
         self._acc_boundary_energy += weight * self._stage_boundary_rate
@@ -581,6 +575,12 @@ class MHDSolver:
             dE = radiate(Ui, self.eos, cfg.rad_coeff, cfg.rad_T_min, cfg.rad_tracer_max, dt)
             self.U[inner] = Ui
             self._acc_rad += xp.sum(dE) * cfg.dx * cfg.dy
+        if self.cfg.cond_kappa0 > 0:
+            ng, cfg = self.ng, self.cfg
+            Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
+            per = (cfg.get_bc_x() == "periodic", cfg.bc_y_type == "periodic")
+            self.cond_stages = conduct(Ui, self.eos, cfg.cond_kappa0, cfg.cond_x0, cfg.cond_tracer_max,
+                                       (cfg.dx, cfg.dy), per, dt)
         self.apply_bc(self.U)
         if self._glm_ch_frozen > 0:
             decay = np.exp(-self.cfg.glm_alpha * self._glm_ch_frozen * dt / min(self.cfg.dx, self.cfg.dy))

@@ -123,3 +123,22 @@ def radiation_from_args(a, rho_unit, v_unit, L0):
         return {}
     ion = getattr(a, "ion_mass_amu", 2.0)
     return bremsstrahlung_kwargs(rho_unit, v_unit, L0, a.z_eff, ion, a.t_rad_min_ev)
+
+
+M_E = 9.1093837015e-31
+
+
+def braginskii_kwargs(rho_unit, v_unit, L0, z=1.0, ion_mass_amu=2.0, coulomb_log=10.0, tracer_max=0.1):
+    """Config keywords for magnetized electron conduction in code units.
+    Spitzer-Braginskii: k_par = 3.16 n_e kT tau_e / m_e (heat flux per gradient of kT; Z = 1 coefficient),
+    tau_e = 3.44e5 T_eV^1.5 / (n_e[cm^-3] lnL) s (NRL), so k_par = C T_eV^5/2 independent of density;
+    magnetization x = omega_ce tau_e = (e B / m_e) tau_e. In code units, with T = p/rho:
+    k_par = cond_kappa0 T^5/2 and x = cond_x0 |B| T^3/2 / rho."""
+    A, Z = ion_mass_amu, z
+    T1 = temperature_eV_per_code(v_unit, A, Z)             # eV per code temperature
+    tau_coef = 3.44e11 / coulomb_log                        # tau_e = tau_coef T_eV^1.5 / n_e[m^-3]
+    C = 3.16 * E_CHARGE * tau_coef / M_E                    # k_par [1/(m s)] = C T_eV^2.5, flux per grad(kT)
+    kappa0 = C * T1**2.5 * E_CHARGE * T1 / (L0 * rho_unit * v_unit**3)
+    B_unit = np.sqrt(MU0 * rho_unit * v_unit**2)
+    x0 = (E_CHARGE / M_E) * tau_coef * T1**1.5 * B_unit * A * AMU / (Z * rho_unit)
+    return dict(cond_kappa0=kappa0, cond_x0=x0, cond_tracer_max=tracer_max)

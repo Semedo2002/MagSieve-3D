@@ -173,6 +173,143 @@ def radiate(U, gamma, coeff, T_min, tracer_max, dt):
     return dE
 
 
+def _along(nd, axis, s, rest=slice(None)):
+    """index tuple for a spatial array: s on axis, rest elsewhere"""
+    idx = [rest] * nd
+    idx[axis] = s
+    return tuple(idx)
+
+
+def vf_advection_rate(F, WL, WR, a_c, axis, h):
+    """Volume-fraction tracer, da/dt + u.grad(a) = 0, along one spatial axis: -(div(u a) - a div u) with the
+    face a the HLLD kernel used for the energy flux (F_a = mass flux * a_upwind) and u_f = mass flux /
+    upwind density. F, WL, WR hold the faces along `axis` (variables first); a_c is the tracer on the
+    cells, interior along `axis`. Shared by the 2D and 3D solvers."""
+    F0, Fa = F[RHO], F[RHOC]
+    rho_up = xp.where(F0 >= 0, WL[iRHO], WR[iRHO])
+    u_f = F0 / rho_up
+    a_f = xp.where(xp.abs(F0) > 1e-300, Fa / xp.where(F0 == 0, 1.0, F0), 0.5 * (WL[iCLR] + WR[iCLR]))
+    ua = u_f * a_f
+    nd, n = a_c.ndim, a_c.shape[axis]
+    hi, lo = _along(nd, axis, slice(1, 1 + n)), _along(nd, axis, slice(0, n))
+    return -((ua[hi] - ua[lo]) - a_c * (u_f[hi] - u_f[lo])) / h
+
+
+def _vl(a, b):
+    """van Leer (harmonic) limiter"""
+    return xp.where(a * b > 0, 2.0 * a * b / xp.where(a + b == 0, 1.0, a + b), 0.0)
+
+
+def _pad1(f, periodic):
+    for ax, per in enumerate(periodic):
+        width = [(0, 0)] * f.ndim
+        width[ax] = (1, 1)
+        f = xp.pad(f, width, mode="wrap" if per else "edge")
+    return f
+
+
+def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=2.5):
+    """-div q for magnetized (Braginskii-type) conduction on interior cells, 2D or 3D:
+        q = -[k_perp I + (k_par - k_perp) b b] . grad(theta),  k_par = kappa0 theta^T_exp,
+        k_perp = k_par / (1 + x^2),  x = omega_ce tau_e = x0 |B| theta^1.5 / rho.
+    Face fluxes, so the energy update telescopes. Normal gradient: compact two-point difference; transverse
+    gradients: van Leer limited average of the four one-sided differences around the face (Sharma &
+    Hammett 2007), which keeps strongly anisotropic conduction from moving heat from cold to hot. Faces
+    touching the liner (tracer >= tracer_max) and non-periodic domain faces carry no heat.
+    theta, rho, a: interior arrays; B: three interior arrays (Bz enters |B| and b in 2D)."""
+    nd = theta.ndim
+    tp, rp, ap = (_pad1(f, periodic) for f in (theta, rho, a))
+    Bp = [_pad1(f, periodic) for f in B]
+    div = xp.zeros_like(theta)
+    core = slice(1, -1)
+    for ax in range(nd):
+        L, R = _along(nd, ax, slice(0, -1), core), _along(nd, ax, slice(1, None), core)
+        gn = (tp[R] - tp[L]) / h[ax]
+        Bf = [0.5 * (Bc[L] + Bc[R]) for Bc in Bp]
+        Bm = xp.sqrt(Bf[0]**2 + Bf[1]**2 + Bf[2]**2)
+        inv = xp.where(Bm > 0, 1.0 / xp.where(Bm > 0, Bm, 1.0), 0.0)
+        b = [c * inv for c in Bf]
+        tf = xp.maximum(0.5 * (tp[L] + tp[R]), 0.0)
+        kpar = kappa0 * tf**T_exp
+        x = x0 * Bm * tf**1.5 / (0.5 * (rp[L] + rp[R]))
+        kperp = kpar / (1.0 + x * x)
+        bg = b[ax] * gn
+        for t in range(nd):
+            if t == ax:
+                continue
+            side = []
+            for S in (L, R):
+                c, up, dn = list(S), list(S), list(S)
+                up[t], dn[t] = slice(2, None), slice(0, -2)
+                c, up, dn = tuple(c), tuple(up), tuple(dn)
+                side.append(_vl((tp[c] - tp[dn]) / h[t], (tp[up] - tp[c]) / h[t]))
+            bg = bg + b[t] * _vl(side[0], side[1])
+        q = -(kperp * gn + (kpar - kperp) * b[ax] * bg)
+        q = xp.where((ap[L] < tracer_max) & (ap[R] < tracer_max), q, 0.0)
+        if not periodic[ax]:
+            n = q.shape[ax]
+            q[_along(nd, ax, 0)] = 0.0
+            q[_along(nd, ax, n - 1)] = 0.0
+        div -= (q[_along(nd, ax, slice(1, None))] - q[_along(nd, ax, slice(0, -1))]) / h[ax]
+    return div
+
+
+def rkl2(y0, L, dt, dt_expl, s_max=60):
+    """Second-order Runge-Kutta-Legendre super-time-step (Meyer, Balsara & Aslam 2014) of dy/dt = L(y) over
+    dt, given the forward-Euler stable step dt_expl. Stable for dt <= dt_expl (s^2 + s - 2)/4 with s stages;
+    longer steps are split into sub-steps of at most s_max stages. Returns (y, total stages)."""
+    ratio = dt / dt_expl
+    stages = lambda r: max(2, int(np.ceil(0.5 * (np.sqrt(9.0 + 16.0 * r) - 1.0))))
+    s, nsub = stages(ratio), 1
+    if s > s_max:                                   # each sub-step covers dt/nsub: ratio/nsub
+        nsub = int(np.ceil(4.0 * ratio / (s_max * s_max + s_max - 2.0)))
+        s = stages(ratio / nsub)
+    h = dt / nsub
+    b = [1.0 / 3.0] * 3 + [(j * j + j - 2.0) / (2.0 * j * (j + 1.0)) for j in range(3, s + 1)]
+    w1 = 4.0 / (s * s + s - 2.0)
+    y = y0
+    for _ in range(nsub):
+        L0 = L(y)
+        ym2, ym1 = y, y + b[1] * w1 * h * L0
+        for j in range(2, s + 1):
+            mu = (2.0 * j - 1.0) / j * b[j] / b[j - 1]
+            nu = -(j - 1.0) / j * b[j] / b[j - 2]
+            mut = mu * w1
+            gt = -(1.0 - b[j - 1]) * mut
+            yj = mu * ym1 + nu * ym2 + (1.0 - mu - nu) * y + mut * h * L(ym1) + gt * h * L0
+            ym2, ym1 = ym1, yj
+        y = ym1
+    return y, s * nsub
+
+
+def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5):
+    """Split step: anisotropic conduction over dt on the interior conservative array U (in place on U[EN]),
+    with density, momentum and B frozen, by RKL2. Returns the number of stages used (0 if nothing to do)."""
+    rho = xp.maximum(U[RHO], FLOOR_RHO)
+    vf = not _ideal(gamma) and gamma.volume_fraction
+    a = xp.clip(U[RHOC] if vf else U[RHOC] / rho, 0.0, 1.0)
+    fixed = 0.5 * (U[MX]**2 + U[MY]**2 + U[MZ]**2) / rho + 0.5 * (U[BX]**2 + U[BY]**2 + U[BZ]**2)
+    B = (U[BX], U[BY], U[BZ])
+
+    def theta_of(E):
+        eps = E - fixed
+        p = (gamma - 1) * eps if _ideal(gamma) else gamma.pressure(rho, eps, a)
+        return xp.maximum(p, 0.0) / rho
+
+    def rate(E):
+        return conduction_div(theta_of(E), B, rho, a, kappa0, x0, tracer_max, h, periodic)
+
+    # forward-Euler limit from the largest diffusivity k_par / (rho phi1), phi1 = d eps / d p
+    phi1 = 1.0 / (gamma - 1) if _ideal(gamma) else gamma.coeffs(rho, a)[0]
+    D = xp.where(a < tracer_max, kappa0 * theta_of(U[EN])**2.5 / (rho * phi1), 0.0)
+    D_max = float(xp.max(D))
+    if D_max <= 0:
+        return 0
+    dt_expl = cfl / (2.0 * D_max * sum(1.0 / hh**2 for hh in h))
+    U[EN], stages = rkl2(U[EN], rate, dt, dt_expl)
+    return stages
+
+
 def sound_speed2(W, gamma):
     """squared sound speed of a primitive state"""
     rho = xp.maximum(W[iRHO], FLOOR_RHO)

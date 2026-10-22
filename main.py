@@ -619,6 +619,159 @@ def radiation_decay_test():
     return ok
 
 
+def _hot_spot(cls, n, angle, kappa0, x0, amp=1e-3, sigma=0.1, nz=None, dz_factor=1.0):
+    """Static uniform plasma (rho = 1, T = p/rho = 1) with a small Gaussian hot spot and a uniform field of
+    unit strength in the x-y plane at `angle`; periodic box [-1, 1]^2 (x [-1, 1]^2 x thin z in 3D)."""
+    kw = dict(nx=n, ny=n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0,
+              gamma=5.0 / 3.0, B_transverse=0.0, powell_source=False, bc_x_type="periodic", bc_y_type="periodic",
+              diag_interval=10**9, snapshot_times=[], cond_kappa0=kappa0, cond_x0=x0)
+    if nz:
+        kw.update(nz=nz, z_max=nz * dz_factor * 2.0 / n)
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = cls(Config(**kw))
+    shape = (NVAR,) + s.U.shape[1:]
+    W = xp.zeros(shape)
+    X = s.x.reshape((-1,) + (1,) * (len(shape) - 2))
+    Y = s.y.reshape((1, -1) + (1,) * (len(shape) - 3))
+    W[iRHO] = 1.0
+    W[iPR] = 1.0 + amp * xp.exp(-(X**2 + Y**2) / (2 * sigma**2))
+    W[iBX], W[iBY] = np.cos(angle), np.sin(angle)
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    s.apply_bc(s.U)
+    return s
+
+
+def conduction_test():
+    """Magnetized conduction: small Gaussian hot spot (dT/T = 1e-3) in a uniform field, k_par/k_perp = 1e4,
+    D_par = 0.01, integrated to t = 2 with four RKL2 super-steps. For linear diffusion the second moment of
+    the excess temperature grows by exactly 2 D t along each principal direction, so the spread along and
+    across B is compared with that. Field along x (grid-aligned: exact up to the 0.25% variation of k with
+    T) and at 45 deg, where the limited transverse gradients add numerical perpendicular diffusion that must
+    fall with resolution (64^2, 128^2). Also: no new extrema (to round-off), energy conserved."""
+    from sieve.physics import conduct
+    print("\n--- Conduction: anisotropic hot spot ---"); sys.stdout.flush()
+    g, D_par, ratio, t_end = 5.0 / 3.0, 0.01, 1e4, 2.0
+    kappa0, x0 = D_par / (g - 1), np.sqrt(ratio - 1)
+    ok, out, leak = True, [], {}
+    for name, ang, n in (("B along x, 64^2", 0.0, 64), ("B at 45 deg, 64^2", np.pi / 4, 64),
+                         ("B at 45 deg, 128^2", np.pi / 4, 128)):
+        s = _hot_spot(MHDSolver, n, ang, kappa0, x0)
+        ng, cfg = s.ng, s.cfg
+        Ui = s.U[:, ng:-ng, ng:-ng]
+        X, Y = (to_numpy(a)[ng:-ng, ng:-ng] for a in (s.X, s.Y))
+        u, v = X * np.cos(ang) + Y * np.sin(ang), -X * np.sin(ang) + Y * np.cos(ang)
+
+        def moments():
+            w = to_numpy(cons_to_prim(s.U, s.eos)[iPR, ng:-ng, ng:-ng]) - 1.0
+            return np.sum(w * u**2) / np.sum(w), np.sum(w * v**2) / np.sum(w), w
+        su0, sv0, w0 = moments()
+        E0 = float(xp.sum(Ui[EN]))
+        stages = 0
+        for _ in range(4):
+            stages += conduct(Ui, s.eos, cfg.cond_kappa0, cfg.cond_x0, cfg.cond_tracer_max, (cfg.dx, cfg.dy),
+                              (True, True), t_end / 4)
+        su, sv, w = moments()
+        par, perp = (su - su0) / (2 * D_par * t_end), (sv - sv0) / (2 * D_par * t_end)
+        bounded = w.max() <= w0.max() and w.min() >= -1e-10 * w0.max()
+        dE = abs(float(xp.sum(Ui[EN])) - E0) / E0
+        if ang == 0:
+            good = abs(par - 1) < 0.01 and abs(perp * ratio - 1) < 0.05
+        else:
+            leak[n] = perp
+            good = abs(par - 1) < 0.05 and perp < 0.05 and (n == 64 or perp < leak[64])
+        good = good and bounded and dE < 1e-13
+        ok = ok and good
+        out.append(f"  {name}: spread along B {par:.4f} x 2 D_par t, across B {perp:.2e} x 2 D_par t "
+                   f"(exact {1 / ratio:.0e}); max {w.max() / w0.max():.3f} of initial, min {w.min() / w0.max():+.1e}; "
+                   f"{stages} RKL2 stages vs {t_end / (0.5 * cfg.dx**2 / (4 * D_par)):.0f} explicit steps; energy "
+                   f"{dE:.1e}  [{'PASS' if good else 'FAIL'}]")
+    print("\n".join(out))
+    print(f"  45 deg numerical cross-field leakage falls with resolution at order {np.log2(leak[64] / leak[128]):.2f}")
+    return ok
+
+
+def parity3d_test(tol=1e-12):
+    """3D slabs one cell pattern deep in z must reproduce the 2D solver for the Phase 2-4 physics:
+    (1) stiffened Al on stiffened Cu at 10 km/s (two materials, volume-fraction tracer);
+    (2) bremsstrahlung decay of a uniform hot plasma; (3) magnetized conduction from a hot spot in an
+    oblique field, with the hydrodynamics running. In (3) the slab has dz = 10 dx: the RKL2 stage count
+    comes from the explicit limit, which counts 1/dz^2, and equal stage counts are needed for round-off
+    agreement (with dz = dx the 3D run takes more stages and differs by the RKL2 time error, 1e-4 of the
+    hot-spot amplitude). The z faces still run and must contribute exactly zero."""
+    from sieve.solver3d import MHDSolver3D
+    from sieve.eos import stiffened_from_hugoniot
+    from sieve.units import bremsstrahlung_kwargs, AMU, E_CHARGE
+    print("\n--- 3D parity: EOS, radiation, conduction ---"); sys.stdout.flush()
+    res = []
+
+    def build(cls, nx, ny, x0, left, right, bc, nz=None, extent=(1.0, None), **kw):
+        Lx, Ly = extent
+        Ly = Ly or ny * Lx / nx
+        c = dict(nx=nx, ny=ny, x_max=Lx, y_max=Ly, t_end=1.0, cfl=0.3, mach=1.0, B_transverse=0.0,
+                 powell_source=False, bc_x_type=bc, bc_y_type="periodic", diag_interval=10**9, snapshot_times=[], **kw)
+        if nz:
+            c.update(nz=nz, z_max=nz * Lx / nx)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = cls(Config(**c))
+        W = xp.zeros((NVAR,) + s.U.shape[1:])
+        x = s.x.reshape((-1,) + (1,) * (W.ndim - 2))
+        inside = x < x0
+        for k, i in ((0, iRHO), (1, iVX), (2, iPR), (3, iCLR)):
+            W[i] = xp.where(inside, left[k], right[k])
+        s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+        s.apply_bc(s.U)
+        return s
+
+    def compare(s2, s3, keys=(iRHO, iPR)):
+        ng = s2.ng
+        W2 = cons_to_prim(s2.U, s2.eos)[:, ng:-ng, ng:-ng]
+        W3 = cons_to_prim(s3.U, s3.eos)[:, ng:-ng, ng:-ng, ng:-ng]
+        d = max(float(xp.max(xp.abs(W3[i] - W2[i][:, :, None]))) / float(xp.max(xp.abs(W2[i]))) for i in keys)
+        zv = max(float(xp.max(xp.abs(W3[i] - W3[i][:, :, :1]))) for i in keys)
+        return d, zv
+
+    # (1) two-material impact
+    gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 5.0)
+    gC, piC = stiffened_from_hugoniot(CU["rho0"], CU["c0"], CU["s"], 3.0)
+    mm = dict(eos_fuel="stiffened", gamma=gC, p_inf=piC, eos_liner="stiffened", gamma_liner=gA, p_inf_liner=piA)
+    L, R = (AL["rho0"], 10.0, 1e-4, 1.0), (CU["rho0"], 0.0, 1e-4, 0.0)
+    s2 = build(MHDSolver, 200, 4, 0.5, L, R, "extrapolation", **mm)
+    s3 = build(MHDSolver3D, 200, 4, 0.5, L, R, "extrapolation", nz=4, **mm)
+    for s in (s2, s3):
+        _march(s, 0.03)
+    res.append(("stiffened Al -> Cu impact", *compare(s2, s3, (iRHO, iPR, iCLR)), s2.step, s3.step))
+
+    # (2) radiation decay (same set-up as the radiation test)
+    mp, n0, T0 = 1.67262192e-27, 1e26, 500.0
+    v0 = np.sqrt(2 * E_CHARGE * T0 / mp)
+    rad = bremsstrahlung_kwargs(n0 * mp, v0, 1.0, 1.0, mp / AMU, 10.0)
+    hot = (1.0, 0.0, 1.0, 0.0)
+    s2 = build(MHDSolver, 8, 8, 2.0, hot, hot, "periodic", gamma=5.0 / 3.0, **rad)
+    s3 = build(MHDSolver3D, 8, 8, 2.0, hot, hot, "periodic", nz=4, gamma=5.0 / 3.0, **rad)
+    for s in (s2, s3):
+        _march(s, 5e-6 * v0)
+    d, zv = compare(s2, s3)
+    # the 3D integral is over the slab depth; the 2D one is per unit depth
+    erad = abs(s3.cumulative_radiated_energy / (s3.cfg.dz * s3.cfg.nz) - s2.cumulative_radiated_energy) \
+        / s2.cumulative_radiated_energy
+    res.append(("bremsstrahlung decay", max(d, erad), zv, s2.step, s3.step))
+
+    # (3) conduction with hydrodynamics, oblique field
+    s2 = _hot_spot(MHDSolver, 32, np.pi / 6, 0.15, 30.0)
+    s3 = _hot_spot(MHDSolver3D, 32, np.pi / 6, 0.15, 30.0, nz=4, dz_factor=10.0)
+    for s in (s2, s3):
+        _march(s, 0.2)
+    res.append(("conduction, field at 30 deg", *compare(s2, s3), s2.step, s3.step))
+
+    ok = True
+    for name, d, zv, n2, n3 in res:
+        good = d < tol and zv == 0.0 and n2 == n3
+        ok = ok and good
+        print(f"  {name}: steps 2D/3D {n2}/{n3}, max rel diff {d:.1e}, z-variation {zv:.1e}  "
+              f"[{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def galilean_test(U=6.49):
     """Interface frame: the interface must stay put, energy must close, and the interface growth must match
     the lab frame (within 10%). Mixing-layer enstrophy is reported, not asserted: the scheme is not exactly
@@ -685,6 +838,8 @@ VERIFICATION_TESTS = {
     "eos_interface": eos_interface_test,
     "eos_positivity": eos_positivity_test,
     "radiation": radiation_decay_test,
+    "conduction": conduction_test,
+    "parity3d": parity3d_test,
     "galilean": galilean_test,
     "rmi_mhd": rmi_mhd_smoke_test,
 }
