@@ -154,6 +154,25 @@ def pressure_margin(U, gamma):
     return gamma.pressure(rho, eps, a) - gamma.p_min(rho, a)
 
 
+def radiate(U, gamma, coeff, T_min, tracer_max, dt):
+    """Optically thin bremsstrahlung over dt, in place on U[EN]; returns the energy removed per cell.
+
+    Q = coeff rho^2 sqrt(theta), theta = p/rho. At fixed density the internal energy changes as
+    d eps = phi1 dp (eps = phi1 p + phi2), so d theta/dt = -K sqrt(theta) with K = coeff rho/phi1, which
+    has the exact solution sqrt(theta_new) = sqrt(theta) - K dt/2. Cooling stops at theta = T_min and acts
+    only where the liner fraction is below tracer_max. Exact, so no stability limit on dt."""
+    W = cons_to_prim(U, gamma)
+    rho, p, a = W[iRHO], W[iPR], xp.clip(W[iCLR], 0.0, 1.0)
+    theta = p / rho
+    on = (theta > T_min) & (a < tracer_max)
+    phi1 = 1.0 / (gamma - 1) if _ideal(gamma) else gamma.coeffs(rho, a)[0]
+    K = coeff * rho / phi1
+    s = xp.maximum(xp.sqrt(theta) - 0.5 * K * dt, np.sqrt(T_min))
+    dE = xp.where(on, phi1 * rho * (theta - s * s), 0.0)
+    U[EN] -= dE
+    return dE
+
+
 def sound_speed2(W, gamma):
     """squared sound speed of a primitive state"""
     rho = xp.maximum(W[iRHO], FLOOR_RHO)

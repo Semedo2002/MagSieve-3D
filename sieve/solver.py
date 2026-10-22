@@ -37,6 +37,7 @@ from .physics import (
     parallel_stripe_state,
     compute_resistive_terms,
     sound_speed2,
+    radiate,
     resistivity_field,
     eta_max_of,
     richtmyer_linear_theory,
@@ -155,6 +156,8 @@ class MHDSolver:
         # Ohmic heating integral (diagnostic; already inside E through the Poynting flux)
         self._acc_ohmic = xp.zeros(())
         self._stage_ohmic_rate = xp.zeros(())
+        # radiated energy (split step after each RK step; removed from E, so it is a budget term)
+        self._acc_rad = xp.zeros(())
         self._inflow_U = None
         self._inflow_superfast = None
         self._dt_limiter = "hyperbolic"
@@ -277,6 +280,7 @@ class MHDSolver:
         self._acc_boundary_energy = xp.zeros(())
         self._acc_powell_energy = xp.zeros(())
         self._acc_ohmic = xp.zeros(())
+        self._acc_rad = xp.zeros(())
         self._rho_light = rho1; self._rho_heavy = rho_h
         # Post-shock state held fixed in the x_min ghost cells (driven shock).
         self._inflow_U = self.U[:, :self.ng, :].copy()
@@ -443,6 +447,11 @@ class MHDSolver:
         return float(self._acc_powell_energy)
 
     @property
+    def cumulative_radiated_energy(self):
+        """Energy radiated away so far (optically thin bremsstrahlung)."""
+        return float(self._acc_rad)
+
+    @property
     def cumulative_ohmic_heating(self):
         """Integral of eta |J|^2 over the domain and time so far."""
         return float(self._acc_ohmic)
@@ -565,23 +574,31 @@ class MHDSolver:
         xp.add(self.dU, self.U_stage, out=self.dU)
         xp.copyto(self.U, self.dU)
         self.enforce_scalar_bounds(self.U)
+        if self.cfg.rad_coeff > 0:
+            ng, cfg = self.ng, self.cfg
+            inner = (slice(None), slice(ng, ng + cfg.nx), slice(ng, ng + cfg.ny))
+            Ui = self.U[inner]
+            dE = radiate(Ui, self.eos, cfg.rad_coeff, cfg.rad_T_min, cfg.rad_tracer_max, dt)
+            self.U[inner] = Ui
+            self._acc_rad += xp.sum(dE) * cfg.dx * cfg.dy
         self.apply_bc(self.U)
         if self._glm_ch_frozen > 0:
             decay = np.exp(-self.cfg.glm_alpha * self._glm_ch_frozen * dt / min(self.cfg.dx, self.cfg.dy))
             self.U[PSI] *= decay
 
     def energy_budget(self):
-        """Energy balance over the run: E(t) - E(0) = inflow + Powell + residual."""
+        """Energy balance over the run: E(t) - E(0) = inflow + Powell - radiated + residual."""
         e0 = self.diag_energy_total[0]; ef = self.diag_energy_total[-1]
         inflow = self._cumulative_boundary_energy
         powell = self._cumulative_powell_energy
+        rad = self.cumulative_radiated_energy
         scale = max(abs(e0), 1e-14)
         return {
             "E0": e0, "E": ef, "dE": ef - e0,
-            "boundary_inflow": inflow, "powell": powell,
+            "boundary_inflow": inflow, "powell": powell, "radiated": rad,
             "raw_change_rel": (ef - e0) / scale,
             "powell_rel": powell / scale,
-            "conservation_error_rel": (ef - e0 - inflow - powell) / scale,
+            "conservation_error_rel": (ef - e0 - inflow - powell + rad) / scale,
         }
 
     def energy_budget_report(self):

@@ -127,6 +127,8 @@ class MHDSolver3D:
             raise ValueError("solver3d needs nz >= 4")
         if cfg.is_multimaterial():
             raise NotImplementedError("multi-material EOS is implemented in the 2D solver only")
+        if cfg.rad_coeff > 0:
+            raise NotImplementedError("radiative cooling is implemented in the 2D solver only")
         self.cfg = cfg
         self.ng = ng = 2
         self.nx_tot, self.ny_tot, self.nz_tot = cfg.nx + 2 * ng, cfg.ny + 2 * ng, cfg.nz + 2 * ng

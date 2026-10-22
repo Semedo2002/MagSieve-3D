@@ -11,7 +11,8 @@ sieve/            solver package
   config.py       typed configuration (unknown keys raise ValueError)
   physics.py      CUDA HLLD wrapper, MUSCL, jump conditions, resistive terms, stripe equilibrium
   eos.py          two-material EOS: ideal gas, stiffened gas, Mie-Gruneisen (linear Us-Up)
-  units.py        SI helpers: conductivity to code-unit diffusivity, Spitzer coefficient, liner EOS
+  units.py        SI helpers: conductivity to code-unit diffusivity, Spitzer coefficient, liner EOS,
+                  bremsstrahlung coefficient
   hlld_kernel.cu  HLLD Riemann solver (one thread per face)
   solver.py       MHDSolver (SSP-RK3, GLM + Powell, BCs, energy budget) and PostProcessor
   solver3d.py     MHDSolver3D: unsplit HLLD in x, y, z (same kernel, rotated), z-periodic, 3D seeding,
@@ -63,6 +64,20 @@ python examples/nearstar_mtif3_validation.py --eos-liner mie_gruneisen          
 python examples/mtif_flux_compression.py --eos-liner stiffened --p-inf-gpa 20 --gamma-liner 3.8
 ```
 
+### Radiation
+
+Optically thin bremsstrahlung, P = 1.69e-38 Z n_e^2 sqrt(T_eV) W/m^3 (NRL formulary, n in m^-3), acts on the
+fuel only: where the liner fraction is below `rad_tracer_max` (0.1) and T is above `rad_T_min`. It is a
+split step after each time step using the exact solution at fixed density, sqrt(T) falling linearly in time, so
+it is stable for any time step. The energy removed accumulates in `cumulative_radiated_energy` and enters the
+energy budget. `units.bremsstrahlung_kwargs` converts to code units; the examples take `--enable-rad`,
+`--z-eff`, `--t-rad-min-ev`. At the examples' default parameters the fuel stays below 1 eV and nothing
+radiates; a hot dense core does:
+
+```
+python examples/mtif_flux_compression.py --enable-rad --v-ref-kms 100 --rho-ref 100
+```
+
 ### Resistivity
 
 `eta_model` selects `constant` (`eta_resistivity` everywhere, the default), `material` (`eta_fuel` where the
@@ -95,6 +110,7 @@ python examples/nearstar_mtif3_validation.py --eta-model spitzer --sigma-liner 3
 | ohmic | periodic box, eta varying 10x: thermal energy gained matches the integral of eta J^2 to 0.14%, total energy to 2e-14 |
 | eos_impact | 10 km/s Al impact: stiffened Al on stiffened Cu vs the exact impedance match, and Mie-Gruneisen Al on Al vs the Us-Up Hugoniot; shock speeds, pressure, densities and velocity within 0.5% |
 | eos_interface | Al slab in gas at uniform p and u: volume-fraction tracer keeps p uniform to 1e-9 (round-off times p_inf/p); mass-fraction blending, for comparison, is off by 3e5 p within 0.002 us |
+| radiation | uniform hydrogen plasma, T0 = 500 eV, n = 1e20 cm^-3: T(t) matches (sqrt(T0) - K t/2)^2 to 1e-14 down to the 10 eV cutoff; E + E_rad conserved to 1e-15; no cooling in liner material or below the cutoff |
 | eos_positivity | stiffened Al pulled apart at 5 and 8 km/s (cavitation) and a gas/Al interface: p + p_inf > 0, c^2 > 0, finite state |
 
 ## Reproducing the study
@@ -166,7 +182,7 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 
 ## Model and numerical limitations
 
-- Ideal gas (γ = 5/3) by default; stiffened-gas and Mie-Gruneisen liners have no strength, spall or phase change (tension is limited only by cavitation at c^2 = 0). The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. No physical viscosity or thermal conduction, no radiation.
+- Ideal gas (γ = 5/3) by default; stiffened-gas and Mie-Gruneisen liners have no strength, spall or phase change (tension is limited only by cavitation at c^2 = 0). The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. No physical viscosity or thermal conduction. Radiation is optically thin bremsstrahlung only (no line or recombination radiation, no opacity or reabsorption, T_e = T_i), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
 - Resistivity is scalar (isotropic), with no Hall term. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
 - Cell-centred magnetic field with GLM cleaning; the divergence error at shocks is a few percent (no constrained transport).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.

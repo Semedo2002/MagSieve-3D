@@ -562,6 +562,63 @@ def eos_positivity_test():
     return ok
 
 
+def radiation_decay_test():
+    """Uniform hydrogen plasma, T0 = 500 eV, n = 1e20 cm^-3, periodic box (the interior of a hot sphere
+    before any rarefaction arrives). Optically thin bremsstrahlung gives 3 n k dT/dt = -1.69e-38 n^2 sqrt(T)
+    (SI, T in eV), so T(t) = (sqrt(T0) - K t/2)^2 with K = 1.69e-38 n/(3 e), until T reaches T_min = 10 eV,
+    where cooling stops. K is computed here from the SI constants, independently of the code-unit
+    conversion in units.py. Also: no cooling in liner material (tracer 1) or below T_min."""
+    from sieve.units import bremsstrahlung_kwargs, AMU, E_CHARGE
+    print("\n--- Radiation: bremsstrahlung decay of a uniform hot plasma ---"); sys.stdout.flush()
+    mp, n0, T0, Tmin = 1.67262192e-27, 1e26, 500.0, 10.0
+    v0 = np.sqrt(2 * E_CHARGE * T0 / mp)              # code temperature p/rho = 1 is 500 eV
+    t0 = 1.0 / v0                                     # L0 = 1 m
+    rad = bremsstrahlung_kwargs(n0 * mp, v0, 1.0, z_eff=1.0, ion_mass_amu=mp / AMU, t_min_ev=Tmin)
+    K = 1.69e-38 * n0 / (3 * E_CHARGE)
+
+    def box(theta0, C, **kw):
+        cfg = Config(nx=8, ny=8, x_max=1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=5.0 / 3.0,
+                     B_transverse=0.0, powell_source=False, bc_x_type="periodic", bc_y_type="periodic",
+                     diag_interval=10**9, snapshot_times=[], **rad, **kw)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+        W[iRHO], W[iPR], W[iCLR] = 1.0, theta0, C
+        s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+        return s
+
+    def theta(s):
+        Wi = cons_to_prim(s.U, s.eos)[:, s.ng:-s.ng, s.ng:-s.ng]
+        th = Wi[iPR] / Wi[iRHO]
+        return float(xp.mean(th)), float(xp.max(th) - xp.min(th))
+
+    s = box(1.0, 0.0)
+    E0 = _energy(s)
+    err_T, err_E, spread = 0.0, 0.0, 0.0
+    for t_us in (2.0, 5.0, 8.0, 10.5, 12.0):
+        _march(s, t_us * 1e-6 / t0)
+        th, sp = theta(s)
+        T_exact = max((np.sqrt(T0) - 0.5 * K * t_us * 1e-6)**2, Tmin)
+        err_T = max(err_T, abs(th * T0 - T_exact) / T_exact)
+        err_E = max(err_E, abs(_energy(s) + s.cumulative_radiated_energy - E0) / E0)
+        spread = max(spread, sp)
+    t_floor = 2 * (np.sqrt(T0) - np.sqrt(Tmin)) / K
+    steps = s.step
+    # cutoffs: liner material (tracer 1, kept exact by the volume-fraction tracer) and T < T_min
+    liner = box(1.0, 1.0, material_tracer="volume_fraction")
+    cold = box(0.5 * Tmin / T0, 0.0)
+    for b in (liner, cold):
+        _march(b, 2e-6 / t0)
+    still = (liner.cumulative_radiated_energy == 0.0 and cold.cumulative_radiated_energy == 0.0
+             and abs(theta(liner)[0] - 1.0) < 1e-14 and abs(theta(cold)[0] - 0.5 * Tmin / T0) < 1e-14)
+    ok = err_T < 1e-10 and err_E < 1e-13 and spread < 1e-12 and still
+    print(f"  K = {K:.4e} eV^1/2/s, T reaches {Tmin:g} eV at {t_floor * 1e6:.2f} us; {steps} steps to 12 us: "
+          f"max |T - T_exact|/T {err_T:.1e}, |E + E_rad - E0|/E0 {err_E:.1e}, radiated "
+          f"{100 * s.cumulative_radiated_energy / E0:.1f}% of E0; no cooling in liner / below T_min: "
+          f"{'yes' if still else 'NO'}  [{'PASS' if ok else 'FAIL'}]")
+    return ok
+
+
 def galilean_test(U=6.49):
     """Interface frame: the interface must stay put, energy must close, and the interface growth must match
     the lab frame (within 10%). Mixing-layer enstrophy is reported, not asserted: the scheme is not exactly
@@ -627,6 +684,7 @@ VERIFICATION_TESTS = {
     "eos_impact": eos_impact_test,
     "eos_interface": eos_interface_test,
     "eos_positivity": eos_positivity_test,
+    "radiation": radiation_decay_test,
     "galilean": galilean_test,
     "rmi_mhd": rmi_mhd_smoke_test,
 }

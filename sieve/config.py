@@ -146,6 +146,12 @@ class PhysicsConfig:
     mg_s: float = 0.0
     mg_gamma0: float = 0.0
     material_tracer: Optional[str] = None
+    # optically thin bremsstrahlung, Q = rad_coeff rho^2 sqrt(p/rho) in code units (0 = off; see
+    # units.bremsstrahlung_kwargs), only where the liner fraction < rad_tracer_max and p/rho > rad_T_min.
+    # Applied as a split step with the exact solution at fixed density, so it never limits the time step.
+    rad_coeff: float = 0.0
+    rad_T_min: float = 0.0
+    rad_tracer_max: float = 0.1
     localized_rh: bool = False
     enstrophy_locking_fraction: float = 0.20
 
@@ -168,6 +174,8 @@ class PhysicsConfig:
             raise ValueError("p_inf is only used by the stiffened EOS; set eos_fuel/eos_liner='stiffened'")
         if min(self.p_inf, self.p_inf_liner) < 0:
             raise ValueError("p_inf must be non-negative")
+        if min(self.rad_coeff, self.rad_T_min) < 0 or not 0 < self.rad_tracer_max <= 1:
+            raise ValueError("rad_coeff, rad_T_min must be >= 0 and 0 < rad_tracer_max <= 1")
         if self.eos_liner == "mie_gruneisen" and min(self.mg_rho0, self.mg_c0, self.mg_s, self.mg_gamma0) <= 0:
             raise ValueError("eos_liner='mie_gruneisen' needs mg_rho0, mg_c0, mg_s, mg_gamma0 > 0")
 

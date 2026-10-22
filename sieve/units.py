@@ -94,3 +94,32 @@ def eos_from_args(a, rho_unit, v_unit):
         return dict(eos_liner="stiffened", gamma_liner=g, p_inf_liner=pinf / p_unit), H["rho0"] / rho_unit
     return (dict(eos_liner="mie_gruneisen", mg_rho0=H["rho0"] / rho_unit, mg_c0=H["c0"] / v_unit, mg_s=H["s"],
                  mg_gamma0=H["gamma0"]), H["rho0"] / rho_unit)
+
+
+# NRL Plasma Formulary: P_br = 1.69e-32 Z n_e^2 sqrt(T_eV) W/cm^3 with n in cm^-3 (Z_eff = Z for one ion
+# species, n_e = Z n_i). In SI with n in m^-3: 1.69e-38 W/m^3.
+BREMS_SI = 1.69e-38
+
+
+def bremsstrahlung_kwargs(rho_unit, v_unit, L0, z_eff=1.0, ion_mass_amu=2.0, t_min_ev=10.0, tracer_max=0.1):
+    """Config keywords for optically thin bremsstrahlung in code units. Q = rad_coeff rho^2 sqrt(p/rho):
+    n_e = Z rho/(A m_u), kT = A m_u p/((1 + Z) rho), energy-density rate unit rho_unit v_unit^3 / L0."""
+    A, Z = ion_mass_amu, z_eff
+    T1 = temperature_eV_per_code(v_unit, A, Z)
+    coeff = BREMS_SI * Z**3 / (A * AMU)**2 * rho_unit**2 * np.sqrt(T1) / (rho_unit * v_unit**3 / L0)
+    return dict(rad_coeff=coeff, rad_T_min=t_min_ev / T1, rad_tracer_max=tracer_max)
+
+
+def add_radiation_args(ap):
+    g = ap.add_argument_group("radiation")
+    g.add_argument("--enable-rad", dest="enable_rad", action="store_true", help="optically thin bremsstrahlung in the fuel")
+    g.add_argument("--z-eff", dest="z_eff", type=float, default=1.0)
+    g.add_argument("--t-rad-min-ev", dest="t_rad_min_ev", type=float, default=10.0,
+                   help="no cooling below this temperature")
+
+
+def radiation_from_args(a, rho_unit, v_unit, L0):
+    if not a.enable_rad:
+        return {}
+    ion = getattr(a, "ion_mass_amu", 2.0)
+    return bremsstrahlung_kwargs(rho_unit, v_unit, L0, a.z_eff, ion, a.t_rad_min_ev)

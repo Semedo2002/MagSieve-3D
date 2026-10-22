@@ -14,6 +14,7 @@ the real shot values, and add the missing physics, before comparing amplitudes w
     python examples/nearstar_mtif3_validation.py --sigma-liner 3.5e7            # resistive Al liner
     python examples/nearstar_mtif3_validation.py --eta-model spitzer --sigma-liner 3.5e7
     python examples/nearstar_mtif3_validation.py --eos-liner stiffened --sigma-liner 3.5e7    # solid Al liner
+    python examples/nearstar_mtif3_validation.py --enable-rad --t-rad-min-ev 10              # bremsstrahlung
 
 Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
@@ -35,7 +36,9 @@ with contextlib.redirect_stdout(io.StringIO()):
     from sieve.physics import xp, prim_to_cons, cons_to_prim, pressure_margin
     from sieve.solver import MHDSolver, to_numpy
     from sieve.diagnostics import enclosed_by_tracer, cavitation_split
-    from sieve.units import add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args
+    from sieve.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
+                             add_radiation_args, radiation_from_args)
+    from sieve.physics import internal_energy
 
 GAMMA = 5.0 / 3.0
 MU0 = 4e-7 * np.pi
@@ -54,10 +57,11 @@ def units(a):
 def setup(a, u):
     a.eta = resistivity_from_args(a, u["L0"], u["v0"])
     a.eos, rho_metal = eos_from_args(a, u["rho0"], u["v0"])
+    a.rad = radiation_from_args(a, u["rho0"], u["v0"], u["L0"])
     if a.liner_ratio is None:
         a.liner_ratio = rho_metal or 10.0                       # solid density for a metal EOS
     # tracer = liner volume fraction in every run (also with an ideal-gas liner)
-    cfg = Config(**a.eta, **a.eos, material_tracer="volume_fraction", nx=a.n, ny=a.n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=a.t_end_us * 1e-6 / u["t0"],
+    cfg = Config(**a.eta, **a.eos, **a.rad, material_tracer="volume_fraction", nx=a.n, ny=a.n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=a.t_end_us * 1e-6 / u["t0"],
                  cfl=0.3, gamma=GAMMA, B_transverse=1.0, B_field_type="uniform", powell_source=True,
                  bc_x_type="extrapolation", bc_y_type="outflow", diag_interval=10**9, snapshot_times=[])
     s = MHDSolver(cfg)
@@ -127,7 +131,7 @@ def check_state(s, E0):
     s._mixed_at_floor = max(getattr(s, "_mixed_at_floor", 0), n_mixed)
     E = float(xp.sum(U[EN])) * s.cfg.dx * s.cfg.dy
     E0 = E if E0 is None else E0
-    err = (E - E0 - s._cumulative_boundary_energy - s._cumulative_powell_energy) / E0
+    err = (E - E0 - s._cumulative_boundary_energy - s._cumulative_powell_energy + s.cumulative_radiated_energy) / E0
     return p_pure, float(xp.min(U[0])), err, E0
 
 
@@ -135,11 +139,22 @@ def run(a, out):
     os.makedirs(out, exist_ok=True)
     u = units(a)
     s, B0, V = setup(a, u)
+    # reference energies for the radiated fraction: initial kinetic energy, initial fuel thermal energy
+    ng = s.ng
+    U0 = s.U[:, ng:-ng, ng:-ng]
+    C0 = xp.clip(cons_to_prim(s.U, s.eos)[iCLR, ng:-ng, ng:-ng], 0, 1)
+    dA = s.cfg.dx * s.cfg.dy
+    Ekin0 = float(xp.sum(0.5 * (U0[1]**2 + U0[2]**2) / U0[0])) * dA
+    Eth_fuel0 = float(xp.sum(internal_energy(U0) * (C0 < 0.1))) * dA
     mach = V / np.sqrt(GAMMA)
     print(f"liner {a.v_liner_kms:g} km/s = Mach {mach:.1f} in the fuel; seed {a.b_seed_t:g} T "
           f"(beta = {2 / B0**2:.3g}); time unit {u['t0'] * 1e6:.3g} us", flush=True)
     if a.v_liner_kms < 10 or mach < 5:
         print("warning: liner below 10 km/s or Mach 5", flush=True)
+    if a.rad:
+        T_fuel = a.p_fuel_mpa * 1e6 / a.rho_fuel * a.ion_mass_amu * 1.66053906660e-27 / (2 * 1.602176634e-19)
+        print(f"radiation: bremsstrahlung, Z_eff {a.z_eff:g}, off below {a.t_rad_min_ev:g} eV (initial fuel "
+              f"{T_fuel:.3g} eV)", flush=True)
     if a.eos_liner != "ideal":
         print(f"liner EOS: {s.eos.describe()}, liner density {a.liner_ratio * u['rho0']:.0f} kg/m^3", flush=True)
     if a.eta:
@@ -179,6 +194,7 @@ def run(a, out):
     dB = np.gradient(B, t_us, axis=0)            # T/us
     # Ohmic heat, J/m of column: code energy per unit length * p0 * L0^2
     ohmic_J_per_m = s.cumulative_ohmic_heating * u["p0"] * u["L0"]**2
+    E_rad = s.cumulative_radiated_energy
     head = ["t_us", "R_core_mm"] + [f"B_{r:g}mm_T" for r in a.probes_mm] + [f"dBdt_{r:g}mm_T_per_us" for r in a.probes_mm]
     with open(os.path.join(out, "synthetic_probes.csv"), "w", newline="") as fh:
         wr = csv.writer(fh)
@@ -199,6 +215,8 @@ def run(a, out):
                 + " MHD" + ("" if not a.eta else f" with {a.eta_model} resistivity")
                 + "; not a prediction of MTIF-3 shot data",
         "eta_model": a.eta_model, "eta_code": a.eta, "eos_liner": a.eos_liner, "eos_code": a.eos, "ohmic_heat_J_per_m": ohmic_J_per_m,
+        "radiation": bool(a.rad), "rad_code": a.rad, "radiated_J_per_m": E_rad * u["p0"] * u["L0"]**2,
+        "radiated_pct_of_Ekin0": 100 * E_rad / Ekin0, "radiated_pct_of_fuel_Eth0": 100 * E_rad / Eth_fuel0,
         "params": vars(a), "units": u, "liner_mach": mach, "beta_seed": 2 / B0**2,
         "B_peak_T": float(B.max()), "B_peak_innermost_T": float(b1[k_pk]), "B_peak_over_seed": float(b1[k_pk] / a.b_seed_t),
         "t_peak_us": float(t_us[k_pk]), "rise_time_10_90_us": t90 - t10,
@@ -263,7 +281,11 @@ def plot(out):
     fig.colorbar(im, ax=axR, shrink=0.85, label=r"$\log_{10}\rho$ (kg/m$^3$)")
     eta_note = "" if summ.get("eta_model", "ideal") == "ideal" else f" with {summ['eta_model']} resistivity"
     eos = summ.get("eos_liner", "ideal")
-    phys = "ideal-gas MHD" if eos == "ideal" else         f"MHD with a {'stiffened-gas' if eos == 'stiffened' else 'Mie-Gruneisen'} Al liner"
+    liner = "stiffened-gas" if eos == "stiffened" else "Mie-Gruneisen"
+    phys = "ideal-gas MHD" if eos == "ideal" else f"MHD with a {liner} Al liner"
+    if summ.get("radiation"):
+        eta_note += (f"; bremsstrahlung radiated {summ['radiated_pct_of_Ekin0']:.2g}% of the initial kinetic and "
+                     f"{summ['radiated_pct_of_fuel_Eth0']:.2g}% of the initial fuel thermal energy")
     fig.text(0.01, 0.005, f"Illustrative parameters, {phys}{eta_note}: signal shape and scaling only, not a prediction "
              "of MTIF-3 shot data.", fontsize=8, color="#666666")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
@@ -296,6 +318,7 @@ def main():
     ap.add_argument("--no-plot", action="store_true")
     add_resistivity_args(ap)
     add_eos_args(ap)
+    add_radiation_args(ap)
     a = ap.parse_args()
     if a.quick:
         a.n = 128

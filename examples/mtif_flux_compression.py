@@ -8,6 +8,7 @@ div B = 0 holds exactly; flux surfaces are drawn as circles enclosing fixed frac
     python examples/mtif_flux_compression.py --quick --check # 128 x 128 smoke test
     python examples/mtif_flux_compression.py --plot-only     # redo plots from saved data
     python examples/mtif_flux_compression.py --sigma-liner 3.5e7   # resistive aluminium liner
+    python examples/mtif_flux_compression.py --enable-rad --v-ref-kms 100   # hot core, bremsstrahlung
 
 Conductivities are in S/m; the code units are tied to SI through --r-ref-mm (core radius) and
 --v-ref-kms (sqrt(p/rho) of the core) and --rho-ref (core density), defaulting to the NearStar example's
@@ -33,7 +34,8 @@ with contextlib.redirect_stdout(io.StringIO()):
     from sieve.physics import xp, prim_to_cons, cons_to_prim, internal_energy, pressure_margin
     from sieve.solver import MHDSolver, to_numpy
     from sieve.diagnostics import enclosed_by_tracer, cavitation_split
-    from sieve.units import add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args
+    from sieve.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
+                             add_radiation_args, radiation_from_args)
 
 GAMMA = 5.0 / 3.0
 
@@ -44,10 +46,11 @@ def setup(a):
     L0 = a.r_ref_mm * 1e-3 / a.R0                               # code length unit in m
     a.eta = resistivity_from_args(a, L0, a.v_ref_kms * 1e3)
     a.eos, rho_metal = eos_from_args(a, a.rho_ref, a.v_ref_kms * 1e3)
+    a.rad = radiation_from_args(a, a.rho_ref, a.v_ref_kms * 1e3, L0)
     if a.rho_liner is None:
         a.rho_liner = rho_metal or 10.0                         # solid density for a metal EOS
     # tracer = liner volume fraction in every run (also with an ideal-gas liner)
-    cfg = Config(**a.eta, **a.eos, material_tracer="volume_fraction", nx=a.n, ny=a.n, x_min=-L, x_max=L, y_min=-L, y_max=L, t_end=a.t_end, cfl=0.3,
+    cfg = Config(**a.eta, **a.eos, **a.rad, material_tracer="volume_fraction", nx=a.n, ny=a.n, x_min=-L, x_max=L, y_min=-L, y_max=L, t_end=a.t_end, cfl=0.3,
                  gamma=GAMMA, B_transverse=a.B0, B_field_type="uniform", powell_source=True,
                  bc_x_type="extrapolation", bc_y_type="outflow", diag_interval=10**9, snapshot_times=[])
     s = MHDSolver(cfg)
@@ -102,14 +105,16 @@ def diag(s, a, E0=None):
         "t": s.t, "step": s.step,
         "R": R, "B_max": float(xp.max(xp.abs(Bz))), "B_core_mean": core_flux / max(core_area, 1e-30),
         "flux": flux, "core_flux": core_flux,
-        "ohmic": s.cumulative_ohmic_heating,
+        "ohmic": s.cumulative_ohmic_heating, "E_rad": s.cumulative_radiated_energy,
+        "E_th_core": float(xp.sum(internal_energy(U) * gas_in)) * dA,
         "E_kin": float(xp.sum(0.5 * rho * v2)) * dA, "E_mag": float(xp.sum(0.5 * B2)) * dA,
         "E_th": float(xp.sum(internal_energy(U))) * dA, "E_tot": E,
         "divB_L2": float(xp.sqrt(xp.mean(divB**2))), "divB_max": float(xp.max(xp.abs(divB))),
         "p_min": p_pure, "mixed_cells_at_floor": n_mixed, "rho_min": float(xp.min(U[0])),
     }
     E0 = E if E0 is None else E0
-    row["energy_error"] = (E - E0 - s._cumulative_boundary_energy - s._cumulative_powell_energy) / E0
+    row["energy_error"] = (E - E0 - s._cumulative_boundary_energy - s._cumulative_powell_energy
+                           + s.cumulative_radiated_energy) / E0
     return row, E0
 
 
@@ -125,6 +130,9 @@ def run(a, out):
     print(f"liner speed {V:.3f} (Mach {a.mach:g}), rho_liner {a.rho_liner:g}, grid {a.n}x{a.n}", flush=True)
     if a.eos:
         print(f"liner EOS: {s.eos.describe() if not isinstance(s.eos, float) else a.eos}", flush=True)
+    if a.rad:
+        print(f"radiation: bremsstrahlung, Z_eff {a.z_eff:g}, off below {a.t_rad_min_ev:g} eV "
+              f"(code T {a.rad['rad_T_min']:.3g}; initial core T {a.p_core / a.rho_core:.3g})", flush=True)
     if a.eta:
         print(f"resistivity: {a.eta_model}, " + ", ".join(f"{k} {v:.3g}" for k, v in a.eta.items()
                                                        if not isinstance(v, str)), flush=True)
@@ -175,6 +183,9 @@ def run(a, out):
         "eta_model": a.eta_model, "eta_code": a.eta, "eos_liner": a.eos_liner, "eos_code": a.eos,
         "core_flux_retained_at_turnaround": float(d["core_flux"][i_turn] / d["core_flux"][0]),
         "ohmic_heat_over_E0": float(d["ohmic"][-1] / d["E_tot"][0]),
+        "radiation": bool(a.rad), "rad_code": a.rad,
+        "radiated_pct_of_Ekin0": float(100 * d["E_rad"][-1] / d["E_kin"][0]),
+        "radiated_pct_of_core_Eth0": float(100 * d["E_rad"][-1] / d["E_th_core"][0]),
     }
     if a.eta.get("eta_liner", 0) > 0:
         summary["Rm_liner"] = float(V * a.R0 / a.eta["eta_liner"])    # V R0 / eta
@@ -216,6 +227,9 @@ def plot(out):
     Ek0 = d["E_kin"][0]
     for k, c, lab in (("E_kin", "#222222", "kinetic"), ("E_mag", "#c0392b", "magnetic"), ("E_th", "#1f5f99", "thermal")):
         ax[2].plot(d["t"], (d[k] - d[k][0]) / Ek0, color=c, lw=1.6, label=lab)
+    if summ.get("radiation"):
+        ax[2].plot(d["t"], d["E_rad"] / Ek0, color="#e08a1e", lw=1.6,
+                   label=f"radiated ({summ['radiated_pct_of_Ekin0']:.2g}% of $E_{{kin}}(0)$)")
     ax[2].set_title(r"(c) energy change / $E_{kin}(0)$", loc="left"); ax[2].legend(frameon=False, fontsize=8.5)
     for x in ax:
         x.set_xlabel("$t$")
@@ -279,6 +293,7 @@ def main():
     ap.add_argument("--rho-ref", dest="rho_ref", type=float, default=1.0, help="core density in kg/m^3")
     add_resistivity_args(ap)
     add_eos_args(ap)
+    add_radiation_args(ap)
     a = ap.parse_args()
     a.rho_core, a.p_core, a.R0, a.R1, a.diag_every = 1.0, 1.0, 0.5, 0.7, 5
     if a.quick:
