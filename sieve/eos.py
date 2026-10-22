@@ -116,12 +116,12 @@ class EOS:
 
 def make_eos(cfg):
     """cfg.gamma (a float, the old single-material path) unless more than one material is configured."""
-    if not cfg.is_multimaterial():
+    if not cfg.is_multimaterial() and cfg.material_tracer != "volume_fraction":
         return cfg.gamma
     fuel = Material(cfg.eos_fuel, cfg.gamma, cfg.p_inf)
     gl = cfg.gamma if cfg.gamma_liner is None else cfg.gamma_liner
     liner = Material(cfg.eos_liner, gl, cfg.p_inf_liner, cfg.mg_rho0, cfg.mg_c0, cfg.mg_s, cfg.mg_gamma0)
-    return EOS(fuel, liner, cfg.material_tracer == "volume_fraction")
+    return EOS(fuel, liner, cfg.material_tracer != "mass_fraction")
 
 
 def stiffened_from_hugoniot(rho0, c0, s, up_ref):

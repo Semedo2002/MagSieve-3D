@@ -132,8 +132,10 @@ class PhysicsConfig:
     # fuel: ideal or stiffened (gamma, p_inf); liner: ideal, stiffened (gamma_liner, p_inf_liner) or
     # mie_gruneisen (linear Us-Up Hugoniot reference: mg_rho0, mg_c0, mg_s, mg_gamma0, code units).
     # With more than one material the tracer becomes a volume fraction advected non-conservatively
-    # (material_tracer = "volume_fraction", keeps pressure equilibrium across the interface);
-    # "mass_fraction" blends by the conserved tracer instead and is kept for comparison.
+    # (keeps pressure equilibrium across the interface); material_tracer = "mass_fraction" blends by the
+    # conserved tracer instead and is kept for comparison. Setting "volume_fraction" explicitly also
+    # makes a single ideal gas carry its tracer as a volume fraction (same pressures, a tracer that
+    # measures volume); left as None, a single gas keeps the conserved mass-fraction tracer.
     eos_fuel: str = "ideal"
     p_inf: float = 0.0
     eos_liner: str = "ideal"
@@ -143,7 +145,7 @@ class PhysicsConfig:
     mg_c0: float = 0.0
     mg_s: float = 0.0
     mg_gamma0: float = 0.0
-    material_tracer: str = "volume_fraction"
+    material_tracer: Optional[str] = None
     localized_rh: bool = False
     enstrophy_locking_fraction: float = 0.20
 
@@ -160,7 +162,7 @@ class PhysicsConfig:
             raise ValueError(f"eos_fuel must be ideal or stiffened, not {self.eos_fuel!r}")
         if self.eos_liner not in ("ideal", "stiffened", "mie_gruneisen"):
             raise ValueError(f"eos_liner must be ideal, stiffened or mie_gruneisen, not {self.eos_liner!r}")
-        if self.material_tracer not in ("volume_fraction", "mass_fraction"):
+        if self.material_tracer not in (None, "volume_fraction", "mass_fraction"):
             raise ValueError(f"material_tracer must be volume_fraction or mass_fraction")
         if (self.eos_fuel == "ideal" and self.p_inf != 0) or (self.eos_liner == "ideal" and self.p_inf_liner != 0):
             raise ValueError("p_inf is only used by the stiffened EOS; set eos_fuel/eos_liner='stiffened'")

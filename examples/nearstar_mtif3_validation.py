@@ -56,7 +56,8 @@ def setup(a, u):
     a.eos, rho_metal = eos_from_args(a, u["rho0"], u["v0"])
     if a.liner_ratio is None:
         a.liner_ratio = rho_metal or 10.0                       # solid density for a metal EOS
-    cfg = Config(**a.eta, **a.eos, nx=a.n, ny=a.n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=a.t_end_us * 1e-6 / u["t0"],
+    # tracer = liner volume fraction in every run (also with an ideal-gas liner)
+    cfg = Config(**a.eta, **a.eos, material_tracer="volume_fraction", nx=a.n, ny=a.n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=a.t_end_us * 1e-6 / u["t0"],
                  cfl=0.3, gamma=GAMMA, B_transverse=1.0, B_field_type="uniform", powell_source=True,
                  bc_x_type="extrapolation", bc_y_type="outflow", diag_interval=10**9, snapshot_times=[])
     s = MHDSolver(cfg)
