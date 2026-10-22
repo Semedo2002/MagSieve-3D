@@ -1,4 +1,4 @@
-﻿extern "C" __global__
+extern "C" __global__
 void hlld_flux_x_kernel(
     const double* __restrict__ WL,
     const double* __restrict__ WR,
@@ -8,13 +8,17 @@ void hlld_flux_x_kernel(
     const double gamma,
     const double ch,
     const double floor_rho,
-    const double floor_pr
+    const double floor_pr,
+    const double* __restrict__ eint_L,    // per-face internal energy per volume and squared sound
+    const double* __restrict__ eint_R,    // speed from the EOS, read only when use_eos != 0
+    const double* __restrict__ csq_L,     // (otherwise ideal gas with the scalar gamma); for a
+    const double* __restrict__ csq_R,     // stiffened gas: (p + g p_inf)/(g - 1) and g (p + p_inf)/rho
+    const int use_eos
 ) {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= n_faces) return;
 
     const int NVAR = 10;
-    double gm1 = gamma - 1.0;
 
     double rhoL = WL[0*n_faces + idx]; if (rhoL < floor_rho) rhoL = floor_rho;
     double rhoR = WR[0*n_faces + idx]; if (rhoR < floor_rho) rhoR = floor_rho;
@@ -22,8 +26,9 @@ void hlld_flux_x_kernel(
     double vxR = WR[1*n_faces + idx], vyR = WR[2*n_faces + idx], vzR = WR[3*n_faces + idx];
     double BxL = WL[4*n_faces + idx], ByL = WL[5*n_faces + idx], BzL = WL[6*n_faces + idx];
     double BxR = WR[4*n_faces + idx], ByR = WR[5*n_faces + idx], BzR = WR[6*n_faces + idx];
-    double pL = WL[7*n_faces + idx]; if (pL < floor_pr) pL = floor_pr;
-    double pR = WR[7*n_faces + idx]; if (pR < floor_pr) pR = floor_pr;
+    // with an EOS the face pressures were already floored above cavitation on the host
+    double pL = WL[7*n_faces + idx]; if (!use_eos && pL < floor_pr) pL = floor_pr;
+    double pR = WR[7*n_faces + idx]; if (!use_eos && pR < floor_pr) pR = floor_pr;
     double psiL = WL[8*n_faces + idx], psiR = WR[8*n_faces + idx];
     double CL_v = WL[9*n_faces + idx], CR_v = WR[9*n_faces + idx];
 
@@ -42,8 +47,8 @@ void hlld_flux_x_kernel(
     double ptL = pL + 0.5*BmL2;
     double ptR = pR + 0.5*BmR2;
 
-    double aL2 = gamma*pL/rhoL;
-    double aR2 = gamma*pR/rhoR;
+    double aL2 = use_eos ? csq_L[idx] : gamma*pL/rhoL;
+    double aR2 = use_eos ? csq_R[idx] : gamma*pR/rhoR;
 
     double tmpL = aL2 + BmL2/rhoL;
     double discL = tmpL*tmpL - 4.0*aL2*Bx2/rhoL;
@@ -99,12 +104,12 @@ void hlld_flux_x_kernel(
 
     double vBL = vxL*Bx_f + vyL*ByL + vzL*BzL;
     double vBLS = SM*Bx_f + vyLS*ByLS + vzLS*BzLS;
-    double EL = pL/gm1 + 0.5*rhoL*(vxL*vxL + vyL*vyL + vzL*vzL) + 0.5*BmL2;
+    double EL = (use_eos ? eint_L[idx] : pL/(gamma - 1.0)) + 0.5*rhoL*(vxL*vxL + vyL*vyL + vzL*vzL) + 0.5*BmL2;
     double ELS = ((SL - vxL)*EL - ptL*vxL + ptS*SM + Bx_f*(vBL - vBLS))/dSL_SM;
 
     double vBR = vxR*Bx_f + vyR*ByR + vzR*BzR;
     double vBRS = SM*Bx_f + vyRS*ByRS + vzRS*BzRS;
-    double ER = pR/gm1 + 0.5*rhoR*(vxR*vxR + vyR*vyR + vzR*vzR) + 0.5*BmR2;
+    double ER = (use_eos ? eint_R[idx] : pR/(gamma - 1.0)) + 0.5*rhoR*(vxR*vxR + vyR*vyR + vzR*vzR) + 0.5*BmR2;
     double ERS = ((SR - vxR)*ER - ptR*vxR + ptS*SM + Bx_f*(vBR - vBRS))/dSR_SM;
 
     double sBx = (Bx_f >= 0.0) ? 1.0 : -1.0;

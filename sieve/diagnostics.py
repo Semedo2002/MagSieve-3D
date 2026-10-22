@@ -55,7 +55,7 @@ def diagnostics_for_solver(solver):
     """Compute solver diagnostics, with the expensive spatial reductions on GPU."""
     ng = solver.ng
     cfg = solver.cfg
-    W = cons_to_prim(solver.U, cfg.gamma)
+    W = cons_to_prim(solver.U, getattr(solver, "eos", cfg.gamma))
     rho = W[iRHO, ng:-ng, ng:-ng]
     p = W[iPR, ng:-ng, ng:-ng]
     vx = W[iVX, ng:-ng, ng:-ng]
@@ -179,3 +179,29 @@ def diagnostics_for_solver(solver):
         "jet_momentum_flux_gap": mom_gap,
         "jet_momentum_flux_bar": mom_bar,
     }
+
+
+def enclosed_by_tracer(C, X, Y, n_theta=256):
+    """Mask of cells inside a ring marked by the tracer (C >= 0.5), e.g. the gas a liner encloses: per
+    angle bin, everything closer to the origin than the nearest marked cell. Works whatever the tracer
+    marks outside the ring and for a non-circular ring. Bins with no marked cell use the largest radius
+    found elsewhere."""
+    c, x, y = (xp.asnumpy(v) if hasattr(xp, "asnumpy") else np.asarray(v) for v in (C, X, Y))
+    r = np.hypot(x, y)
+    b = ((np.arctan2(y, x) + np.pi) / (2 * np.pi) * n_theta).astype(int) % n_theta
+    R = np.full(n_theta, np.inf)
+    hit = c >= 0.5
+    np.minimum.at(R, b[hit], r[hit])
+    if np.all(np.isinf(R)):
+        return np.zeros_like(c, dtype=bool)
+    R[np.isinf(R)] = R[np.isfinite(R)].max()
+    return r < R[b]
+
+
+def cavitation_split(margin, C, pure_tol=1e-6):
+    """(min margin over pure cells, number of mixed cells at or below cavitation). margin is p minus the
+    cavitation pressure (physics.pressure_margin); pure = tracer within pure_tol of 0 or 1 (tight, because a
+    trace of a stiff material in a gas cell already shifts its cavitation pressure by a p_inf)."""
+    pure = (C < pure_tol) | (C > 1 - pure_tol)
+    m_pure = float(xp.min(xp.where(pure, margin, xp.inf)))
+    return m_pure, int(xp.sum((margin <= 0) & ~pure))

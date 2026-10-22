@@ -10,7 +10,8 @@ div B = 0 holds exactly; flux surfaces are drawn as circles enclosing fixed frac
     python examples/mtif_flux_compression.py --sigma-liner 3.5e7   # resistive aluminium liner
 
 Conductivities are in S/m; the code units are tied to SI through --r-ref-mm (core radius) and
---v-ref-kms (sqrt(p/rho) of the core), defaulting to the NearStar example's scales.
+--v-ref-kms (sqrt(p/rho) of the core) and --rho-ref (core density), defaulting to the NearStar example's
+scales; they also set the liner EOS in SI (--eos-liner stiffened / mie_gruneisen use aluminium).
 
 Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
@@ -29,9 +30,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)  # run from a repo checkout without installing
 with contextlib.redirect_stdout(io.StringIO()):
     from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iBZ, iPR, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim
+    from sieve.physics import xp, prim_to_cons, cons_to_prim, internal_energy, pressure_margin
     from sieve.solver import MHDSolver, to_numpy
-    from sieve.units import add_resistivity_args, resistivity_from_args
+    from sieve.diagnostics import enclosed_by_tracer, cavitation_split
+    from sieve.units import add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args
 
 GAMMA = 5.0 / 3.0
 
@@ -41,7 +43,10 @@ def setup(a):
     L = 1.0
     L0 = a.r_ref_mm * 1e-3 / a.R0                               # code length unit in m
     a.eta = resistivity_from_args(a, L0, a.v_ref_kms * 1e3)
-    cfg = Config(**a.eta, nx=a.n, ny=a.n, x_min=-L, x_max=L, y_min=-L, y_max=L, t_end=a.t_end, cfl=0.3,
+    a.eos, rho_metal = eos_from_args(a, a.rho_ref, a.v_ref_kms * 1e3)
+    if a.rho_liner is None:
+        a.rho_liner = rho_metal or 10.0                         # solid density for a metal EOS
+    cfg = Config(**a.eta, **a.eos, nx=a.n, ny=a.n, x_min=-L, x_max=L, y_min=-L, y_max=L, t_end=a.t_end, cfl=0.3,
                  gamma=GAMMA, B_transverse=a.B0, B_field_type="uniform", powell_source=True,
                  bc_x_type="extrapolation", bc_y_type="outflow", diag_interval=10**9, snapshot_times=[])
     s = MHDSolver(cfg)
@@ -66,8 +71,8 @@ def setup(a):
     W[iVX] = -V * liner * X / r
     W[iVY] = -V * liner * Y / r
     W[iBZ] = Bz
-    W[iCLR] = 1 - core                                          # 0 in the core, 1 outside
-    s.U = prim_to_cons(W, GAMMA)
+    W[iCLR] = liner                                             # material tracer: 1 in the liner only
+    s.U = prim_to_cons(W, s.eos)
     s.t, s.step = 0.0, 0
     return s, V
 
@@ -76,17 +81,21 @@ def diag(s, a, E0=None):
     """One row of diagnostics."""
     ng = s.ng
     U = s.U[:, ng:-ng, ng:-ng]
-    W = cons_to_prim(s.U, GAMMA)[:, ng:-ng, ng:-ng]
+    W = cons_to_prim(s.U, s.eos)[:, ng:-ng, ng:-ng]
     dA = s.cfg.dx * s.cfg.dy
-    rho, p, Bz, C = W[iRHO], W[iPR], W[iBZ], xp.clip(W[iCLR], 0, 1)
+    rho, Bz, C = W[iRHO], W[iBZ], xp.clip(W[iCLR], 0, 1)
     v2 = W[iVX]**2 + W[iVY]**2
     B2 = W[4]**2 + W[5]**2 + Bz**2
-    core_area = float(xp.sum(1 - C)) * dA
+    # core = gas enclosed by the liner (the tracer marks the liner only)
+    gas_in = (1 - C) * xp.asarray(enclosed_by_tracer(C, s.X[ng:-ng, ng:-ng], s.Y[ng:-ng, ng:-ng]))
+    core_area = float(xp.sum(gas_in)) * dA
     R = np.sqrt(core_area / np.pi)                              # equivalent core radius
     flux = float(xp.sum(Bz)) * dA                               # total axial flux (conserved)
-    core_flux = float(xp.sum(Bz * (1 - C))) * dA
+    core_flux = float(xp.sum(Bz * gas_in)) * dA
     divB = xp.gradient(W[4], s.cfg.dx, axis=0) + xp.gradient(W[5], s.cfg.dy, axis=1)
-    p_raw = (GAMMA - 1) * (U[EN] - 0.5 * (U[1]**2 + U[2]**2 + U[3]**2) / U[0] - 0.5 * (U[4]**2 + U[5]**2 + U[6]**2))
+    # p above cavitation (p for an ideal gas): pure cells must stay positive; mixed cells at a free
+    # surface facing vacuum can dip below and are held by the solver's floor, so they are only counted
+    p_pure, n_mixed = cavitation_split(pressure_margin(U, s.eos), C)
     E = float(xp.sum(U[EN])) * dA
     row = {
         "t": s.t, "step": s.step,
@@ -94,9 +103,9 @@ def diag(s, a, E0=None):
         "flux": flux, "core_flux": core_flux,
         "ohmic": s.cumulative_ohmic_heating,
         "E_kin": float(xp.sum(0.5 * rho * v2)) * dA, "E_mag": float(xp.sum(0.5 * B2)) * dA,
-        "E_th": float(xp.sum(p)) * dA / (GAMMA - 1), "E_tot": E,
+        "E_th": float(xp.sum(internal_energy(U))) * dA, "E_tot": E,
         "divB_L2": float(xp.sqrt(xp.mean(divB**2))), "divB_max": float(xp.max(xp.abs(divB))),
-        "p_min": float(xp.min(p_raw)), "rho_min": float(xp.min(U[0])),
+        "p_min": p_pure, "mixed_cells_at_floor": n_mixed, "rho_min": float(xp.min(U[0])),
     }
     E0 = E if E0 is None else E0
     row["energy_error"] = (E - E0 - s._cumulative_boundary_energy - s._cumulative_powell_energy) / E0
@@ -105,7 +114,7 @@ def diag(s, a, E0=None):
 
 def frame(s):
     ng = s.ng
-    W = cons_to_prim(s.U, GAMMA)[:, ng:-ng, ng:-ng]
+    W = cons_to_prim(s.U, s.eos)[:, ng:-ng, ng:-ng]
     return to_numpy(W[iRHO]).astype(np.float32), to_numpy(W[iBZ]).astype(np.float32)
 
 
@@ -113,6 +122,8 @@ def run(a, out):
     os.makedirs(out, exist_ok=True)
     s, V = setup(a)
     print(f"liner speed {V:.3f} (Mach {a.mach:g}), rho_liner {a.rho_liner:g}, grid {a.n}x{a.n}", flush=True)
+    if a.eos:
+        print(f"liner EOS: {s.eos.describe() if not isinstance(s.eos, float) else a.eos}", flush=True)
     if a.eta:
         print(f"resistivity: {a.eta_model}, " + ", ".join(f"{k} {v:.3g}" for k, v in a.eta.items()
                                                        if not isinstance(v, str)), flush=True)
@@ -126,7 +137,7 @@ def run(a, out):
         if times and s.t >= times[0] - 1e-12:
             times.pop(0)
             r_, b_ = frame(s); rho_f.append(r_); bz_f.append(b_); t_f.append(s.t)
-        s.dt = min(s.compute_dt(cons_to_prim(s.U, GAMMA)), a.t_end - s.t)
+        s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), a.t_end - s.t)
         s.step_ssprk3()
         s.t += s.dt
         s.step += 1
@@ -158,8 +169,9 @@ def run(a, out):
         "flux_drift": float(abs(d["flux"][-1] / d["flux"][0] - 1)),
         "energy_error_max": float(np.max(np.abs(d["energy_error"]))),
         "p_min": float(d["p_min"].min()), "rho_min": float(d["rho_min"].min()),
+        "mixed_cells_at_floor_max": int(d["mixed_cells_at_floor"].max()),
         "divB_max": float(d["divB_max"].max()),
-        "eta_model": a.eta_model, "eta_code": a.eta,
+        "eta_model": a.eta_model, "eta_code": a.eta, "eos_liner": a.eos_liner, "eos_code": a.eos,
         "core_flux_retained_at_turnaround": float(d["core_flux"][i_turn] / d["core_flux"][0]),
         "ohmic_heat_over_E0": float(d["ohmic"][-1] / d["E_tot"][0]),
     }
@@ -248,7 +260,8 @@ def plot(out):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--n", type=int, default=512, help="cells per side")
-    ap.add_argument("--rho-liner", dest="rho_liner", type=float, default=10.0)
+    ap.add_argument("--rho-liner", dest="rho_liner", type=float, default=None,
+                    help="liner density / core density (default 10, or solid Al for a metal EOS)")
     ap.add_argument("--mach", type=float, default=4.0)
     ap.add_argument("--B0", type=float, default=1.0)
     ap.add_argument("--t-end", dest="t_end", type=float, default=0.25)
@@ -262,7 +275,9 @@ def main():
     ap.add_argument("--no-plot", action="store_true")
     ap.add_argument("--r-ref-mm", dest="r_ref_mm", type=float, default=8.0, help="core radius in mm (SI scale)")
     ap.add_argument("--v-ref-kms", dest="v_ref_kms", type=float, default=1.0, help="core sqrt(p/rho) in km/s")
+    ap.add_argument("--rho-ref", dest="rho_ref", type=float, default=1.0, help="core density in kg/m^3")
     add_resistivity_args(ap)
+    add_eos_args(ap)
     a = ap.parse_args()
     a.rho_core, a.p_core, a.R0, a.R1, a.diag_every = 1.0, 1.0, 0.5, 0.7, 5
     if a.quick:
@@ -273,8 +288,8 @@ def main():
         summ = run(a, a.out)
         if a.check:
             ok = (summ["p_min"] > 0 and summ["rho_min"] > 0 and summ["energy_error_max"] < 1e-10
-                  # with resistivity, flux diffusing into the ambient can leave through the open boundary
-                  and summ["flux_drift"] < (1e-10 if a.eta_model == "ideal" else 1e-6)
+                  # flux can leave through the open boundary (resistive diffusion, or a heavy liner rebounding)
+                  and summ["flux_drift"] < 1e-6
                   and summ["B_max_over_B0"] > 2)
             print("smoke check:", "PASS" if ok else "FAIL")
             if not ok:

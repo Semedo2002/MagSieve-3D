@@ -82,8 +82,17 @@ _hlld_kernel = _hlld_module.get_function("hlld_flux_x_kernel")
 # ============================================================
 # GPU Vectorized Operations
 # ============================================================
+def _ideal(eos):
+    return isinstance(eos, (int, float))
+
+
+def _tracer_is_vf(eos):
+    return not _ideal(eos) and eos.volume_fraction
+
+
 def cons_to_prim(U, gamma):
-    """Conservative to primitive -- fully on GPU."""
+    """Conservative to primitive -- fully on GPU. gamma is a float (one ideal gas) or an eos.EOS;
+    with a volume-fraction tracer U[RHOC] holds the fraction itself, not rho times it."""
     W = xp.empty_like(U)
     rho = xp.maximum(U[RHO], FLOOR_RHO)
     ri = 1.0 / rho
@@ -95,10 +104,14 @@ def cons_to_prim(U, gamma):
     W[iBY] = U[BY]
     W[iBZ] = U[BZ]
     W[iPSI] = U[PSI]
-    W[iCLR] = U[RHOC] * ri
+    W[iCLR] = U[RHOC] if _tracer_is_vf(gamma) else U[RHOC] * ri
     KE = 0.5 * rho * (W[iVX]**2 + W[iVY]**2 + W[iVZ]**2)
     ME = 0.5 * (U[BX]**2 + U[BY]**2 + U[BZ]**2)
-    W[iPR] = xp.maximum((gamma - 1) * (U[EN] - KE - ME), FLOOR_PR)
+    if _ideal(gamma):
+        W[iPR] = xp.maximum((gamma - 1) * (U[EN] - KE - ME), FLOOR_PR)
+    else:
+        a = W[iCLR]
+        W[iPR] = xp.maximum(gamma.pressure(rho, U[EN] - KE - ME, a), gamma.p_floor(rho, a))
     return W
 
 
@@ -114,14 +127,52 @@ def prim_to_cons(W, gamma):
     U[BY] = W[iBY]
     U[BZ] = W[iBZ]
     U[PSI] = W[iPSI]
-    U[RHOC] = rho * W[iCLR]
+    U[RHOC] = W[iCLR] if _tracer_is_vf(gamma) else rho * W[iCLR]
     KE = 0.5 * rho * (W[iVX]**2 + W[iVY]**2 + W[iVZ]**2)
     ME = 0.5 * (W[iBX]**2 + W[iBY]**2 + W[iBZ]**2)
-    U[EN] = W[iPR] / (gamma - 1) + KE + ME
+    if _ideal(gamma):
+        U[EN] = W[iPR] / (gamma - 1) + KE + ME
+    else:
+        U[EN] = gamma.eps(rho, W[iPR], W[iCLR]) + KE + ME
     return U
 
 
-def muscl_x(W):
+def internal_energy(U):
+    """eps = E - kinetic - magnetic, per volume (no floors)"""
+    rho = xp.maximum(U[RHO], FLOOR_RHO)
+    return U[EN] - 0.5 * (U[MX]**2 + U[MY]**2 + U[MZ]**2) / rho - 0.5 * (U[BX]**2 + U[BY]**2 + U[BZ]**2)
+
+
+def pressure_margin(U, gamma):
+    """raw pressure (before any floor) minus the cavitation pressure: p for an ideal gas, p + p_inf for a
+    stiffened gas. Must stay positive."""
+    eps = internal_energy(U)
+    if _ideal(gamma):
+        return (gamma - 1) * eps
+    rho = xp.maximum(U[RHO], FLOOR_RHO)
+    a = U[RHOC] if gamma.volume_fraction else U[RHOC] / rho
+    return gamma.pressure(rho, eps, a) - gamma.p_min(rho, a)
+
+
+def sound_speed2(W, gamma):
+    """squared sound speed of a primitive state"""
+    rho = xp.maximum(W[iRHO], FLOOR_RHO)
+    if _ideal(gamma):
+        return gamma * xp.maximum(W[iPR], FLOOR_PR) / rho
+    return xp.maximum(gamma.c2(rho, W[iPR], W[iCLR]), 0.0)
+
+
+def _floor_faces(WL, WR, eos):
+    for Wf in (WL, WR):
+        Wf[iRHO] = xp.maximum(Wf[iRHO], FLOOR_RHO)
+        if _ideal(eos):
+            Wf[iPR] = xp.maximum(Wf[iPR], FLOOR_PR)
+        else:
+            Wf[iCLR] = xp.clip(Wf[iCLR], 0.0, 1.0)
+            Wf[iPR] = xp.maximum(Wf[iPR], eos.p_floor(Wf[iRHO], Wf[iCLR]))
+
+
+def muscl_x(W, eos=None):
     """MUSCL reconstruction in x -- GPU vectorized with van Leer limiter."""
     dm = W[:, 1:-1, :] - W[:, :-2, :]
     dp = W[:, 2:, :] - W[:, 1:-1, :]
@@ -129,14 +180,11 @@ def muscl_x(W):
     d = xp.where(ab > 0, 2.0 * ab / (dm + dp + 1e-30), 0.0)
     WL = W[:, 1:-2, :] + 0.5 * d[:, :-1, :]
     WR = W[:, 2:-1, :] - 0.5 * d[:, 1:, :]
-    WL[iRHO] = xp.maximum(WL[iRHO], FLOOR_RHO)
-    WR[iRHO] = xp.maximum(WR[iRHO], FLOOR_RHO)
-    WL[iPR] = xp.maximum(WL[iPR], FLOOR_PR)
-    WR[iPR] = xp.maximum(WR[iPR], FLOOR_PR)
+    _floor_faces(WL, WR, 1.4 if eos is None else eos)
     return WL, WR
 
 
-def muscl_y(W):
+def muscl_y(W, eos=None):
     """MUSCL reconstruction in y -- GPU vectorized with van Leer limiter."""
     dm = W[:, :, 1:-1] - W[:, :, :-2]
     dp = W[:, :, 2:] - W[:, :, 1:-1]
@@ -144,27 +192,39 @@ def muscl_y(W):
     d = xp.where(ab > 0, 2.0 * ab / (dm + dp + 1e-30), 0.0)
     WL = W[:, :, 1:-2] + 0.5 * d[:, :, :-1]
     WR = W[:, :, 2:-1] - 0.5 * d[:, :, 1:]
-    WL[iRHO] = xp.maximum(WL[iRHO], FLOOR_RHO)
-    WR[iRHO] = xp.maximum(WR[iRHO], FLOOR_RHO)
-    WL[iPR] = xp.maximum(WL[iPR], FLOOR_PR)
-    WR[iPR] = xp.maximum(WR[iPR], FLOOR_PR)
+    _floor_faces(WL, WR, 1.4 if eos is None else eos)
     return WL, WR
 
 
+_NO_EOS = None
+
+
 def hlld_flux_x(WL, WR, gamma, ch):
-    """HLLD flux using CUDA kernel -- one thread per interface."""
+    """HLLD flux using CUDA kernel -- one thread per interface. With an eos.EOS the kernel gets each face
+    state's internal energy and squared sound speed instead of one gamma."""
+    global _NO_EOS
     n_faces = WL.shape[1]
     F = xp.empty_like(WL)
     smax_arr = xp.empty(n_faces, dtype=xp.float64)
 
     block = 256
     grid = (n_faces + block - 1) // block
+    if _ideal(gamma):
+        if _NO_EOS is None or _NO_EOS.size < 1:
+            _NO_EOS = xp.zeros(1, dtype=xp.float64)
+        eL = eR = c2L = c2R = _NO_EOS
+        use_eos, g0 = 0, gamma
+    else:
+        eL, eR = (xp.ascontiguousarray(gamma.eps(Wf[iRHO], Wf[iPR], Wf[iCLR])) for Wf in (WL, WR))
+        c2L, c2R = (xp.ascontiguousarray(xp.maximum(gamma.c2(Wf[iRHO], Wf[iPR], Wf[iCLR]), 0.0)) for Wf in (WL, WR))
+        use_eos, g0 = 1, 0.0
 
     _hlld_kernel(
         (grid,), (block,),
         (WL, WR, F, smax_arr,
-         np.int32(n_faces), np.float64(gamma), np.float64(ch),
-         np.float64(FLOOR_RHO), np.float64(FLOOR_PR))
+         np.int32(n_faces), np.float64(g0), np.float64(ch),
+         np.float64(FLOOR_RHO), np.float64(FLOOR_PR),
+         eL, eR, c2L, c2R, np.int32(use_eos))
     )
 
     smax = float(xp.max(smax_arr))

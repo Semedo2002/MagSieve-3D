@@ -64,3 +64,33 @@ def resistivity_from_args(a, L0, v0):
     a.eta_model = model
     return resistivity_kwargs(model, L0, v0, a.sigma_liner, a.sigma_fuel, a.sigma_min, a.t_min_ev,
                               a.ion_mass_amu, 1.0, a.coulomb_log)
+
+
+# aluminium: linear Us-Up Hugoniot (Marsh 1980) and Gruneisen parameter
+AL_HUGONIOT = dict(rho0=2700.0, c0=5328.0, s=1.338, gamma0=2.0)
+
+
+def add_eos_args(ap):
+    g = ap.add_argument_group("liner equation of state")
+    g.add_argument("--eos-liner", dest="eos_liner", choices=["ideal", "stiffened", "mie_gruneisen"], default="ideal")
+    g.add_argument("--gamma-liner", dest="gamma_liner", type=float, default=None,
+                   help="ideal/stiffened liner gamma (stiffened default: fit to the Al Hugoniot at u_p = 1 km/s)")
+    g.add_argument("--p-inf-gpa", dest="p_inf_gpa", type=float, default=None,
+                   help="stiffened p_inf, GPa (default rho0 c0^2 / gamma for Al)")
+
+
+def eos_from_args(a, rho_unit, v_unit):
+    """Config keywords for the liner EOS (code units) and the liner's natural density in code units
+    (None for an ideal-gas liner). Mie-Gruneisen uses the aluminium Hugoniot."""
+    from .eos import stiffened_from_hugoniot
+    H = AL_HUGONIOT
+    p_unit = rho_unit * v_unit**2
+    if a.eos_liner == "ideal":
+        return ({} if a.gamma_liner is None else {"gamma_liner": a.gamma_liner}), None
+    if a.eos_liner == "stiffened":
+        g_fit, _ = stiffened_from_hugoniot(H["rho0"], H["c0"], H["s"], 1000.0)
+        g = a.gamma_liner or g_fit
+        pinf = a.p_inf_gpa * 1e9 if a.p_inf_gpa is not None else H["rho0"] * H["c0"]**2 / g
+        return dict(eos_liner="stiffened", gamma_liner=g, p_inf_liner=pinf / p_unit), H["rho0"] / rho_unit
+    return (dict(eos_liner="mie_gruneisen", mg_rho0=H["rho0"] / rho_unit, mg_c0=H["c0"] / v_unit, mg_s=H["s"],
+                 mg_gamma0=H["gamma0"]), H["rho0"] / rho_unit)

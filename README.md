@@ -10,7 +10,8 @@ A 2D and 3D compressible MHD solver (CuPy + a custom CUDA HLLD kernel) and the p
 sieve/            solver package
   config.py       typed configuration (unknown keys raise ValueError)
   physics.py      CUDA HLLD wrapper, MUSCL, jump conditions, resistive terms, stripe equilibrium
-  units.py        SI helpers: conductivity to code-unit diffusivity, Spitzer coefficient
+  eos.py          two-material EOS: ideal gas, stiffened gas, Mie-Gruneisen (linear Us-Up)
+  units.py        SI helpers: conductivity to code-unit diffusivity, Spitzer coefficient, liner EOS
   hlld_kernel.cu  HLLD Riemann solver (one thread per face)
   solver.py       MHDSolver (SSP-RK3, GLM + Powell, BCs, energy budget) and PostProcessor
   solver3d.py     MHDSolver3D: unsplit HLLD in x, y, z (same kernel, rotated), z-periodic, 3D seeding,
@@ -45,6 +46,23 @@ python main.py --help
 
 `--case` runs a 12 x 2 domain to t = 0.8 and writes figures and 61-frame GIFs to `rmi_output_gpu/`.
 
+### Equation of state
+
+Two materials, selected by the tracer: `eos_fuel` (where it is 0: `ideal` with `gamma`, or `stiffened` with
+`p_inf`) and `eos_liner` (where it is 1: `ideal`, `stiffened` with `gamma_liner` and `p_inf_liner`, or
+`mie_gruneisen` with `mg_rho0`, `mg_c0`, `mg_s`, `mg_gamma0`). Each law is written as eps = phi1(rho) p + phi2(rho);
+mixed cells blend phi1 and phi2 linearly in the tracer, which is then a volume fraction advected
+non-conservatively with the face values the energy flux uses (Shyue 1998), so a material interface at uniform
+p and u stays in equilibrium. The HLLD kernel takes each face state's internal energy and sound speed from the
+EOS; with one ideal gas the solver runs the original code path. Multi-material runs are 2D only. The examples
+take an aluminium liner in SI:
+
+```
+python examples/nearstar_mtif3_validation.py --eos-liner stiffened                # Al, gamma/p_inf fitted to its Hugoniot
+python examples/nearstar_mtif3_validation.py --eos-liner mie_gruneisen            # Al: rho0 2700, c0 5328, s 1.338, Gamma0 2
+python examples/mtif_flux_compression.py --eos-liner stiffened --p-inf-gpa 20 --gamma-liner 3.8
+```
+
 ### Resistivity
 
 `eta_model` selects `constant` (`eta_resistivity` everywhere, the default), `material` (`eta_fuel` where the
@@ -75,6 +93,9 @@ python examples/nearstar_mtif3_validation.py --eta-model spitzer --sigma-liner 3
 | resistive_z | weak B_x(z) decays as exp(-eta k^2 t) (error 3e-4); Ohmic heating conserves energy |
 | resistive_layers | two-layer steady diffusion, eta jumps 4x: piecewise-linear B_z recovered to 3e-4 with harmonic face averaging (arithmetic: 1.7e-2) |
 | ohmic | periodic box, eta varying 10x: thermal energy gained matches the integral of eta J^2 to 0.14%, total energy to 2e-14 |
+| eos_impact | 10 km/s Al impact: stiffened Al on stiffened Cu vs the exact impedance match, and Mie-Gruneisen Al on Al vs the Us-Up Hugoniot; shock speeds, pressure, densities and velocity within 0.5% |
+| eos_interface | Al slab in gas at uniform p and u: volume-fraction tracer keeps p uniform to 1e-9 (round-off times p_inf/p); mass-fraction blending, for comparison, is off by 3e5 p within 0.002 us |
+| eos_positivity | stiffened Al pulled apart at 5 and 8 km/s (cavitation) and a gas/Al interface: p + p_inf > 0, c^2 > 0, finite state |
 
 ## Reproducing the study
 
@@ -145,7 +166,7 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 
 ## Model and numerical limitations
 
-- Ideal gas (γ = 5/3) for every material, no physical viscosity or thermal conduction, no radiation.
+- Ideal gas (γ = 5/3) by default; stiffened-gas and Mie-Gruneisen liners have no strength, spall or phase change (tension is limited only by cavitation at c^2 = 0). The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. No physical viscosity or thermal conduction, no radiation.
 - Resistivity is scalar (isotropic), with no Hall term. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
 - Cell-centred magnetic field with GLM cleaning; the divergence error at shocks is a few percent (no constrained transport).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.

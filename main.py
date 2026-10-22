@@ -10,7 +10,7 @@ import numpy as np
 from typing import Dict, List, Tuple
 
 from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iCLR
-from sieve.physics import xp, cp, cons_to_prim, prim_to_cons, mhd_rankine_hugoniot
+from sieve.physics import xp, cp, cons_to_prim, prim_to_cons, mhd_rankine_hugoniot, sound_speed2
 from sieve.solver import MHDSolver, PostProcessor, save_figure, to_numpy, OUTPUT_DIR
 
 import matplotlib
@@ -302,9 +302,8 @@ def resistive_z_test(eta=0.01, tol=0.01):
 
 def _march(s, t_end):
     """Plain time loop for hand-built 2D states (energy budget accumulates inside step_ssprk3)."""
-    g = s.cfg.gamma
     while s.t < t_end - 1e-14:
-        s.dt = min(s.compute_dt(cons_to_prim(s.U, g)), t_end - s.t)
+        s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), t_end - s.t)
         s.step_ssprk3(); s.t += s.dt; s.step += 1
 
 
@@ -409,6 +408,160 @@ def ohmic_heating_test(tol=0.01):
     return ok
 
 
+# Multi-material EOS tests. Units: g/cm^3, km/s, mm, us, GPa (1 g/cm^3 (km/s)^2 = 1 GPa).
+AL = dict(rho0=2.70, c0=5.328, s=1.338, gamma0=2.0)
+CU = dict(rho0=8.93, c0=3.940, s=1.489, gamma0=2.0)
+
+
+def _eos_tube(nx, t_end, x0, left, right, bc="extrapolation", **cfg_kw):
+    """1D Riemann problem on an nx x 4 strip; left/right = (rho, u, p, liner fraction)."""
+    cfg = Config(nx=nx, ny=4, x_max=1.0, y_max=4.0 / nx, t_end=t_end, cfl=0.3, mach=1.0, B_transverse=0.0,
+                 powell_source=False, bc_x_type=bc, bc_y_type="periodic", diag_interval=10**9,
+                 snapshot_times=[], **cfg_kw)
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(cfg)
+    x = s.x[:, None] * xp.ones((1, s.ny_tot))
+    W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+    inside = x0(x) if callable(x0) else (x < x0)
+    for k, i in ((0, iRHO), (1, iVX), (2, iPR), (3, iCLR)):
+        W[i] = xp.where(inside, left[k], right[k])
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    s.apply_bc(s.U)
+    E0 = _energy(s)
+    _march(s, t_end)
+    ng = s.ng
+    Wf = cons_to_prim(s.U, s.eos)
+    prof = {k: to_numpy(Wf[i, ng:-ng, ng]) for k, i in (("rho", iRHO), ("u", iVX), ("p", iPR), ("a", iCLR))}
+    prof["x"] = to_numpy(s.x[ng:-ng])
+    prof["c2"] = to_numpy(sound_speed2(Wf, s.eos)[ng:-ng, ng])
+    prof["budget"] = abs(_energy(s) - E0 - s._cumulative_boundary_energy) / abs(E0)
+    return s, prof
+
+
+def _shock_from(prof, p_lo, p_hi, side):
+    """x where p first exceeds the mid value, scanning in from the given side"""
+    mid = 0.5 * (p_lo + p_hi)
+    i = np.where(prof["p"] > mid)[0]
+    return prof["x"][i[-1]] if side == "right" else prof["x"][i[0]]
+
+
+def eos_impact_test(tol=0.02):
+    """Al flyer at 10 km/s on targets at rest, compared with the exact jump conditions.
+    (1) stiffened-gas Al on stiffened-gas Cu (two materials, volume-fraction interface): impedance match of
+        the two stiffened-gas Hugoniots gives interface velocity, pressure and both shocks.
+    (2) Mie-Gruneisen Al on Mie-Gruneisen Al: symmetric, u_p = V/2 and the state must lie on the reference
+        Hugoniot Us = c0 + s u_p, p = rho0 Us u_p.
+    Shock speeds are measured relative to the unshocked material ahead of each shock."""
+    from sieve.eos import stiffened_from_hugoniot, stiffened_hugoniot
+    print("\n--- EOS: 10 km/s aluminium impact ---"); sys.stdout.flush()
+    V, p0, nx, t_end = 10.0, 1e-4, 400, 0.035
+    gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 5.0)
+    gC, piC = stiffened_from_hugoniot(CU["rho0"], CU["c0"], CU["s"], 3.0)
+    # impedance match: p_Cu(u) = p_Al(V - u)
+    lo, hi = 0.0, V
+    for _ in range(200):
+        u = 0.5 * (lo + hi)
+        if stiffened_hugoniot(CU["rho0"], p0, gC, piC, u)[0] > stiffened_hugoniot(AL["rho0"], p0, gA, piA, V - u)[0]:
+            hi = u
+        else:
+            lo = u
+    pC, rC, usC = stiffened_hugoniot(CU["rho0"], p0, gC, piC, u)
+    pA, rA, usA = stiffened_hugoniot(AL["rho0"], p0, gA, piA, V - u)
+    s, P = _eos_tube(nx, t_end, 0.5, (AL["rho0"], V, p0, 1.0), (CU["rho0"], 0.0, p0, 0.0),
+                     eos_fuel="stiffened", gamma=gC, p_inf=piC, eos_liner="stiffened", gamma_liner=gA,
+                     p_inf_liner=piA)
+    t = s.t
+    xs_C, xs_A = _shock_from(P, p0, pC, "right"), _shock_from(P, p0, pA, "left")
+    xc = 0.5 + u * t
+    h = 1.0 / nx
+    cu = (P["x"] > xc + 8 * h) & (P["x"] < xs_C - 8 * h)
+    al = (P["x"] > xs_A + 8 * h) & (P["x"] < xc - 8 * h)
+    errs = {"Us_Cu": abs((xs_C - 0.5) / t - usC) / usC,
+            "Us_Al": abs((0.5 - xs_A) / t + V - usA) / usA,             # relative to the unshocked flyer
+            "p": abs(np.mean(P["p"][cu | al]) - pC) / pC,
+            "rho_Cu": abs(np.mean(P["rho"][cu]) - rC) / rC, "rho_Al": abs(np.mean(P["rho"][al]) - rA) / rA,
+            "u": abs(np.mean(P["u"][cu | al]) - u) / u}
+    ok1 = max(errs.values()) < tol and P["budget"] < 1e-12
+    print(f"  stiffened Al (gamma {gA:.3f}, p_inf {piA:.2f} GPa) -> Cu (gamma {gC:.3f}, p_inf {piC:.2f} GPa): "
+          f"exact p {pC:.1f} GPa, u {u:.3f}, Us Cu {usC:.3f}, rho Cu {rC:.3f}, rho Al {rA:.3f}")
+    print("    rel. errors " + ", ".join(f"{k} {v:.1e}" for k, v in errs.items())
+          + f"; energy budget {P['budget']:.1e}  [{'PASS' if ok1 else 'FAIL'}]")
+    mg = dict(eos_liner="mie_gruneisen", mg_rho0=AL["rho0"], mg_c0=AL["c0"], mg_s=AL["s"], mg_gamma0=AL["gamma0"])
+    s, P = _eos_tube(nx, t_end, 0.5, (AL["rho0"], V, 0.0, 1.0), (AL["rho0"], 0.0, 0.0, 1.0), **mg)
+    up = V / 2
+    us = AL["c0"] + AL["s"] * up
+    pH, rH = AL["rho0"] * us * up, AL["rho0"] * us / (us - up)
+    xr, xl = _shock_from(P, 0.0, pH, "right"), _shock_from(P, 0.0, pH, "left")
+    mid = (P["x"] > xl + 8 * h) & (P["x"] < xr - 8 * h) & (np.abs(P["x"] - 0.5 - up * s.t) > 8 * h)
+    errs = {"Us": abs((xr - 0.5) / s.t - us) / us, "Us_left": abs((0.5 - xl) / s.t + V - us) / us,
+            "p": abs(np.mean(P["p"][mid]) - pH) / pH,
+            "rho": abs(np.mean(P["rho"][mid]) - rH) / rH, "u": abs(np.mean(P["u"][mid]) - up) / up}
+    ok2 = max(errs.values()) < tol and P["budget"] < 1e-12
+    print(f"  Mie-Gruneisen Al -> Al: Hugoniot u_p {up:g}, Us {us:.3f}, p {pH:.1f} GPa, rho {rH:.3f}")
+    print("    rel. errors " + ", ".join(f"{k} {v:.1e}" for k, v in errs.items())
+          + f"; energy budget {P['budget']:.1e}  [{'PASS' if ok2 else 'FAIL'}]")
+    return ok1 and ok2
+
+
+def eos_interface_test():
+    """Aluminium slab (stiffened, p_inf ~ 27 GPa) carried through gas at uniform p and u, periodic box.
+    The exact solution keeps p and u uniform. Volume-fraction tracer: must hold to round-off. Mass-fraction
+    blending (the conserved tracer) is run briefly for comparison and reported: its spurious pressures reach
+    the cavitation floor within a few steps and the fake sound speeds shrink the time step ~20x."""
+    from sieve.eos import stiffened_from_hugoniot
+    print("\n--- EOS: material interface in pressure equilibrium ---"); sys.stdout.flush()
+    gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 5.0)
+    p0, u0 = 1e-4, 1.0
+    slab = lambda x: (x > 0.3) & (x < 0.6)
+    res = {}
+    for mode, t_end in (("volume_fraction", 0.2), ("mass_fraction", 0.002)):
+        try:
+            s, P = _eos_tube(100, t_end, slab, (AL["rho0"], u0, p0, 1.0), (1e-3, u0, p0, 0.0), bc="periodic",
+                             gamma=1.4, eos_liner="stiffened", gamma_liner=gA, p_inf_liner=piA,
+                             material_tracer=mode)
+            res[mode] = (np.max(np.abs(P["p"] - p0)) / p0, np.max(np.abs(P["u"] - u0)) / u0, P["budget"])
+        except Exception as e:                      # mass-fraction blending can crash outright
+            res[mode] = (float("inf"), float("inf"), float("inf"))
+            print(f"  {mode}: {type(e).__name__}: {e}")
+    vf, mf = res["volume_fraction"], res["mass_fraction"]
+    ok = vf[0] < 1e-8 and vf[1] < 1e-8 and vf[2] < 1e-12
+    print(f"  max |p - p0|/p0: volume fraction {vf[0]:.1e} (t = 0.2), mass fraction {mf[0]:.1e} (t = 0.002); max |u - u0|/u0: "
+          f"{vf[1]:.1e}, {mf[1]:.1e}; energy budget (vf) {vf[2]:.1e}  [{'PASS' if ok else 'FAIL'}]")
+    return ok
+
+
+def eos_positivity_test():
+    """Aluminium (stiffened) pulled apart symmetrically. At v = 5 km/s the centre approaches cavitation;
+    the exact centre state has P = p + p_inf = P0 (1 - (g-1) v/(2 c0))^(2g/(g-1)). At v = 8 km/s (beyond
+    2 c0/(g-1)) the exact solution has a cavity. Checks p + p_inf > 0, c^2 > 0, finite state; also a gas /
+    aluminium interface pulled apart."""
+    from sieve.eos import stiffened_from_hugoniot
+    print("\n--- EOS: positivity under extreme expansion ---"); sys.stdout.flush()
+    gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 5.0)
+    st = dict(eos_liner="stiffened", gamma_liner=gA, p_inf_liner=piA)
+    p0 = 1e-4
+    c0 = np.sqrt(gA * (p0 + piA) / AL["rho0"])
+    ok, lines = True, []
+    for name, v, left, right in (("Al, v = 5", 5.0, None, None), ("Al, v = 8 (cavitates)", 8.0, None, None),
+                                 ("gas | Al, v = 8", 8.0, (1e-3, -8.0, p0, 0.0), (AL["rho0"], 8.0, p0, 1.0))):
+        L = left or (AL["rho0"], -v, p0, 1.0)
+        R = right or (AL["rho0"], v, p0, 1.0)
+        s, P = _eos_tube(200, 0.04, 0.5, L, R, gamma=1.4, **st)
+        pinf_loc = P["a"] * piA                      # p_inf of the local mixture (exact for a = 0, 1)
+        fine = all(np.all(np.isfinite(P[k])) for k in ("rho", "u", "p"))
+        good = fine and np.min(P["c2"]) >= 0 and np.min(P["p"] + pinf_loc) > 0 and np.min(P["rho"]) > 0
+        msg = (f"  {name}: min(p + p_inf) {np.min(P['p'] + pinf_loc):.2e} GPa, min c^2 {np.min(P['c2']):.2e}, "
+               f"min rho {np.min(P['rho']):.2e}")
+        if v == 5.0 and left is None:
+            Pc = (p0 + piA) * (1 - (gA - 1) * v / (2 * c0))**(2 * gA / (gA - 1))
+            num = np.min(P["p"]) + piA
+            msg += f"; centre P {num:.3f} vs exact {Pc:.3f} GPa"
+        lines.append(msg + f"  [{'PASS' if good else 'FAIL'}]")
+        ok = ok and good
+    print("\n".join(lines))
+    return ok
+
+
 def galilean_test(U=6.49):
     """Interface frame: the interface must stay put, energy must close, and the interface growth must match
     the lab frame (within 10%). Mixing-layer enstrophy is reported, not asserted: the scheme is not exactly
@@ -471,6 +624,9 @@ VERIFICATION_TESTS = {
     "resistive_z": resistive_z_test,
     "resistive_layers": resistive_layers_test,
     "ohmic": ohmic_heating_test,
+    "eos_impact": eos_impact_test,
+    "eos_interface": eos_interface_test,
+    "eos_positivity": eos_positivity_test,
     "galilean": galilean_test,
     "rmi_mhd": rmi_mhd_smoke_test,
 }

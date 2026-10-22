@@ -25,6 +25,7 @@ from .config import (
     iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iPSI, iCLR,
 )
 from .diagnostics import diagnostics_for_solver
+from .eos import make_eos
 from .physics import (
     xp, cp,
     cons_to_prim, prim_to_cons,
@@ -35,6 +36,7 @@ from .physics import (
     parallel_stripe_limits,
     parallel_stripe_state,
     compute_resistive_terms,
+    sound_speed2,
     resistivity_field,
     eta_max_of,
     richtmyer_linear_theory,
@@ -101,6 +103,9 @@ class MHDSolver:
 
     def __init__(self, config):
         self.cfg = config
+        # float gamma for one ideal gas, eos.EOS for two materials
+        self.eos = make_eos(config)
+        self._vf = not isinstance(self.eos, (int, float)) and self.eos.volume_fraction
         self.ng = 2
         self.nx_tot = config.nx + 2 * self.ng
         self.ny_tot = config.ny + 2 * self.ng
@@ -267,7 +272,7 @@ class MHDSolver:
 
         W[iCLR] = xp.where(post, 0.0, phi)
 
-        self.U = prim_to_cons(W, g)
+        self.U = prim_to_cons(W, self.eos)
         self.t = 0.0; self.step = 0
         self._acc_boundary_energy = xp.zeros(())
         self._acc_powell_energy = xp.zeros(())
@@ -395,6 +400,9 @@ class MHDSolver:
                   f"over-specifies the outgoing fast characteristic.")
 
     def enforce_scalar_bounds(self, U):
+        if self._vf:
+            U[RHOC] = xp.clip(U[RHOC], 0.0, 1.0)
+            return U
         rho = xp.maximum(U[RHO], FLOOR_RHO)
         C = xp.clip(U[RHOC] / rho, 0.0, 1.0)
         U[RHOC] = rho * C
@@ -403,9 +411,8 @@ class MHDSolver:
     def compute_dt(self, W):
         cfg = self.cfg
         rho = xp.maximum(W[iRHO], FLOOR_RHO)
-        p = xp.maximum(W[iPR], FLOOR_PR)
         B2 = W[iBX]**2 + W[iBY]**2 + W[iBZ]**2
-        cf = xp.sqrt(cfg.gamma * p / rho + B2 / rho)
+        cf = xp.sqrt(sound_speed2(W, self.eos) + B2 / rho)
         sx = xp.abs(W[iVX]) + cf
         sy = xp.abs(W[iVY]) + cf
         # GLM speed = largest MHD signal speed (Dedner et al. 2002). psi waves
@@ -461,14 +468,15 @@ class MHDSolver:
         cfg = self.cfg; ng = self.ng; nx = cfg.nx; ny = cfg.ny
         g = cfg.gamma; ch = self._glm_ch_frozen
         U = self.apply_bc(U)
-        W = cons_to_prim(U, g)
-        WLx, WRx = muscl_x(W); s = WLx.shape
+        eos = self.eos
+        W = cons_to_prim(U, eos)
+        WLx, WRx = muscl_x(W, eos); s = WLx.shape
         Fx, _ = hlld_flux_x(xp.ascontiguousarray(WLx.reshape(NVAR, -1)),
-                             xp.ascontiguousarray(WRx.reshape(NVAR, -1)), g, ch)
+                             xp.ascontiguousarray(WRx.reshape(NVAR, -1)), eos, ch)
         Fx = Fx.reshape(s)
-        WLy, WRy = muscl_y(W); s2 = WLy.shape
+        WLy, WRy = muscl_y(W, eos); s2 = WLy.shape
         Fy, _ = hlld_flux_y(xp.ascontiguousarray(WLy.reshape(NVAR, -1)),
-                             xp.ascontiguousarray(WRy.reshape(NVAR, -1)), g, ch)
+                             xp.ascontiguousarray(WRy.reshape(NVAR, -1)), eos, ch)
         Fy = Fy.reshape(s2)
         dFx = Fx[:, 1:1+nx, :] - Fx[:, 0:nx, :]
         dFy = Fy[:, :, 1:1+ny] - Fy[:, :, 0:ny]
@@ -476,6 +484,12 @@ class MHDSolver:
         R[...] = 0.0
         R[:, ng:ng+nx, ng:ng+ny] -= dFx[:, :, ng:ng+ny] / cfg.dx
         R[:, ng:ng+nx, ng:ng+ny] -= dFy[:, ng:ng+nx, :] / cfg.dy
+        if self._vf:
+            # volume fraction: da/dt + u.grad(a) = 0, written as div(u a) - a div(u) with the face a
+            # the kernel used for the energy flux (F_a = mass flux * a_upwind), so uniform p and u stay
+            # uniform across the material interface
+            R[RHOC, ng:ng+nx, ng:ng+ny] = (self._vf_rate(Fx, WLx, WRx, W, 0, cfg.dx)[:, ng:ng+ny]
+                                          + self._vf_rate(Fy, WLy, WRy, W, 1, cfg.dy)[ng:ng+nx, :])
         # Net energy inflow through the domain faces, from the same fluxes that
         # update U[EN]. Fx[:, 0] / Fx[:, nx] are the x_min / x_max faces.
         boundary_rate = (xp.sum(Fx[EN, 0, ng:ng+ny] - Fx[EN, nx, ng:ng+ny]) * cfg.dy
@@ -500,6 +514,20 @@ class MHDSolver:
         self._stage_powell_rate = powell_rate
         self._stage_ohmic_rate = ohmic_rate
         return R
+
+    def _vf_rate(self, F, WL, WR, W, axis, h):
+        """-(div(u a) - a div u) along one axis, on interior cells along that axis"""
+        F0, Fa = F[RHO], F[RHOC]
+        rho_up = xp.where(F0 >= 0, WL[iRHO], WR[iRHO])
+        u_f = F0 / rho_up
+        a_f = xp.where(xp.abs(F0) > 1e-300, Fa / xp.where(F0 == 0, 1.0, F0), 0.5 * (WL[iCLR] + WR[iCLR]))
+        ua = u_f * a_f
+        ng, n = self.ng, (self.cfg.nx if axis == 0 else self.cfg.ny)
+        if axis == 0:
+            a_c = W[iCLR, ng:ng+n, :]
+            return -((ua[1:1+n] - ua[:n]) - a_c * (u_f[1:1+n] - u_f[:n])) / h
+        a_c = W[iCLR, :, ng:ng+n]
+        return -((ua[:, 1:1+n] - ua[:, :n]) - a_c * (u_f[:, 1:1+n] - u_f[:, :n])) / h
 
     def _accumulate_energy_budget(self, weight):
         self._acc_boundary_energy += weight * self._stage_boundary_rate
@@ -567,7 +595,7 @@ class MHDSolver:
 
     def save_snapshot(self, label=None):
         ng = self.ng
-        W = cons_to_prim(self.U, self.cfg.gamma)
+        W = cons_to_prim(self.U, self.eos)
         key = label or f"t={self.t:.4f}"
         self.snapshots[key] = {
             'rho': to_numpy(W[iRHO, ng:-ng, ng:-ng]),
@@ -592,7 +620,7 @@ class MHDSolver:
         _record_diagnostics(self)
         self.save_snapshot(label="initial")
         while self.t < cfg.t_end and self.step < cfg.max_steps:
-            W = cons_to_prim(self.U, g)
+            W = cons_to_prim(self.U, self.eos)
             dt_cfl = self.compute_dt(W)
             self.dt = min(dt_cfl, cfg.t_end - self.t)
             if self.dt <= 1e-16: break

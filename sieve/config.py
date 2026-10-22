@@ -128,6 +128,22 @@ class PhysicsConfig:
     eta_T_min: float = 1e-2
     eta_max: float = 0.0
     eta_face_mean: str = "harmonic"
+    # equation of state, two materials: "fuel" where the tracer is 0, "liner" where it is 1.
+    # fuel: ideal or stiffened (gamma, p_inf); liner: ideal, stiffened (gamma_liner, p_inf_liner) or
+    # mie_gruneisen (linear Us-Up Hugoniot reference: mg_rho0, mg_c0, mg_s, mg_gamma0, code units).
+    # With more than one material the tracer becomes a volume fraction advected non-conservatively
+    # (material_tracer = "volume_fraction", keeps pressure equilibrium across the interface);
+    # "mass_fraction" blends by the conserved tracer instead and is kept for comparison.
+    eos_fuel: str = "ideal"
+    p_inf: float = 0.0
+    eos_liner: str = "ideal"
+    gamma_liner: Optional[float] = None
+    p_inf_liner: float = 0.0
+    mg_rho0: float = 0.0
+    mg_c0: float = 0.0
+    mg_s: float = 0.0
+    mg_gamma0: float = 0.0
+    material_tracer: str = "volume_fraction"
     localized_rh: bool = False
     enstrophy_locking_fraction: float = 0.20
 
@@ -140,6 +156,18 @@ class PhysicsConfig:
             raise ValueError("eta_model='spitzer' needs eta_spitzer > 0, eta_T_min > 0 and eta_max > 0")
         if min(self.eta_resistivity, self.eta_fuel, self.eta_liner, self.eta_max) < 0:
             raise ValueError("resistivities must be non-negative")
+        if self.eos_fuel not in ("ideal", "stiffened"):
+            raise ValueError(f"eos_fuel must be ideal or stiffened, not {self.eos_fuel!r}")
+        if self.eos_liner not in ("ideal", "stiffened", "mie_gruneisen"):
+            raise ValueError(f"eos_liner must be ideal, stiffened or mie_gruneisen, not {self.eos_liner!r}")
+        if self.material_tracer not in ("volume_fraction", "mass_fraction"):
+            raise ValueError(f"material_tracer must be volume_fraction or mass_fraction")
+        if (self.eos_fuel == "ideal" and self.p_inf != 0) or (self.eos_liner == "ideal" and self.p_inf_liner != 0):
+            raise ValueError("p_inf is only used by the stiffened EOS; set eos_fuel/eos_liner='stiffened'")
+        if min(self.p_inf, self.p_inf_liner) < 0:
+            raise ValueError("p_inf must be non-negative")
+        if self.eos_liner == "mie_gruneisen" and min(self.mg_rho0, self.mg_c0, self.mg_s, self.mg_gamma0) <= 0:
+            raise ValueError("eos_liner='mie_gruneisen' needs mg_rho0, mg_c0, mg_s, mg_gamma0 > 0")
 
     def get_bc_x(self) -> str:
         if self.bc_x_type == "characteristic":
@@ -150,6 +178,10 @@ class PhysicsConfig:
 
     def is_striped(self) -> bool:
         return self.B_field_type == "striped" and self.B_transverse > 0
+
+    def is_multimaterial(self) -> bool:
+        gl = self.gamma if self.gamma_liner is None else self.gamma_liner
+        return self.eos_fuel != "ideal" or self.eos_liner != "ideal" or gl != self.gamma
 
     def is_mhd(self) -> bool:
         return self.B_transverse > 0
@@ -215,3 +247,6 @@ class Config:
 
     def is_resistive(self) -> bool:
         return self.physics.is_resistive()
+
+    def is_multimaterial(self) -> bool:
+        return self.physics.is_multimaterial()

@@ -4,8 +4,8 @@ A dense liner moving inward at >= 10 km/s compresses a pre-magnetized fuel colum
 in a 2D cross-section. Virtual probes at fixed radii record B(t) and dB/dt like b-dot channels.
 
 IMPORTANT: the default machine parameters below are illustrative placeholders, not NearStar's MTIF-3
-values, and the solver is ideal-gas MHD (no solid/liquid EOS for the projectile, no radiation; magnetic
-diffusion into the liner only with --sigma-liner). Use the traces for signal shape and scaling; replace the parameters with
+values, and the default solver is ideal-gas MHD (no radiation; a solid aluminium liner only with
+--eos-liner stiffened or mie_gruneisen, magnetic diffusion into the liner only with --sigma-liner). Use the traces for signal shape and scaling; replace the parameters with
 the real shot values, and add the missing physics, before comparing amplitudes with measured data.
 
     python examples/nearstar_mtif3_validation.py                  # 384 x 384, run + plots
@@ -13,6 +13,7 @@ the real shot values, and add the missing physics, before comparing amplitudes w
     python examples/nearstar_mtif3_validation.py --plot-only
     python examples/nearstar_mtif3_validation.py --sigma-liner 3.5e7            # resistive Al liner
     python examples/nearstar_mtif3_validation.py --eta-model spitzer --sigma-liner 3.5e7
+    python examples/nearstar_mtif3_validation.py --eos-liner stiffened --sigma-liner 3.5e7    # solid Al liner
 
 Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
@@ -31,9 +32,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)  # run from a repo checkout without installing
 with contextlib.redirect_stdout(io.StringIO()):
     from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iBZ, iPR, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim
+    from sieve.physics import xp, prim_to_cons, cons_to_prim, pressure_margin
     from sieve.solver import MHDSolver, to_numpy
-    from sieve.units import add_resistivity_args, resistivity_from_args
+    from sieve.diagnostics import enclosed_by_tracer, cavitation_split
+    from sieve.units import add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args
 
 GAMMA = 5.0 / 3.0
 MU0 = 4e-7 * np.pi
@@ -51,7 +53,10 @@ def units(a):
 
 def setup(a, u):
     a.eta = resistivity_from_args(a, u["L0"], u["v0"])
-    cfg = Config(**a.eta, nx=a.n, ny=a.n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=a.t_end_us * 1e-6 / u["t0"],
+    a.eos, rho_metal = eos_from_args(a, u["rho0"], u["v0"])
+    if a.liner_ratio is None:
+        a.liner_ratio = rho_metal or 10.0                       # solid density for a metal EOS
+    cfg = Config(**a.eta, **a.eos, nx=a.n, ny=a.n, x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0, t_end=a.t_end_us * 1e-6 / u["t0"],
                  cfl=0.3, gamma=GAMMA, B_transverse=1.0, B_field_type="uniform", powell_source=True,
                  bc_x_type="extrapolation", bc_y_type="outflow", diag_interval=10**9, snapshot_times=[])
     s = MHDSolver(cfg)
@@ -73,8 +78,8 @@ def setup(a, u):
     W[iVX] = -V * liner * X / r
     W[iVY] = -V * liner * Y / r
     W[iBZ] = Bz
-    W[iCLR] = 1 - fuel
-    s.U = prim_to_cons(W, GAMMA)
+    W[iCLR] = liner                                # material tracer: 1 in the liner only
+    s.U = prim_to_cons(W, s.eos)
     s.t, s.step = 0.0, 0
     return s, B0, V
 
@@ -105,19 +110,24 @@ def sample(s, probes):
 
 def core_radius(s):
     ng = s.ng
-    rho = xp.maximum(s.U[0, ng:-ng, ng:-ng], 1e-300)
-    C = xp.clip(s.U[9, ng:-ng, ng:-ng] / rho, 0, 1)
-    return float(np.sqrt(float(xp.sum(1 - C)) * s.cfg.dx * s.cfg.dy / np.pi))
+    C = xp.clip(cons_to_prim(s.U, s.eos)[iCLR, ng:-ng, ng:-ng], 0, 1)
+    # fuel = gas enclosed by the liner (the tracer marks the liner only)
+    inside = xp.asarray(enclosed_by_tracer(C, s.X[ng:-ng, ng:-ng], s.Y[ng:-ng, ng:-ng]))
+    return float(np.sqrt(float(xp.sum((1 - C) * inside)) * s.cfg.dx * s.cfg.dy / np.pi))
 
 
 def check_state(s, E0):
     ng = s.ng
     U = s.U[:, ng:-ng, ng:-ng]
-    p = (GAMMA - 1) * (U[EN] - 0.5 * (U[1]**2 + U[2]**2 + U[3]**2) / U[0] - 0.5 * (U[4]**2 + U[5]**2 + U[6]**2))
+    # p above cavitation (p for an ideal gas); mixed cells at a free surface facing vacuum may dip below
+    # and are held by the solver's floor, so only pure cells count toward p_min
+    C = xp.clip(cons_to_prim(s.U, s.eos)[iCLR, ng:-ng, ng:-ng], 0, 1)
+    p_pure, n_mixed = cavitation_split(pressure_margin(U, s.eos), C)
+    s._mixed_at_floor = max(getattr(s, "_mixed_at_floor", 0), n_mixed)
     E = float(xp.sum(U[EN])) * s.cfg.dx * s.cfg.dy
     E0 = E if E0 is None else E0
     err = (E - E0 - s._cumulative_boundary_energy - s._cumulative_powell_energy) / E0
-    return float(xp.min(p)), float(xp.min(U[0])), err, E0
+    return p_pure, float(xp.min(U[0])), err, E0
 
 
 def run(a, out):
@@ -129,6 +139,8 @@ def run(a, out):
           f"(beta = {2 / B0**2:.3g}); time unit {u['t0'] * 1e6:.3g} us", flush=True)
     if a.v_liner_kms < 10 or mach < 5:
         print("warning: liner below 10 km/s or Mach 5", flush=True)
+    if a.eos_liner != "ideal":
+        print(f"liner EOS: {s.eos.describe()}, liner density {a.liner_ratio * u['rho0']:.0f} kg/m^3", flush=True)
     if a.eta:
         Rm = V * R_CODE / a.eta["eta_liner"] if a.eta.get("eta_liner", 0) > 0 else float("inf")
         print(f"resistivity: {a.eta_model}, liner eta {a.eta.get('eta_liner', 0) * u['L0'] * u['v0']:.3g} m^2/s "
@@ -152,7 +164,7 @@ def run(a, out):
             p_min, rho_min, err_max = min(p_min, pm), min(rho_min, rm), max(err_max, abs(err))
             if pm <= 0 or rm <= 0:
                 raise RuntimeError(f"non-physical state at step {s.step}: p_min={pm:.3g}")
-        s.dt = min(s.compute_dt(cons_to_prim(s.U, GAMMA)), s.cfg.t_end - s.t)
+        s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), s.cfg.t_end - s.t)
         s.step_ssprk3()
         s.t += s.dt
         s.step += 1
@@ -182,9 +194,10 @@ def run(a, out):
     Rmm = T[:, 1]
     near = np.where(Rmm <= 1.1 * Rmm.min())[0]
     summary = {
-        "note": "illustrative parameters and ideal-gas MHD" + ("" if not a.eta else f" with {a.eta_model} resistivity")
+        "note": "illustrative parameters, " + ("ideal-gas" if a.eos_liner == "ideal" else f"{a.eos_liner} Al liner")
+                + " MHD" + ("" if not a.eta else f" with {a.eta_model} resistivity")
                 + "; not a prediction of MTIF-3 shot data",
-        "eta_model": a.eta_model, "eta_code": a.eta, "ohmic_heat_J_per_m": ohmic_J_per_m,
+        "eta_model": a.eta_model, "eta_code": a.eta, "eos_liner": a.eos_liner, "eos_code": a.eos, "ohmic_heat_J_per_m": ohmic_J_per_m,
         "params": vars(a), "units": u, "liner_mach": mach, "beta_seed": 2 / B0**2,
         "B_peak_T": float(B.max()), "B_peak_innermost_T": float(b1[k_pk]), "B_peak_over_seed": float(b1[k_pk] / a.b_seed_t),
         "t_peak_us": float(t_us[k_pk]), "rise_time_10_90_us": t90 - t10,
@@ -195,6 +208,7 @@ def run(a, out):
         "rise_definition": "10-90% of the field increase at the innermost probe",
         "steps": s.step, "wall_s": time.time() - t0,
         "p_min_code": p_min, "rho_min_code": rho_min, "energy_error_max": err_max,
+        "mixed_cells_at_floor_max": getattr(s, "_mixed_at_floor", 0),
     }
     with open(os.path.join(out, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=2)
@@ -247,7 +261,9 @@ def plot(out):
     axR.set_title(f"peak compression, $t$ = {float(pk['t_us']):.3f} $\\mu$s", loc="left", fontsize=10)
     fig.colorbar(im, ax=axR, shrink=0.85, label=r"$\log_{10}\rho$ (kg/m$^3$)")
     eta_note = "" if summ.get("eta_model", "ideal") == "ideal" else f" with {summ['eta_model']} resistivity"
-    fig.text(0.01, 0.005, f"Illustrative parameters, ideal-gas MHD{eta_note}: signal shape and scaling only, not a prediction "
+    eos = summ.get("eos_liner", "ideal")
+    phys = "ideal-gas MHD" if eos == "ideal" else         f"MHD with a {'stiffened-gas' if eos == 'stiffened' else 'Mie-Gruneisen'} Al liner"
+    fig.text(0.01, 0.005, f"Illustrative parameters, {phys}{eta_note}: signal shape and scaling only, not a prediction "
              "of MTIF-3 shot data.", fontsize=8, color="#666666")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     fig.savefig(os.path.join(out, "nearstar_mtif3_probe_signals.png"), dpi=220)
@@ -262,7 +278,8 @@ def main():
     ap.add_argument("--liner-mm", dest="liner_mm", type=float, default=3.0, help="liner thickness")
     ap.add_argument("--rho-fuel", dest="rho_fuel", type=float, default=1.0, help="fuel density, kg/m^3")
     ap.add_argument("--p-fuel-mpa", dest="p_fuel_mpa", type=float, default=1.0, help="fuel pressure, MPa")
-    ap.add_argument("--liner-ratio", dest="liner_ratio", type=float, default=10.0, help="liner / fuel density")
+    ap.add_argument("--liner-ratio", dest="liner_ratio", type=float, default=None,
+                    help="liner / fuel density (default 10, or solid Al for a metal EOS)")
     ap.add_argument("--v-liner-kms", dest="v_liner_kms", type=float, default=10.0, help="liner speed, km/s")
     ap.add_argument("--b-seed-t", dest="b_seed_t", type=float, default=10.0, help="seed axial field, T")
     ap.add_argument("--probes-mm", dest="probes_mm", type=float, nargs="+", default=[1.0, 2.0, 5.0])
@@ -277,6 +294,7 @@ def main():
     ap.add_argument("--plot-only", action="store_true")
     ap.add_argument("--no-plot", action="store_true")
     add_resistivity_args(ap)
+    add_eos_args(ap)
     a = ap.parse_args()
     if a.quick:
         a.n = 128
