@@ -128,7 +128,7 @@ def radiation_from_args(a, rho_unit, v_unit, L0):
 M_E = 9.1093837015e-31
 
 
-def braginskii_kwargs(rho_unit, v_unit, L0, z=1.0, ion_mass_amu=2.0, coulomb_log=10.0, tracer_max=0.1):
+def braginskii_kwargs(rho_unit, v_unit, L0, z=1.0, ion_mass_amu=2.0, coulomb_log=10.0, tracer_max=0.1, nernst=False):
     """Config keywords for magnetized electron conduction in code units.
     Spitzer-Braginskii: k_par = 3.16 n_e kT tau_e / m_e (heat flux per gradient of kT; Z = 1 coefficient),
     tau_e = 3.44e5 T_eV^1.5 / (n_e[cm^-3] lnL) s (NRL), so k_par = C T_eV^5/2 independent of density;
@@ -141,7 +141,11 @@ def braginskii_kwargs(rho_unit, v_unit, L0, z=1.0, ion_mass_amu=2.0, coulomb_log
     kappa0 = C * T1**2.5 * E_CHARGE * T1 / (L0 * rho_unit * v_unit**3)
     B_unit = np.sqrt(MU0 * rho_unit * v_unit**2)
     x0 = (E_CHARGE / M_E) * tau_coef * T1**1.5 * B_unit * A * AMU / (Z * rho_unit)
-    return dict(cond_kappa0=kappa0, cond_x0=x0, cond_tracer_max=tracer_max)
+    kw = dict(cond_kappa0=kappa0, cond_x0=x0, cond_tracer_max=tracer_max)
+    if nernst:
+        # v_N = -c_N (beta_wedge/|B|) grad(theta): kT/e = T1 theta volts, |B| = B_unit B, grad = grad/L0
+        kw["nernst_coeff"] = T1 / (B_unit * L0 * v_unit)
+    return kw
 
 
 def add_conduction_args(ap):
@@ -151,8 +155,10 @@ def add_conduction_args(ap):
     g.add_argument("--braginskii", action="store_true",
                    help="cross-field suppression from omega_ce tau_e (the default)")
     g.add_argument("--kappa-ratio", dest="kappa_ratio", type=float, default=None,
-                   help="instead: set k_par/k_perp to this value in the initial fuel; it then scales as "
-                        "1 + x^2 with x ~ |B| T^1.5 / rho")
+                   help="instead: set k_par/k_perp to this value in the initial fuel; it then follows the "
+                        "Braginskii fit with x ~ |B| T^1.5 / rho")
+    g.add_argument("--nernst", action="store_true",
+                   help="Nernst field advection and Ettingshausen heat flux (needs --enable-conduction)")
 
 
 def conduction_from_args(a, rho_unit, v_unit, L0, B_fuel, T_fuel, rho_fuel):
@@ -161,10 +167,37 @@ def conduction_from_args(a, rho_unit, v_unit, L0, B_fuel, T_fuel, rho_fuel):
         return {}
     if a.braginskii and a.kappa_ratio is not None:
         raise SystemExit("--braginskii and --kappa-ratio are alternatives; give one")
+    from .transport import x_for_kappa_ratio
     kw = braginskii_kwargs(rho_unit, v_unit, L0, getattr(a, "z_eff", 1.0), getattr(a, "ion_mass_amu", 2.0),
-                           getattr(a, "coulomb_log", 10.0))
+                           getattr(a, "coulomb_log", 10.0), nernst=getattr(a, "nernst", False))
     if a.kappa_ratio is not None:
         if a.kappa_ratio < 1:
             raise SystemExit("--kappa-ratio must be >= 1")
-        kw["cond_x0"] = np.sqrt(a.kappa_ratio - 1) * rho_fuel / (max(B_fuel, 1e-300) * T_fuel**1.5)
+        kw["cond_x0"] = x_for_kappa_ratio(a.kappa_ratio) * rho_fuel / (max(B_fuel, 1e-300) * T_fuel**1.5)
     return kw
+
+
+def twotemp_kwargs(rho_unit, v_unit, L0, z=1.0, ion_mass_amu=2.0, coulomb_log=10.0):
+    """Config keywords for the two-temperature model: electron-ion energy equilibration
+    nu = 2 m_e/(m_i tau_e), tau_e = 3.44e5 T_eV^1.5/(Z n_e[cm^-3] lnL) s, in code units nu = te_eq_coeff rho/theta_e^1.5."""
+    A, Z = ion_mass_amu, z
+    T1 = temperature_eV_per_code(v_unit, A, Z)
+    tau_coef = 3.44e11 / (coulomb_log * Z)                  # tau_e = tau_coef T_eV^1.5 / n_e[m^-3]
+    c_eq = 2 * M_E / (A * AMU) * Z * rho_unit / (A * AMU) / (tau_coef * T1**1.5) * (L0 / v_unit)
+    return dict(two_temp=True, z_ion=Z, te_eq_coeff=c_eq)
+
+
+def strength_kwargs(rho_unit, v_unit, G_gpa=26.0, Y_gpa=0.29, spall_gpa=1.2):
+    """liner strength in code units (defaults: aluminium 6061, G 26 GPa, yield 0.29 GPa, spall 1.2 GPa)"""
+    p_unit = rho_unit * v_unit**2
+    return dict(strength=True, shear_modulus=G_gpa * 1e9 / p_unit, yield_strength=Y_gpa * 1e9 / p_unit,
+                spall_strength=spall_gpa * 1e9 / p_unit)
+
+
+def viscosity_kwargs(rho_unit, v_unit, L0, z=1.0, ion_mass_amu=2.0, coulomb_log=10.0):
+    """Braginskii parallel ion viscosity eta_0 = 0.96 n_i kT_i tau_i, tau_i = 2.09e7 T_i^1.5 A^0.5/(Z^4 n_i[cm^-3] lnL)
+    s (NRL), independent of density: eta_0 = visc_coeff theta_i^2.5 in code units (theta_i = T_i code)."""
+    A, Z = ion_mass_amu, z
+    T1 = temperature_eV_per_code(v_unit, A, Z)
+    eta_SI_per_T = 0.96 * 2.09e13 * E_CHARGE * np.sqrt(A) / (Z**4 * coulomb_log)     # Pa s / eV^2.5
+    return dict(visc_coeff=eta_SI_per_T * T1**2.5 / (rho_unit * v_unit * L0))

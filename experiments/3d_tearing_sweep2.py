@@ -38,7 +38,7 @@ args = ap.parse_args()
 ETA, B0, L_SHEET = 0.02, 6.0, 0.5
 Lx, Ly, Lz, T_END = 8.0, 2.0, 1.0, 0.6
 SEEDS = (0.003, 0.01, 0.03)
-BASE = dict(x_max=Lx, y_max=Ly, z_max=Lz, t_end=T_END, cfl=0.3, mach=10.0, interface_x=1.5,
+BASE = dict(div_b="glm", x_max=Lx, y_max=Ly, z_max=Lz, t_end=T_END, cfl=0.3, mach=10.0, interface_x=1.5,
             perturbation_amp=0.02, perturbation_mode=4, density_ratio=3.0, bc_x_type="inflow_outflow",
             diag_interval=10, B_modulation_mode=1)
 STRIPES = dict(B_field_type="striped", B_transverse=B0, eta_resistivity=ETA)

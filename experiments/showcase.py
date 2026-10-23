@@ -6,7 +6,7 @@ from sieve.config import Config
 from sieve.solver import MHDSolver, PostProcessor
 
 t_end = 0.8
-base = dict(nx=400, ny=100, x_min=0.0, x_max=12.0, y_min=0.0, y_max=2.0, t_end=t_end, mach=10.0,
+base = dict(div_b="glm", nx=400, ny=100, x_min=0.0, x_max=12.0, y_min=0.0, y_max=2.0, t_end=t_end, mach=10.0,
             perturbation_amp=0.02, perturbation_mode=4, density_ratio=3.0, bc_x_type="inflow_outflow",
             B_modulation_mode=4, localized_rh=True, diag_interval=20,
             snapshot_times=list(np.linspace(0.0, t_end, 61)))

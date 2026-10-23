@@ -9,13 +9,16 @@ import numpy as np
 
 from .config import (
     NVAR, FLOOR_RHO, FLOOR_PR,
-    RHO, MX, MY, MZ, BX, BY, BZ, EN, PSI, RHOC,
+    RHO, MX, MY, MZ, BX, BY, BZ, EN, PSI, RHOC, RHOSE,
     iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iPSI, iCLR,
 )
 from .physics import (xp, cons_to_prim, prim_to_cons, hlld_flux_x, parallel_stripe_state,
                       resistivity_field, face_eta, eta_max_of, sound_speed2, radiate, vf_advection_rate,
                       conduct, _floor_faces)
 from .eos import make_eos
+from . import ct
+from . import twotemp
+from .viscosity import viscous_step
 from .solver import MHDSolver, to_numpy
 
 # variable permutations that rotate the y or z face normal onto x for the HLLD kernel
@@ -34,6 +37,14 @@ def _sl(ax, s):
 
 def muscl(W, ax, eos=None):
     """van Leer MUSCL along array axis ax (1, 2, 3); face k lies between cells k+1 and k+2."""
+    from .physics import _FUSED, _ideal
+    if _FUSED:
+        from . import fused
+        e = 1.4 if eos is None else eos
+        WL, WR = fused.muscl(W, ax - 1, floor_p=_ideal(e))
+        if not _ideal(e):
+            _floor_faces(WL, WR, e)
+        return WL, WR
     dm = W[_sl(ax, slice(1, -1))] - W[_sl(ax, slice(None, -2))]
     dp = W[_sl(ax, slice(2, None))] - W[_sl(ax, slice(1, -1))]
     ab = dm * dp
@@ -46,11 +57,10 @@ def muscl(W, ax, eos=None):
 
 def hlld_flux(WL, WR, ax, gamma, ch):
     """HLLD flux through faces normal to axis ax, via variable rotation onto x."""
-    perm = _PERM[ax]
     shape = WL.shape
-    F, _ = hlld_flux_x(xp.ascontiguousarray(WL[perm].reshape(NVAR, -1)),
-                       xp.ascontiguousarray(WR[perm].reshape(NVAR, -1)), gamma, ch)
-    return F.reshape(shape)[perm]
+    F, _ = hlld_flux_x(xp.ascontiguousarray(WL).reshape(NVAR, -1), xp.ascontiguousarray(WR).reshape(NVAR, -1),
+                       gamma, ch, axn=ax - 1)
+    return F.reshape(shape)
 
 
 def _levi(i, j, k):
@@ -125,10 +135,20 @@ class MHDSolver3D:
         cfg = config
         if cfg.nz < 4:
             raise ValueError("solver3d needs nz >= 4")
+        if cfg.geometry != "cartesian":
+            raise NotImplementedError("cylindrical geometry is implemented in the 2D solver")
+        if cfg.nernst_coeff > 0:
+            raise NotImplementedError("Nernst/Ettingshausen are implemented in the 2D solver")
+        if cfg.strength:
+            raise NotImplementedError("liner strength is implemented in the 2D solver")
         self.cfg = cfg
         # float gamma for one ideal gas, eos.EOS for two materials (volume-fraction tracer)
         self.eos = make_eos(cfg)
         self._vf = not isinstance(self.eos, (int, float)) and self.eos.volume_fraction
+        # constrained transport: Bf = [Bx on x-faces, By on y-faces, Bz on z-faces], built from U on first use
+        self.ct = cfg.div_b == "ct"
+        self.Bf = None
+        self._faces_owner = None
         self.ng = ng = 2
         self.nx_tot, self.ny_tot, self.nz_tot = cfg.nx + 2 * ng, cfg.ny + 2 * ng, cfg.nz + 2 * ng
         self.x = xp.asarray(cfg.x_min + (np.arange(self.nx_tot) - ng + 0.5) * cfg.dx)
@@ -326,13 +346,99 @@ class MHDSolver3D:
 
     # ------------------------------------------------------------ right-hand side
 
-    def compute_rhs(self, U, out):
+    def _ct_sync(self):
+        """face fields from self.U if it was (re)assigned since they were made (total energy unchanged)"""
+        if not self.ct or self._faces_owner is self.U:
+            return
+        U = self.U
+        self.Bf = ct.faces_from_cells(U, 3)
+        ct.cells_from_faces(U, self.Bf, (slice(None),) * 3)            # E kept, so the budget is unaffected
+        self._faces_owner = U
+        self._Bf1 = [xp.empty_like(f) for f in self.Bf]
+        self._dBf = [xp.empty_like(f) for f in self.Bf]
+
+    def set_vector_potential(self, Ax, Ay, Az):
+        """Set B from A = (Ax, Ay, Az) (numpy callables, each evaluated on its cell edges): faces are its
+        discrete curl, so div B = 0 to round-off; cell B and the magnetic energy in E follow, pressure kept.
+        Call after setting U."""
+        cfg, ng = self.cfg, self.ng
+        fc = lambda lo, h, N: lo + (np.arange(N + 1) - ng) * h
+        cf = (fc(cfg.x_min, cfg.dx, self.nx_tot), fc(cfg.y_min, cfg.dy, self.ny_tot), fc(cfg.z_min, cfg.dz, self.nz_tot))
+        Bf = ct.faces_from_potential((Ax, Ay, Az), (to_numpy(self.x), to_numpy(self.y), to_numpy(self.z)), cf)
+        U = self.U
+        B2 = U[BX]**2 + U[BY]**2 + U[BZ]**2
+        if self.ct:
+            self.Bf = Bf
+            self._faces_owner = U
+            self._Bf1 = [xp.empty_like(f) for f in Bf]
+            self._dBf = [xp.empty_like(f) for f in Bf]
+        ct.cells_from_faces(U, Bf, (slice(None),) * 3)
+        U[EN] += 0.5 * (U[BX]**2 + U[BY]**2 + U[BZ]**2 - B2)
+
+    def div_b_max(self):
+        """max |div B| h / max |B| on interior cells (face divergence with CT)"""
+        cfg, ng = self.cfg, self.ng
+        n, h = (cfg.nx, cfg.ny, cfg.nz), (cfg.dx, cfg.dy, cfg.dz)
+        if self.ct:
+            self._ct_sync()
+            d = ct.div_faces(self.Bf, h, ng, n)
+        else:
+            W = cons_to_prim(self.U, self.eos)
+            d = ((W[iBX][2:, 1:-1, 1:-1] - W[iBX][:-2, 1:-1, 1:-1]) / (2 * cfg.dx)
+                 + (W[iBY][1:-1, 2:, 1:-1] - W[iBY][1:-1, :-2, 1:-1]) / (2 * cfg.dy)
+                 + (W[iBZ][1:-1, 1:-1, 2:] - W[iBZ][1:-1, 1:-1, :-2]) / (2 * cfg.dz))[(slice(ng - 1, -ng + 1),) * 3]
+        Bm = float(xp.max(xp.sqrt(self.U[BX]**2 + self.U[BY]**2 + self.U[BZ]**2)))
+        return float(xp.max(xp.abs(d))) * min(h) / max(Bm, 1e-300)
+
+    def _ct_face_rates(self, Fs, W, Bf, dBf, eta):
+        """dB/dt = -curl E on the faces, E on the edges from edge_emf (plus eta J)"""
+        cfg, ng = self.cfg, self.ng
+        n, h = (cfg.nx, cfg.ny, cfg.nz), (cfg.dx, cfg.dy, cfg.dz)
+        E = []
+        for c in range(3):
+            a, b = (c + 1) % 3, (c + 2) % 3
+            order = (a, b, c)
+            perm = (0,) + tuple(1 + k for k in order)
+            Ec = ct.edge_emf(Fs[a].transpose(perm), Fs[b].transpose(perm), W.transpose(perm), a, b,
+                             h[a], h[b], n[a], n[b])
+            if eta is not None:
+                Bp = {a: Bf[a].transpose(order), b: Bf[b].transpose(order)}
+                J = ct.edge_current(Bp, a, b, h[a], h[b], n[a], n[b])
+                e = eta if isinstance(eta, (int, float)) else eta.transpose(order)
+                Ec = Ec + ct.edge_eta(e, n[a], n[b]) * J
+            E.append(Ec.transpose(tuple(int(k) for k in np.argsort(order))))   # back to (x, y, z)
+        for f in range(3):
+            p, q = (f + 1) % 3, (f + 2) % 3
+            # dB_f = -(d_p E_q - d_q E_p); E_q: faces on f and p, cells on q; E_p: faces on q and f, cells on p
+            Eq, Ep = E[q], E[p]
+            sq = [slice(None)] * 3
+            sq[q] = slice(ng, ng + n[q])
+            hi, lo = list(sq), list(sq)
+            hi[p], lo[p] = slice(1, None), slice(0, -1)
+            dEq = (Eq[tuple(hi)] - Eq[tuple(lo)]) / h[p]
+            sp = [slice(None)] * 3
+            sp[p] = slice(ng, ng + n[p])
+            hi, lo = list(sp), list(sp)
+            hi[q], lo[q] = slice(1, None), slice(0, -1)
+            dEp = (Ep[tuple(hi)] - Ep[tuple(lo)]) / h[q]
+            dBf[f][...] = 0.0
+            tgt = [slice(ng, ng + m) for m in n]
+            tgt[f] = slice(ng, ng + n[f] + 1)
+            dBf[f][tuple(tgt)] = -(dEq - dEp)
+
+    def compute_rhs(self, U, out, Bf=None, dBf=None):
         cfg = self.cfg
         ng, g, ch = self.ng, self.eos, self._ch
         n = (cfg.nx, cfg.ny, cfg.nz)
         h = (cfg.dx, cfg.dy, cfg.dz)
+        if self.ct:
+            ch = 0.0
+            ct.cells_from_faces(U, Bf, tuple(slice(ng, ng + m) for m in n))
         U = self.apply_bc(U)
+        if self.ct:
+            ct.ghost_faces(Bf, U, ng, n, (cfg.get_bc_x() == "periodic", True, True))
         W = cons_to_prim(U, g)
+        Fs = [None] * 3
         out[...] = 0.0
         inner = (slice(None),) + tuple(slice(ng, ng + m) for m in n)
         rate = xp.zeros(())
@@ -340,7 +446,13 @@ class MHDSolver3D:
             vf_rate = xp.zeros(n)
         for ax in (1, 2, 3):
             WL, WR = muscl(W, ax, g)
+            if self.ct:                              # normal field on a face is the face value
+                N = W.shape[ax]
+                sel = [slice(None)] * 3
+                sel[ax - 1] = slice(2, N - 1)
+                WL[iBX + ax - 1] = WR[iBX + ax - 1] = Bf[ax - 1][tuple(sel)]
             F = hlld_flux(WL, WR, ax, g, ch)
+            Fs[ax - 1] = F
             m = n[ax - 1]
             if self._vf:
                 # volume fraction: da/dt + u.grad(a) = 0 from the same face values as the energy flux
@@ -360,7 +472,7 @@ class MHDSolver3D:
             out[(RHOC,) + inner[1:]] = vf_rate
         self._rate_boundary = rate
         self._rate_powell = xp.zeros(())
-        if cfg.powell_source and cfg.is_mhd():
+        if cfg.powell_source and cfg.is_mhd() and not self.ct:
             divB = xp.zeros_like(W[iBX])
             c = (slice(1, -1),) * 3
             divB[c] = ((W[iBX][2:, 1:-1, 1:-1] - W[iBX][:-2, 1:-1, 1:-1]) / (2 * cfg.dx)
@@ -373,10 +485,15 @@ class MHDSolver3D:
             S[EN] = -divB * vB
             out[inner] += S[inner]
             self._rate_powell = xp.sum(S[EN][inner[1:]]) * cfg.dx * cfg.dy * cfg.dz
+        eta = None
         if cfg.is_resistive():
-            Rr, rate_r = resistive_terms_3d(U, resistivity_field(W, cfg), h, ng, n, cfg.eta_face_mean)
+            eta = resistivity_field(W, cfg)
+            Rr, rate_r = resistive_terms_3d(U, eta, h, ng, n, cfg.eta_face_mean)
             out[inner] += Rr[inner]
             self._rate_boundary = self._rate_boundary + rate_r
+        if self.ct:
+            out[BX:BZ + 1] = 0.0                     # B lives on the faces
+            self._ct_face_rates(Fs, W, Bf, dBf, eta)
         return out
 
     @property
@@ -391,12 +508,30 @@ class MHDSolver3D:
     def step_ssprk3(self):
         dt = self.dt
         U0 = self.U
-        self.compute_rhs(U0, self.dU); self._acc(dt / 6)
+        self._ct_sync()
+        if self.cfg.two_temp and getattr(self, "_te_owner", None) is not self.U:
+            if float(xp.max(xp.abs(self.U[RHOSE]))) == 0.0:
+                twotemp.init_equal(self.U, self.cfg.gamma, self.cfg.z_ion)
+            self._te_owner = self.U
+        F0, F1, dF = (self.Bf, self._Bf1, self._dBf) if self.ct else (None, None, None)
+        self.compute_rhs(U0, self.dU, F0, dF); self._acc(dt / 6)
+        if self.ct:
+            for f0, f1, d in zip(F0, F1, dF):
+                xp.add(f0, dt * d, out=f1)
         xp.add(U0, dt * self.dU, out=self.U_temp)
-        self.compute_rhs(self.U_temp, self.dU); self._acc(dt / 6)
+        self.compute_rhs(self.U_temp, self.dU, F1, dF); self._acc(dt / 6)
+        if self.ct:
+            for f0, f1, d in zip(F0, F1, dF):
+                f1[...] = 0.75 * f0 + 0.25 * (f1 + dt * d)
         self.U_stage[...] = 0.75 * U0 + 0.25 * (self.U_temp + dt * self.dU)
-        self.compute_rhs(self.U_stage, self.dU); self._acc(2 * dt / 3)
+        self.compute_rhs(self.U_stage, self.dU, F1, dF); self._acc(2 * dt / 3)
+        if self.ct:
+            for f0, f1, d in zip(F0, F1, dF):
+                f0[...] = f0 / 3.0 + 2.0 / 3.0 * (f1 + dt * d)
         self.U[...] = U0 / 3 + 2.0 / 3.0 * (self.U_stage + dt * self.dU)
+        if self.ct:
+            n3 = (self.cfg.nx, self.cfg.ny, self.cfg.nz)
+            ct.cells_from_faces(self.U, self.Bf, tuple(slice(self.ng, self.ng + m) for m in n3))
         if self._vf:
             self.U[RHOC] = xp.clip(self.U[RHOC], 0.0, 1.0)
         else:
@@ -405,18 +540,36 @@ class MHDSolver3D:
         cfg, ng = self.cfg, self.ng
         inner = (slice(None),) + tuple(slice(ng, ng + m) for m in (cfg.nx, cfg.ny, cfg.nz))
         if cfg.rad_coeff > 0:
-            dE = radiate(self.U[inner], self.eos, cfg.rad_coeff, cfg.rad_T_min, cfg.rad_tracer_max, dt)
+            dE = radiate(self.U[inner], self.eos, cfg.rad_coeff, cfg.rad_T_min, cfg.rad_tracer_max, dt,
+                         electron_Z=cfg.z_ion if cfg.two_temp else None)
             self._acc_rad += xp.sum(dE) * cfg.dx * cfg.dy * cfg.dz
         if cfg.cond_kappa0 > 0:
             per = (cfg.get_bc_x() == "periodic", True, True)
+            wall = cfg.cond_wall_T if cfg.cond_wall == "isothermal" else None
             self.cond_stages = conduct(self.U[inner], self.eos, cfg.cond_kappa0, cfg.cond_x0, cfg.cond_tracer_max,
-                                       (cfg.dx, cfg.dy, cfg.dz), per, dt)
+                                       (cfg.dx, cfg.dy, cfg.dz), per, dt, wall_T=wall, perp=cfg.cond_perp,
+                                       electron_Z=cfg.z_ion if cfg.two_temp else None)
+        if cfg.two_temp and cfg.te_eq_coeff > 0:
+            Ui = self.U[inner]
+            fuel = xp.clip(cons_to_prim(Ui, self.eos)[iCLR], 0, 1) < cfg.cond_tracer_max
+            twotemp.equilibrate(Ui, cfg.gamma, cfg.z_ion, cfg.te_eq_coeff, fuel, dt)
+        if cfg.visc_coeff > 0:
+            Ui = self.U[inner]
+            Wi = cons_to_prim(Ui, self.eos)
+            fuel = xp.clip(Wi[iCLR], 0, 1) < cfg.cond_tracer_max
+            theta_i = twotemp.temperatures(Ui, cfg.gamma, cfg.z_ion)[1] if cfg.two_temp else Wi[iPR] / Wi[iRHO]
+            eta = cfg.visc_coeff * xp.maximum(theta_i, 0.0)**2.5
+            self.visc_stages = viscous_step(Ui, eta, (cfg.dx, cfg.dy, cfg.dz), (cfg.get_bc_x() == "periodic", True, True),
+                                            fuel, dt)
         if self._sigma is not None:
             self._U_before_sponge = self.U.copy()
             self._apply_sponge(dt)
         self._update_plateau()
         self.apply_bc(self.U)
-        if self._ch > 0:
+        if self.ct:
+            ct.ghost_faces(self.Bf, self.U, self.ng, (self.cfg.nx, self.cfg.ny, self.cfg.nz),
+                           (self.cfg.get_bc_x() == "periodic", True, True))
+        if self._ch > 0 and not self.ct:
             h = min(self.cfg.dx, self.cfg.dy, self.cfg.dz)
             self.U[PSI] *= np.exp(-self.cfg.glm_alpha * self._ch * dt / h)
 

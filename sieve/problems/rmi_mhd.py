@@ -53,6 +53,7 @@ class RMIParams:
     cfl: float = 0.3
     diag_every: int = 10
     n_frames: int = 31
+    div_b: str = "glm"            # the committed results/rmi_mhd runs used GLM; "ct" for constrained transport
 
     def validate(self):
         if self.field not in FIELDS:
@@ -168,7 +169,7 @@ def build_solver(p):
     margins = check_admissible(p, jump, inter)
     cfg = Config(nx=p.nx, ny=p.ny, x_min=0.0, x_max=p.x_max, y_min=0.0, y_max=p.y_max, t_end=p.t_end,
                  cfl=p.cfl, gamma=p.gamma, mach=p.mach, B_transverse=p.B0, B_field_type="uniform",
-                 powell_source=True, bc_x_type="inflow_outflow", bc_y_type="periodic",
+                 powell_source=True, bc_x_type="inflow_outflow", bc_y_type="periodic", div_b=p.div_b,
                  diag_interval=10**9, snapshot_times=[])
     s = MHDSolver(cfg)
     X, Y = s.X, s.Y

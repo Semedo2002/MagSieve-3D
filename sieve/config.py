@@ -7,18 +7,18 @@ from typing import List, Optional
 class ConsVar(IntEnum):
     RHO = 0; MX = 1; MY = 2; MZ = 3
     BX = 4; BY = 5; BZ = 6; EN = 7
-    PSI = 8; RHOC = 9
+    PSI = 8; RHOC = 9; RHOSE = 10      # RHOSE: rho s_e, electron entropy (s_e = p_e/rho^gamma), passive
 
 
 class PrimVar(IntEnum):
     RHO = 0; VX = 1; VY = 2; VZ = 3
     BX = 4; BY = 5; BZ = 6; PR = 7
-    PSI = 8; CLR = 9
+    PSI = 8; CLR = 9; SE = 10
 
 
 NVAR = len(ConsVar)
-RHO, MX, MY, MZ, BX, BY, BZ, EN, PSI, RHOC = tuple(ConsVar)
-iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iPSI, iCLR = tuple(PrimVar)
+RHO, MX, MY, MZ, BX, BY, BZ, EN, PSI, RHOC, RHOSE = tuple(ConsVar)
+iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iPSI, iCLR, iSE = tuple(PrimVar)
 FLOOR_RHO = 1e-12
 FLOOR_PR = 1e-12
 
@@ -104,6 +104,16 @@ class PhysicsConfig:
     sponge_rate: float = 0.0
     sponge_tau: float = 0.5
     equilibrium_closure: str = "uniform_density"
+    # div B control: "ct" (constrained transport, face-centred B, div B = 0 to round-off; Powell and GLM
+    # are off) or "glm" (cell-centred B with GLM cleaning and optional Powell terms, the scheme the
+    # published sieve study used)
+    div_b: str = "ct"
+    # replay each SSP-RK3 step as one captured CUDA graph (2D, CT): removes the per-kernel launch overhead
+    use_cuda_graphs: bool = True
+    # "cartesian" or "cylindrical" (2D solver only): x is the radius r (x_min = 0 is the axis, reflecting),
+    # y the axial coordinate z, and the out-of-plane components are -v_phi, -B_phi. Requires CT and an
+    # extrapolation (outflow) boundary at r = x_max.
+    geometry: str = "cartesian"
     glm_ch: float = 0.0
     # GLM damping, psi *= exp(-glm_alpha * ch * dt / h). Values in [0, 1] keep the
     # cleaning transport-dominated (Mignone & Tzeferacos 2010); 1.5 measured worse.
@@ -158,6 +168,30 @@ class PhysicsConfig:
     cond_kappa0: float = 0.0
     cond_x0: float = 0.0
     cond_tracer_max: float = 0.1
+    # fuel-liner faces: "isothermal" (the liner is a heat sink at temperature cond_wall_T, code units p/rho of
+    # the fuel; the fuel conducts to it across half a cell with its own anisotropic k) or "insulating"
+    cond_wall: str = "isothermal"
+    cond_wall_T: float = 0.0
+    # cross-field conductivity: "braginskii" (full Z = 1 fit, transport.kperp_ratio) or "simple" (1/(1 + x^2))
+    cond_perp: str = "braginskii"
+    # Nernst field advection and Ettingshausen heat flux (sieve/transport.py), coefficient c_N in code units
+    # (units.braginskii_kwargs); 0 = off. Uses cond_x0 for the magnetization; 2D solver with CT.
+    nernst_coeff: float = 0.0
+    # two-temperature fuel (sieve/twotemp.py): electron entropy carried as a passive scalar; electron conduction,
+    # bremsstrahlung, Ohmic and Ettingshausen heating act on the electrons; equilibration rate te_eq_coeff
+    # (units.twotemp_kwargs). Needs an ideal-gas fuel with gamma = 5/3. z_ion: fuel ion charge.
+    two_temp: bool = False
+    z_ion: float = 1.0
+    te_eq_coeff: float = 0.0
+    # Braginskii parallel ion viscosity, eta_0 = visc_coeff theta_i^2.5 (units.viscosity_kwargs); 0 = off.
+    # Cartesian geometry; fuel only (tracer < cond_tracer_max).
+    visc_coeff: float = 0.0
+    # liner strength (sieve/strength.py): elastic-perfectly-plastic, von Mises yield, spall damage; code units
+    # (units.strength_kwargs); scaled by the liner fraction. 2D solver.
+    strength: bool = False
+    shear_modulus: float = 0.0
+    yield_strength: float = 0.0
+    spall_strength: float = 0.0
     localized_rh: bool = False
     enstrophy_locking_fraction: float = 0.20
 
@@ -170,6 +204,12 @@ class PhysicsConfig:
             raise ValueError("eta_model='spitzer' needs eta_spitzer > 0, eta_T_min > 0 and eta_max > 0")
         if min(self.eta_resistivity, self.eta_fuel, self.eta_liner, self.eta_max) < 0:
             raise ValueError("resistivities must be non-negative")
+        if self.geometry not in ("cartesian", "cylindrical"):
+            raise ValueError(f"geometry must be cartesian or cylindrical, not {self.geometry!r}")
+        if self.geometry == "cylindrical" and (self.div_b != "ct" or self.bc_x_type != "extrapolation"):
+            raise ValueError("cylindrical geometry needs div_b='ct' and bc_x_type='extrapolation' (outer boundary)")
+        if self.div_b not in ("ct", "glm"):
+            raise ValueError(f"div_b must be ct or glm, not {self.div_b!r}")
         if self.eos_fuel not in ("ideal", "stiffened"):
             raise ValueError(f"eos_fuel must be ideal or stiffened, not {self.eos_fuel!r}")
         if self.eos_liner not in ("ideal", "stiffened", "mie_gruneisen"):
@@ -180,6 +220,22 @@ class PhysicsConfig:
             raise ValueError("p_inf is only used by the stiffened EOS; set eos_fuel/eos_liner='stiffened'")
         if min(self.p_inf, self.p_inf_liner) < 0:
             raise ValueError("p_inf must be non-negative")
+        if self.two_temp and (abs(self.gamma - 5.0 / 3.0) > 1e-12 or self.eos_fuel != "ideal"):
+            raise ValueError("two_temp needs an ideal-gas fuel with gamma = 5/3")
+        if min(self.te_eq_coeff, self.visc_coeff) < 0 or self.z_ion <= 0:
+            raise ValueError("te_eq_coeff, visc_coeff must be >= 0 and z_ion > 0")
+        if self.strength and min(self.shear_modulus, self.yield_strength) <= 0:
+            raise ValueError("strength needs shear_modulus > 0 and yield_strength > 0")
+        if min(self.shear_modulus, self.yield_strength, self.spall_strength) < 0:
+            raise ValueError("shear_modulus, yield_strength, spall_strength must be >= 0")
+        if self.visc_coeff > 0 and self.geometry != "cartesian":
+            raise ValueError("viscosity is implemented in Cartesian geometry")
+        if self.cond_perp not in ("braginskii", "simple"):
+            raise ValueError("cond_perp must be braginskii or simple")
+        if self.nernst_coeff < 0 or (self.nernst_coeff > 0 and (self.cond_x0 <= 0 or self.div_b != "ct")):
+            raise ValueError("nernst_coeff > 0 needs cond_x0 > 0 (magnetization) and div_b='ct'")
+        if self.cond_wall not in ("isothermal", "insulating") or self.cond_wall_T < 0:
+            raise ValueError("cond_wall must be isothermal or insulating, cond_wall_T >= 0")
         if min(self.cond_kappa0, self.cond_x0) < 0 or not 0 < self.cond_tracer_max <= 1:
             raise ValueError("cond_kappa0, cond_x0 must be >= 0 and 0 < cond_tracer_max <= 1")
         if min(self.rad_coeff, self.rad_T_min) < 0 or not 0 < self.rad_tracer_max <= 1:

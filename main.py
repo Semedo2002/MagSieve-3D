@@ -146,19 +146,19 @@ def boundary_reflection_test(nx=200, eps=1e-4, tol=1e-2):
 
 
 def conservation_test(nx=100, ny=50, t_end=0.05, tol=1e-10, div_tol=0.1):
-    """Short sieve runs: energy must balance boundary fluxes to round-off.
-    Bz stripes have no in-plane field and must keep div B = 0 exactly; in-plane
-    fields are cleaned by GLM and must stay below div_tol in h max|div B|/max|B|
-    (legacy By(y) stripes start at h*k_mod ~ 0.4 and fail this)."""
+    """Short sieve runs: energy must balance boundary fluxes to round-off. With constrained transport the
+    face divergence must stay at round-off for every field; the legacy GLM path (cell-centred B) only
+    keeps h max|div B|/max|B| below div_tol (legacy By(y) stripes start at h*k_mod ~ 0.4 and fail this)."""
     print("\n--- Conservation & Solenoidality ---"); sys.stdout.flush()
     base = dict(nx=nx, ny=ny, t_end=t_end, mach=10.0, localized_rh=True,
                 bc_x_type="inflow_outflow", diag_interval=10**9, snapshot_times=[])
     cases = {
-        "uniform By=1 (Powell+GLM)": dict(B_transverse=1.0, B_field_type="uniform"),
-        "striped Bz, eta=1e-2": dict(B_transverse=2.0, B_field_type="striped",
-                                      B_stripe_component="z", eta_resistivity=1e-2),
-        "striped Bx (tension)": dict(B_transverse=2.0, B_field_type="striped",
-                                     B_stripe_component="x"),
+        "uniform By=1, CT": dict(B_transverse=1.0, B_field_type="uniform"),
+        "striped Bz, eta=1e-2, CT": dict(B_transverse=2.0, B_field_type="striped",
+                                          B_stripe_component="z", eta_resistivity=1e-2),
+        "striped Bx (tension), CT": dict(B_transverse=2.0, B_field_type="striped",
+                                         B_stripe_component="x"),
+        "uniform By=1, GLM+Powell": dict(B_transverse=1.0, B_field_type="uniform", div_b="glm"),
     }
     passed = True
     for label, c in cases.items():
@@ -166,8 +166,8 @@ def conservation_test(nx=100, ny=50, t_end=0.05, tol=1e-10, div_tol=0.1):
         with contextlib.redirect_stdout(io.StringIO()):
             s.initialize(); s.run()
         b = s.energy_budget()
-        err = abs(b["conservation_error_rel"]); div_rel = s.diag_divB_rel_max[-1]
-        exact = c.get("B_stripe_component") == "z"
+        err = abs(b["conservation_error_rel"]); div_rel = s.div_b_max()
+        exact = s.ct or c.get("B_stripe_component") == "z"
         ok = err < tol and div_rel < (1e-12 if exact else div_tol)
         passed &= ok
         print(f"  {label:<26s} E change {100*b['raw_change_rel']:+7.1f}% (inflow)  "
@@ -176,31 +176,38 @@ def conservation_test(nx=100, ny=50, t_end=0.05, tol=1e-10, div_tol=0.1):
     return passed
 
 
-def equilibrium_test(B0=5.0, nx=200, ny=100, t_end=0.05, tol=1e-2):
+def equilibrium_test(B0=5.0, t_end=0.05, tol=5e-2):
     """The gas ahead of the shock must stay at rest. The balance p + Bx^2/2 = P_total
     holds exactly in the initial data but only to O(h^2) at MUSCL-reconstructed
-    faces, so the residual flow is truncation error: measured 1.6e-2, 4.0e-3,
-    1.2e-3 c_s at nx = 100, 200, 400 (order ~2), against 0.30 c_s with no
-    pressure balance. A well-balanced scheme would be needed for round-off."""
+    faces, so the residual flow is truncation error and must fall at second order:
+    with CT measured 1.1e-1, 2.6e-2, 3.8e-3 c_s at nx = 100, 200, 400 (GLM, whose
+    signal speeds are clamped to the global maximum and damp it more: 1.6e-2, 4.0e-3,
+    1.2e-3), against 0.30 c_s with no pressure balance. Checked: order >= 1.5 between
+    nx = 100 and 200 and the nx = 200 residual below tol. A well-balanced scheme would
+    be needed for round-off."""
     print("\n--- Upstream Pressure Equilibrium ---"); sys.stdout.flush()
     passed = True
     for closure in ("uniform_density", "uniform_temperature"):
-        cfg = Config(nx=nx, ny=ny, t_end=t_end, mach=10.0, B_transverse=B0,
-                     B_field_type="striped", B_stripe_component="x",
-                     equilibrium_closure=closure, bc_x_type="inflow_outflow",
-                     diag_interval=10**9, snapshot_times=[])
-        s = MHDSolver(cfg)
-        with contextlib.redirect_stdout(io.StringIO()):
-            s.initialize(); s.run()
-        W = cons_to_prim(s.U, cfg.gamma); ng = s.ng
-        far = s.x[ng:-ng] > 3.5   # shock is at x ~ 1.9 at t_end
-        v = xp.sqrt(W[iVX, ng:-ng, ng:-ng]**2 + W[iVY, ng:-ng, ng:-ng]**2)[far]
-        v_rel = float(xp.max(v)) / np.sqrt(cfg.gamma * cfg.p_bar)
-        ok = v_rel < tol
+        res = []
+        for nx in (100, 200):
+            cfg = Config(nx=nx, ny=nx // 2, t_end=t_end, mach=10.0, B_transverse=B0,
+                         B_field_type="striped", B_stripe_component="x",
+                         equilibrium_closure=closure, bc_x_type="inflow_outflow",
+                         diag_interval=10**9, snapshot_times=[])
+            s = MHDSolver(cfg)
+            with contextlib.redirect_stdout(io.StringIO()):
+                s.initialize(); s.run()
+            W = cons_to_prim(s.U, s.eos); ng = s.ng
+            far = s.x[ng:-ng] > 3.5   # shock is at x ~ 1.9 at t_end
+            v = xp.sqrt(W[iVX, ng:-ng, ng:-ng]**2 + W[iVY, ng:-ng, ng:-ng]**2)[far]
+            res.append(float(xp.max(v)) / np.sqrt(cfg.gamma * cfg.p_bar))
+        order = np.log2(res[0] / res[1])
+        ok = res[1] < tol and order >= 1.5
         passed &= ok
         eq = s._equilibrium
         print(f"  {closure:<20s} B0={B0:g}: P_total={eq['P_total']:.4g}, gap Mach={eq['M_gap']:.3g}, "
-              f"max|v|/c_s upstream = {v_rel:.1e}  [{'PASS' if ok else 'FAIL'}]")
+              f"max|v|/c_s upstream = {res[0]:.1e}, {res[1]:.1e} at nx = 100, 200 (order {order:.2f})  "
+              f"[{'PASS' if ok else 'FAIL'}]")
     try:
         Config(nx=10, eta_resistivty=1e-2)
         print("  misspelled config key accepted  [FAIL]"); passed = False
@@ -300,16 +307,17 @@ def resistive_z_test(eta=0.01, tol=0.01):
     return ok
 
 
-def _march(s, t_end):
+def _march(s, t_end, max_steps=None):
     """Plain time loop for hand-built 2D states (energy budget accumulates inside step_ssprk3)."""
-    while s.t < t_end - 1e-14:
+    n0 = s.step
+    while s.t < t_end - 1e-14 and (max_steps is None or s.step - n0 < max_steps):
         s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), t_end - s.t)
         s.step_ssprk3(); s.t += s.dt; s.step += 1
 
 
 def _energy(s):
     ng = s.ng
-    return float(xp.sum(s.U[EN, ng:-ng, ng:-ng])) * s.cfg.dx * s.cfg.dy
+    return float(xp.sum(s.U[EN, ng:-ng, ng:-ng] * getattr(s, "dV", s.cfg.dx * s.cfg.dy)))
 
 
 def _two_layer_run(face_mean, nx, eta1, eta2, b, t_end):
@@ -413,7 +421,7 @@ AL = dict(rho0=2.70, c0=5.328, s=1.338, gamma0=2.0)
 CU = dict(rho0=8.93, c0=3.940, s=1.489, gamma0=2.0)
 
 
-def _eos_tube(nx, t_end, x0, left, right, bc="extrapolation", **cfg_kw):
+def _eos_tube(nx, t_end, x0, left, right, bc="extrapolation", max_steps=None, **cfg_kw):
     """1D Riemann problem on an nx x 4 strip; left/right = (rho, u, p, liner fraction)."""
     cfg = Config(nx=nx, ny=4, x_max=1.0, y_max=4.0 / nx, t_end=t_end, cfl=0.3, mach=1.0, B_transverse=0.0,
                  powell_source=False, bc_x_type=bc, bc_y_type="periodic", diag_interval=10**9,
@@ -428,7 +436,7 @@ def _eos_tube(nx, t_end, x0, left, right, bc="extrapolation", **cfg_kw):
     s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
     s.apply_bc(s.U)
     E0 = _energy(s)
-    _march(s, t_end)
+    _march(s, t_end, max_steps)
     ng = s.ng
     Wf = cons_to_prim(s.U, s.eos)
     prof = {k: to_numpy(Wf[i, ng:-ng, ng]) for k, i in (("rho", iRHO), ("u", iVX), ("p", iPR), ("a", iCLR))}
@@ -506,17 +514,17 @@ def eos_impact_test(tol=0.02):
 def eos_interface_test():
     """Aluminium slab (stiffened, p_inf ~ 27 GPa) carried through gas at uniform p and u, periodic box.
     The exact solution keeps p and u uniform. Volume-fraction tracer: must hold to round-off. Mass-fraction
-    blending (the conserved tracer) is run briefly for comparison and reported: its spurious pressures reach
-    the cavitation floor within a few steps and the fake sound speeds shrink the time step ~20x."""
+    blending (the conserved tracer) is run for 20 steps for comparison and reported: its spurious pressures
+    reach the cavitation floor within a few steps and the fake sound speeds collapse the time step."""
     from sieve.eos import stiffened_from_hugoniot
     print("\n--- EOS: material interface in pressure equilibrium ---"); sys.stdout.flush()
     gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 5.0)
     p0, u0 = 1e-4, 1.0
     slab = lambda x: (x > 0.3) & (x < 0.6)
     res = {}
-    for mode, t_end in (("volume_fraction", 0.2), ("mass_fraction", 0.002)):
+    for mode, t_end, nmax in (("volume_fraction", 0.2, None), ("mass_fraction", 0.002, 20)):
         try:
-            s, P = _eos_tube(100, t_end, slab, (AL["rho0"], u0, p0, 1.0), (1e-3, u0, p0, 0.0), bc="periodic",
+            s, P = _eos_tube(100, t_end, slab, (AL["rho0"], u0, p0, 1.0), (1e-3, u0, p0, 0.0), bc="periodic", max_steps=nmax,
                              gamma=1.4, eos_liner="stiffened", gamma_liner=gA, p_inf_liner=piA,
                              material_tracer=mode)
             res[mode] = (np.max(np.abs(P["p"] - p0)) / p0, np.max(np.abs(P["u"] - u0)) / u0, P["budget"])
@@ -525,7 +533,7 @@ def eos_interface_test():
             print(f"  {mode}: {type(e).__name__}: {e}")
     vf, mf = res["volume_fraction"], res["mass_fraction"]
     ok = vf[0] < 1e-8 and vf[1] < 1e-8 and vf[2] < 1e-12
-    print(f"  max |p - p0|/p0: volume fraction {vf[0]:.1e} (t = 0.2), mass fraction {mf[0]:.1e} (t = 0.002); max |u - u0|/u0: "
+    print(f"  max |p - p0|/p0: volume fraction {vf[0]:.1e} (t = 0.2), mass fraction {mf[0]:.1e} (20 steps); max |u - u0|/u0: "
           f"{vf[1]:.1e}, {mf[1]:.1e}; energy budget (vf) {vf[2]:.1e}  [{'PASS' if ok else 'FAIL'}]")
     return ok
 
@@ -650,8 +658,9 @@ def conduction_test():
     fall with resolution (64^2, 128^2). Also: no new extrema (to round-off), energy conserved."""
     from sieve.physics import conduct
     print("\n--- Conduction: anisotropic hot spot ---"); sys.stdout.flush()
+    from sieve.transport import x_for_kappa_ratio
     g, D_par, ratio, t_end = 5.0 / 3.0, 0.01, 1e4, 2.0
-    kappa0, x0 = D_par / (g - 1), np.sqrt(ratio - 1)
+    kappa0, x0 = D_par / (g - 1), x_for_kappa_ratio(ratio)       # Braginskii k_perp fit
     ok, out, leak = True, [], {}
     for name, ang, n in (("B along x, 64^2", 0.0, 64), ("B at 45 deg, 64^2", np.pi / 4, 64),
                          ("B at 45 deg, 128^2", np.pi / 4, 128)):
@@ -669,7 +678,7 @@ def conduction_test():
         stages = 0
         for _ in range(4):
             stages += conduct(Ui, s.eos, cfg.cond_kappa0, cfg.cond_x0, cfg.cond_tracer_max, (cfg.dx, cfg.dy),
-                              (True, True), t_end / 4)
+                              (True, True), t_end / 4, perp=cfg.cond_perp)
         su, sv, w = moments()
         par, perp = (su - su0) / (2 * D_par * t_end), (sv - sv0) / (2 * D_par * t_end)
         bounded = w.max() <= w0.max() and w.min() >= -1e-10 * w0.max()
@@ -687,6 +696,313 @@ def conduction_test():
                    f"{dE:.1e}  [{'PASS' if good else 'FAIL'}]")
     print("\n".join(out))
     print(f"  45 deg numerical cross-field leakage falls with resolution at order {np.log2(leak[64] / leak[128]):.2f}")
+    return ok
+
+
+def wall_conduction_test(tol=0.01):
+    """Fuel-liner heat exchange: a fuel slab on [0, 0.5] (insulated at x = 0) at T0 + d against a cold liner
+    wall at x = 0.5 held at T0 (cond_wall="isothermal"). The mean excess temperature follows the exact series
+    sum 8/((2n+1)^2 pi^2) exp(-D k_n^2 t), k_n = (2n+1) pi/(2L). With the field along the wall normal the wall
+    sees k_par; with the field parallel to the wall it sees k_perp = k_par/10, so the same decay takes 10x
+    longer: checks the wall flux and its magnetic insulation. Energy moved into the liner cells is conserved."""
+    from sieve.physics import conduct
+    print("\n--- Conduction: fuel-liner wall exchange ---"); sys.stdout.flush()
+    from sieve.transport import x_for_kappa_ratio
+    g, D, ratio, d, nx = 5.0 / 3.0, 0.01, 10.0, 1e-3, 64
+    kappa0, x0, Lf = D / (g - 1), x_for_kappa_ratio(ratio), 0.5
+    ok, out = True, []
+    for name, Bdir, Deff in (("field along the wall normal", (1.0, 0.0), D), ("field along the wall", (0.0, 1.0), D / ratio)):
+        cfg = Config(nx=nx, ny=4, x_max=1.0, y_max=4.0 / nx, t_end=1.0, mach=1.0, gamma=g, B_transverse=0.0,
+                     bc_x_type="extrapolation", bc_y_type="periodic", material_tracer="volume_fraction",
+                     cond_kappa0=kappa0, cond_x0=x0, cond_wall="isothermal", cond_wall_T=1.0,
+                     diag_interval=10**9, snapshot_times=[])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        x = s.x[:, None] * xp.ones((1, s.ny_tot))
+        fuel = x < Lf
+        W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+        W[iRHO] = 1.0
+        W[iPR] = xp.where(fuel, 1.0 + d, 1.0)
+        W[iCLR] = xp.where(fuel, 0.0, 1.0)
+        W[iBX], W[iBY] = Bdir
+        s.U = prim_to_cons(W, s.eos)
+        ng = s.ng
+        Ui = s.U[:, ng:-ng, ng:-ng]
+        E0 = float(xp.sum(Ui[EN]))
+        t_end = 1.0 / (Deff * (np.pi / (2 * Lf))**2)         # one e-fold of the slowest mode
+        for _ in range(8):
+            conduct(Ui, s.eos, kappa0, x0, 0.1, (cfg.dx, cfg.dy), (False, True), t_end / 8, wall_T=1.0, perp=cfg.cond_perp)
+        Wf = cons_to_prim(s.U, s.eos)[:, ng:-ng, ng:-ng]
+        f = to_numpy(fuel[ng:-ng, ng:-ng])
+        excess = float(np.mean(to_numpy(Wf[iPR] / Wf[iRHO])[f] - 1.0)) / d
+        exact = sum(8 / ((2 * n + 1)**2 * np.pi**2) * np.exp(-(2 * n + 1)**2) for n in range(200))
+        dE = abs(float(xp.sum(Ui[EN])) - E0) / E0
+        good = abs(excess / exact - 1) < tol and dE < 1e-13
+        ok = ok and good
+        out.append(f"  {name}: t = {t_end:.1f}, mean excess {excess:.4f} of the initial (exact {exact:.4f}); "
+                   f"energy {dE:.1e}  [{'PASS' if good else 'FAIL'}]")
+    print("\n".join(out))
+    return ok
+
+
+def transport_test():
+    """Magnetized transport (sieve/transport.py). (1) Braginskii Z = 1 fits: k_perp/k_par = 1 at x = 0 and
+    4.664/(3.1616 x^2) at large x; beta_wedge = 0.81 x and 1.5/x. (2) Nernst advection: an isobaric slab
+    (p = 1, rho = 1/T) with T = 1 + 0.02 (x - 0.5) and weak field bumps in B_y (constrained-transport faces)
+    and in the out-of-plane B_w (cell centred); both must travel down the temperature gradient along the exact
+    path dX/dt = v_N(X), v_N = -c_N (beta_wedge/|B|) dT/dx, with div B at round-off. (3) Ettingshausen: a
+    strong sheared field in a periodic box conserves total energy to round-off while its heat flux
+    redistributes thermal energy."""
+    from sieve import transport as tr
+    print("\n--- Transport: Braginskii fits, Nernst, Ettingshausen ---"); sys.stdout.flush()
+    fits = (abs(tr.kperp_ratio(0.0) - 1) < 1e-3 and abs(tr.kperp_ratio(1e3) * 3.1616 * 1e6 / 4.664 - 1) < 1e-3
+            and abs(tr.beta_wedge_over_x(0.0) - 3.053 / 3.7703) < 1e-12 and abs(1e3 * 1e3 * tr.beta_wedge_over_x(1e3) / 1.5 - 1) < 1e-3)
+    # (2) Nernst advection; small x so beta_wedge/|B| = 0.81 x0 T^1.5/rho
+    nx, cN, x0, t_end, X0, w = 200, 31.0, 1.0, 0.6, 0.7, 0.05
+    cfg = Config(nx=nx, ny=4, x_max=1.0, y_max=4.0 / nx, t_end=t_end, cfl=0.3, mach=1.0, gamma=5 / 3,
+                 B_transverse=1e-6, bc_x_type="extrapolation", bc_y_type="periodic", cond_x0=x0, nernst_coeff=cN,
+                 diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(cfg)
+    T = lambda x: 1.0 + 0.02 * (x - 0.5)
+    x = s.x[:, None] * xp.ones((1, s.ny_tot))
+    bump = 1e-4 * xp.exp(-((x - X0) / w)**2)
+    W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+    W[iPR], W[iRHO] = 1.0, 1.0 / T(x)
+    W[iBY], W[iBZ] = bump, bump
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    E0 = _energy(s)
+    _march(s, t_end)
+    ng = s.ng
+    xc = to_numpy(s.x[ng:-ng])
+    Wf = cons_to_prim(s.U, s.eos)
+    cen = lambda b: float(np.sum(xc * b) / np.sum(b))
+    xy, xw = cen(to_numpy(Wf[iBY, ng:-ng, ng])), cen(to_numpy(Wf[iBZ, ng:-ng, ng]))
+    Xe, n = X0, 4000                                         # exact path: dX/dt = v_N(X)
+    for _ in range(n):
+        th = T(Xe)
+        Xe += -cN * x0 * th**1.5 * th * (3.053 / 3.7703) * 0.02 * (t_end / n)   # rho = 1/T
+    budget = abs(_energy(s) - E0 - s._cumulative_boundary_energy) / abs(E0)
+    div = s.div_b_max()
+    nern_ok = abs(xy - Xe) < 1.5 / nx and abs(xw - Xe) < 1.5 / nx and div < 1e-12 and budget < 1e-12
+    # (3) Ettingshausen in a periodic box: B_w(x) shear, uniform T
+    cfg = Config(nx=64, ny=4, x_max=1.0, y_max=4.0 / 64, t_end=0.2, cfl=0.3, mach=1.0, gamma=5 / 3,
+                 B_transverse=1.0, bc_x_type="periodic", bc_y_type="periodic", cond_x0=2.0, nernst_coeff=1.0,
+                 diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(cfg)
+    W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+    W[iRHO], W[iPR] = 1.0, 1.0
+    W[iBZ] = xp.sin(2 * np.pi * s.x)[:, None]
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    p0 = to_numpy(cons_to_prim(s.U, s.eos)[iPR, s.ng:-s.ng, s.ng]).copy()
+    E0 = _energy(s)
+    _march(s, 0.2)
+    dE = abs(_energy(s) - E0) / E0
+    dp = float(np.max(np.abs(to_numpy(cons_to_prim(s.U, s.eos)[iPR, s.ng:-s.ng, s.ng]) - p0)))
+    ett_ok = dE < 1e-13 and dp > 1e-4
+    ok = fits and nern_ok and ett_ok
+    print(f"  Braginskii fits (limits of k_perp/k_par and beta_wedge): {'ok' if fits else 'WRONG'}")
+    print(f"  Nernst: field bumps moved {X0:.2f} -> {xy:.4f} (B_y, faces) and {xw:.4f} (B_w, cells), exact {Xe:.4f}, "
+          f"toward the cold side; div B {div:.1e}, energy budget {budget:.1e}")
+    print(f"  Ettingshausen: periodic box, total energy {dE:.1e}, pressure redistributed by up to {dp:.2e}  "
+          f"[{'PASS' if ok else 'FAIL'}]")
+    return ok
+
+
+def twotemp_test():
+    """Two-temperature plasma (Z = 1). (1) Uniform plasma at theta_e = 1.2, theta_i = 0.8: theta_e - theta_i
+    relaxes as d(dT)/dt = -2 nu dT, nu = c_eq rho/theta_e^1.5 (theta_e = 1 + dT/2), checked against an RK4
+    solution of that ODE; total energy unchanged. (2) Sod shock tube, gamma = 5/3, T_e = T_i initially: behind
+    the shock the electron entropy equals the upstream one (electrons only compressed adiabatically) and the
+    ions take the shock heating (T_i > T_e). (3) Bremsstrahlung in two-temperature mode cools the electrons
+    only: theta_i unchanged to round-off."""
+    from sieve import twotemp as tt
+    print("\n--- Two-temperature plasma ---"); sys.stdout.flush()
+    g = 5.0 / 3.0
+
+    def box(nx, ny, **kw):
+        cfg = Config(nx=nx, ny=ny, x_max=1.0, y_max=ny / nx, t_end=1.0, cfl=0.3, mach=1.0, gamma=g, B_transverse=0.0,
+                     bc_y_type="periodic", two_temp=True, diag_interval=10**9, snapshot_times=[], **kw)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return MHDSolver(cfg)
+    # (1) equilibration
+    c_eq, T_end = 0.5, 2.0
+    s = box(8, 8, bc_x_type="periodic", te_eq_coeff=c_eq)
+    W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+    W[iRHO], W[iPR] = 1.0, 1.0
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    tt.set_pe(s.U, xp.full_like(s.U[0], 0.6), g)             # theta_e = 1.2, theta_i = 0.8
+    s._te_owner = s.U
+    E0 = _energy(s)
+    _march(s, T_end)
+    te, ti = (float(xp.mean(a[s.ng:-s.ng, s.ng:-s.ng])) for a in tt.temperatures(s.U, g, 1.0))
+    d, n = 0.4, 20000
+    f = lambda d: -2 * c_eq / (1 + d / 2)**1.5 * d
+    hstep = T_end / n
+    for _ in range(n):
+        k1 = f(d); k2 = f(d + 0.5 * hstep * k1); k3 = f(d + 0.5 * hstep * k2); k4 = f(d + hstep * k3)
+        d += hstep * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+    eq_diff = te - ti
+    eq_err = abs(eq_diff / d - 1)
+    eq_E = abs(_energy(s) - E0) / E0
+    # (2) Sod with two temperatures
+    s = box(400, 4, bc_x_type="extrapolation")
+    x = s.x[:, None] * xp.ones((1, s.ny_tot))
+    W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+    W[iRHO] = xp.where(x < 0.5, 1.0, 0.125)
+    W[iPR] = xp.where(x < 0.5, 1.0, 0.1)
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    _march(s, 0.2)
+    ng = s.ng
+    rho = to_numpy(s.U[0, ng:-ng, ng])
+    se = to_numpy(s.U[10, ng:-ng, ng]) / rho
+    te, ti = (to_numpy(a[ng:-ng, ng]) for a in tt.temperatures(s.U, g, 1.0))
+    xc = to_numpy(s.x[ng:-ng])
+    seR = 0.05 / 0.125**g                                    # p_e = p/2 upstream (right)
+    shocked = (xc > 0.73) & (xc < 0.83)                     # between the contact (~0.69) and the shock (~0.85)
+    se_err = float(np.max(np.abs(se[shocked] / seR - 1)))
+    hot_ions = float(np.min(ti[shocked] / te[shocked]))
+    # (3) electron-only radiation
+    s = box(8, 8, bc_x_type="periodic", rad_coeff=0.05, rad_T_min=0.1)
+    W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+    W[iRHO], W[iPR] = 1.0, 1.0
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    ti0 = float(xp.mean(s.temperatures()[1]))
+    _march(s, 1.0)
+    te1, ti1 = (float(xp.mean(a[s.ng:-s.ng, s.ng:-s.ng])) for a in s.temperatures())
+    ok = eq_err < 0.01 and eq_E < 1e-13 and se_err < 0.01 and hot_ions > 1.0 and abs(ti1 - ti0) < 1e-12 and te1 < ti1
+    print(f"  equilibration: theta_e - theta_i = {eq_diff:.5f} vs ODE {d:.5f} "
+          f"({100 * eq_err:.2f}%), energy {eq_E:.1e}")
+    print(f"  Sod: electron entropy behind the shock = upstream to {100 * se_err:.2f}%, T_i/T_e >= {hot_ions:.2f} there")
+    print(f"  radiation cools electrons only: theta_i {ti0:.6f} -> {ti1:.6f}, theta_e -> {te1:.4f}  "
+          f"[{'PASS' if ok else 'FAIL'}]")
+    return ok
+
+
+def viscosity_test(tol=0.05):
+    """Braginskii parallel viscosity: a sound wave along x (k = 2 pi, rho = p = 1, gamma = 5/3) damps at the extra
+    rate mu_eff k^2/(2 rho) over the inviscid scheme's own damping (a run with eta = 0 subtracted), with
+    mu_eff = 4/3 eta for B along k, 1/3 eta for B across k (Pi = -3 eta (bb - I/3)(bb:grad v - div v/3)),
+    and 4/3 eta for B = 0 (isotropic Navier-Stokes). Total energy conserved in the periodic box."""
+    print("\n--- Braginskii viscosity: sound-wave damping ---"); sys.stdout.flush()
+    nx, k, A, eta, T = 128, 2 * np.pi, 1e-4, 0.002, 2.0
+    c = np.sqrt(5.0 / 3.0)
+
+    def run(B, visc):
+        cfg = Config(nx=nx, ny=4, x_max=1.0, y_max=4.0 / nx, t_end=T, cfl=0.3, mach=1.0, gamma=5 / 3,
+                     B_transverse=1e-8, bc_x_type="periodic", bc_y_type="periodic", visc_coeff=visc,
+                     diag_interval=10**9, snapshot_times=[])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        x = s.x[:, None] * xp.ones((1, s.ny_tot))
+        W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+        W[iRHO] = 1.0 + A * xp.sin(k * x)
+        W[iVX] = c * A * xp.sin(k * x)
+        W[iPR] = 1.0 + c**2 * A * xp.sin(k * x)
+        W[iBX], W[iBY] = B
+        s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+        E0 = _energy(s)
+        _march(s, T)
+        xc = to_numpy(s.x[s.ng:-s.ng])
+        dr = to_numpy(s.U[0, s.ng:-s.ng, s.ng]) - 1.0
+        amp = 2 * np.hypot(np.mean(dr * np.sin(k * xc)), np.mean(dr * np.cos(k * xc)))
+        return -np.log(amp / A) / T, abs(_energy(s) - E0) / E0
+    g0, _ = run((1e-6, 0.0), 0.0)
+    out, ok = [], True
+    for name, B, mu in (("B along k", (1e-6, 0.0), 4 / 3), ("B across k", (0.0, 1e-6), 1 / 3), ("B = 0", (0.0, 0.0), 4 / 3)):
+        gv, dE = run(B, eta)
+        exact = mu * eta * k**2 / 2
+        err = abs((gv - g0) / exact - 1)
+        good = err < (tol if mu > 1 else 2 * tol) and dE < 1e-12
+        ok = ok and good
+        out.append(f"  {name}: extra damping {gv - g0:.5f} vs {exact:.5f} ({100 * err:.1f}%), energy {dE:.1e}  "
+                   f"[{'PASS' if good else 'FAIL'}]")
+    print(f"  scheme damping without viscosity: {g0:.5f}")
+    print("\n".join(out))
+    return ok
+
+
+def strength_test():
+    """Liner strength on stiffened-gas aluminium (g/cm^3, km/s, mm, us, GPa; G = 26, Y = 0.29, spall 1.2).
+    (1) A small velocity pulse travels at the longitudinal speed c_L = sqrt(c0^2 + 4G/(3 rho)) = 6.42 km/s,
+    not the bulk c0 = 5.33. (2) A 0.5 km/s impact makes an elastic precursor at the Hugoniot elastic limit
+    sigma_HEL = (K + 4G/3) Y/(2G) moving at c_L; the plastic wave reaches the yield surface, sqrt(3 J2) = Y
+    (S_xx = -2Y/3 in uniaxial strain) and the target stays there behind it. The flyer is long enough that the
+    weak unloading wave its shock reflects off the zero-gradient left boundary stays out of the target. (3) A bar pulled apart at +-0.2 km/s (tension ~3 GPa): spall damage forms at the centre
+    only and the intact metal never carries more tension than the spall strength."""
+    from sieve.eos import stiffened_from_hugoniot
+    from sieve import strength as st
+    print("\n--- Liner strength: elastic waves, Hugoniot elastic limit, spall ---"); sys.stdout.flush()
+    gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 1.0)
+    G, Y, sp = 26.0, 0.29, 1.2
+    rho0, c0 = AL["rho0"], AL["c0"]
+    cL = np.sqrt(c0**2 + 4 * G / (3 * rho0))
+
+    def bar(nx, L, u_of, t_end, spall=0.0, yield_=Y):
+        cfg = Config(nx=nx, ny=4, x_max=L, y_max=4 * L / nx, t_end=t_end, cfl=0.3, mach=1.0, B_transverse=0.0,
+                     bc_x_type="extrapolation", bc_y_type="periodic", eos_liner="stiffened", gamma_liner=gA,
+                     p_inf_liner=piA, material_tracer="volume_fraction", strength=True, shear_modulus=G,
+                     yield_strength=yield_, spall_strength=spall, diag_interval=10**9, snapshot_times=[])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        x = s.x[:, None] * xp.ones((1, s.ny_tot))
+        W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+        W[iRHO], W[iPR], W[iCLR] = rho0, 1e-4, 1.0
+        W[iVX] = u_of(x)
+        s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+        E0 = _energy(s)
+        _march(s, t_end)
+        ng = s.ng
+        P = cons_to_prim(s.U, s.eos)
+        prof = dict(x=to_numpy(s.x[ng:-ng]), u=to_numpy(P[iVX, ng:-ng, ng]), p=to_numpy(P[iPR, ng:-ng, ng]),
+                    Sxx=to_numpy(s.S[st.SXX, ng:-ng, ng]), dmg=to_numpy(s.S[st.DMG, ng:-ng, ng]))
+        prof["budget"] = abs(_energy(s) - E0 - s._cumulative_boundary_energy) / abs(E0)
+        return s, prof
+    # (1) elastic pulse
+    t1 = 0.04
+    s, P = bar(800, 1.0, lambda x: 1e-3 * xp.exp(-((x - 0.5) / 0.02)**2), t1, yield_=1e3)
+    right = P["x"] > 0.5
+    i = int(np.argmax(np.where(right, P["u"], -1)))
+    a_, b_, c_ = P["u"][i - 1], P["u"][i], P["u"][i + 1]
+    xpk = P["x"][i] + 0.5 * (a_ - c_) / (a_ - 2 * b_ + c_) * (P["x"][1] - P["x"][0])
+    speed = (xpk - 0.5) / t1
+    e1 = abs(speed / cL - 1)
+    # (2) Hugoniot elastic limit
+    K = rho0 * c0**2
+    hel = (K + 4 * G / 3) * Y / (2 * G)
+    t2, x0 = 0.12, 0.4
+    s, P = bar(1120, 1.4, lambda x: xp.where(x < x0, 0.5, 0.0), t2)
+    sig = P["p"] - P["Sxx"]                                  # compressive normal stress
+    xs = P["x"]
+    tgt = xs > x0 + 0.02
+    front = xs[np.where(tgt & (sig > 0.5 * hel))[0][-1]]
+    plastic = xs[np.where(tgt & (sig > 2.0 * hel))[0][-1]]
+    h = xs[1] - xs[0]
+    pre = (xs > plastic + 6 * h) & (xs < front - 6 * h)
+    hel_num = float(np.mean(sig[pre]))
+    behind = (xs > x0 + 0.1) & (xs < plastic - 6 * h)
+    sxx_pl = float(np.mean(P["Sxx"][behind]))
+    near = (xs > plastic - 6 * h) & (xs < plastic + 2 * h)
+    seq_peak = float(np.max(1.5 * np.abs(P["Sxx"][near])))      # sqrt(3 J2) = 1.5 |S_xx| in uniaxial strain
+    e2y = abs(seq_peak / Y - 1)
+    e2 = abs(hel_num / hel - 1)
+    e2s = abs(sxx_pl / (-2 * Y / 3) - 1)
+    e2f = abs((front - x0) / t2 / cL - 1)
+    # (3) spall
+    s, P = bar(400, 1.0, lambda x: xp.where(x < 0.5, -0.2, 0.2), 0.04, spall=sp)
+    dm = P["dmg"] > 0.5
+    intact_pmin = float(np.min(P["p"][~dm]))
+    central = bool(dm.any()) and bool(np.all(np.abs(P["x"][dm] - 0.5) < 0.05))
+    ok = (e1 < 0.01 and e2 < 0.05 and e2y < 0.01 and e2s < 0.01 and e2f < 0.03 and central and intact_pmin > -1.1 * sp
+          and P["budget"] < 1e-12)
+    print(f"  elastic pulse: {speed:.3f} km/s vs c_L {cL:.3f} ({100 * e1:.2f}%; bulk c0 {c0:.3f})")
+    print(f"  impact at 0.5 km/s: precursor {hel_num:.3f} GPa vs HEL {hel:.3f} ({100 * e2:.1f}%), front at "
+          f"{(front - x0) / t2:.2f} km/s; plastic front reaches sqrt(3 J2) = {seq_peak:.4f} (Y = {Y}, {100 * e2y:.2f}%), "
+          f"plateau S_xx {sxx_pl:.4f} vs -2Y/3 {-2 * Y / 3:.4f} ({100 * e2s:.2f}%)")
+    print(f"  bar pulled apart: {int(dm.sum())} spalled cells, all within 0.05 mm of the centre: {central}; "
+          f"intact metal min p {intact_pmin:.3f} GPa (spall {-sp}); energy budget {P['budget']:.1e}  "
+          f"[{'PASS' if ok else 'FAIL'}]")
     return ok
 
 
@@ -772,6 +1088,101 @@ def parity3d_test(tol=1e-12):
     return ok
 
 
+def cylindrical_test():
+    """Axisymmetric (r, z) geometry. (1) A static uniform magnetized state (axial field) must stay static to
+    round-off: the r-weighted flux divergence and the p_T/r source balance exactly. (2) Cylindrical Noh
+    problem, gamma = 5/3: gas at v_r = -1 stagnates on the axis behind an outgoing shock at r = t/3 with
+    density ((g+1)/(g-1))^2 = 16, ahead of it rho = 1 + t/r. Checked at t = 0.6 away from the axis
+    (wall-heating layer) and from the outer boundary; plus the energy budget and div B with a weak axial
+    field."""
+    print("\n--- Cylindrical (r, z) geometry ---"); sys.stdout.flush()
+    base = dict(x_min=0.0, x_max=1.0, y_min=0.0, cfl=0.3, gamma=5.0 / 3.0, mach=1.0, B_transverse=1e-3,
+                geometry="cylindrical", bc_x_type="extrapolation", bc_y_type="periodic", diag_interval=10**9,
+                snapshot_times=[])
+    # (1) static uniform state
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(Config(nx=64, ny=8, y_max=8 / 64, t_end=0.5, **base))
+    W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+    W[iRHO], W[iPR], W[iBY] = 1.0, 1.0, 0.7
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    _march(s, 0.5)
+    Wf = cons_to_prim(s.U, s.eos)[:, s.ng:-s.ng, s.ng:-s.ng]
+    vmax = float(xp.max(xp.abs(Wf[iVX]))) + float(xp.max(xp.abs(Wf[iVY])))
+    dp = float(xp.max(xp.abs(Wf[iPR] - 1.0)))
+    # (2) Noh
+    nx, t_end = 200, 0.6
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(Config(nx=nx, ny=4, y_max=4 / nx, t_end=t_end, **base))
+    W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+    W[iRHO], W[iPR], W[iVX], W[iBY] = 1.0, 1e-6, -1.0, 1e-3
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    E0 = _energy(s)
+    _march(s, t_end)
+    ng = s.ng
+    P = cons_to_prim(s.U, s.eos)
+    r, rho = to_numpy(s.x[ng:-ng]), to_numpy(P[iRHO, ng:-ng, ng])
+    plateau = float(np.mean(rho[(r > 0.06) & (r < 0.17)]))
+    rs = r[np.where(rho > 0.5 * (16 + 1 + t_end / 0.2))[0][-1]]            # last cell above mid-jump
+    pre = float(np.mean(rho[(r > 0.28) & (r < 0.32)]))
+    pre_exact = float(np.mean(1 + t_end / r[(r > 0.28) & (r < 0.32)]))
+    budget = abs(_energy(s) - E0 - s._cumulative_boundary_energy) / abs(E0)
+    div = s.div_b_max()
+    ok = (vmax < 1e-12 and dp < 1e-12 and abs(plateau / 16 - 1) < 0.05 and abs(rs - t_end / 3) < 2.5 / nx
+          and abs(pre / pre_exact - 1) < 0.03 and budget < 1e-12 and div < 1e-12)
+    print(f"  static magnetized state, 64x8 to t = 0.5: max |v| {vmax:.1e}, max |dp| {dp:.1e}")
+    print(f"  Noh, {nx} cells, t = {t_end}: post-shock rho {plateau:.3f} (exact 16), shock at r = {rs:.4f} "
+          f"({t_end / 3:.4f}), pre-shock rho {pre:.3f} ({pre_exact:.3f}); energy budget {budget:.1e}, div B {div:.1e}  "
+          f"[{'PASS' if ok else 'FAIL'}]")
+    return ok
+
+
+def ct_test():
+    """Constrained transport. (1) Field loop advection (Gardiner & Stone 2005): a weak loop A_z = A0 (R - r)
+    carried diagonally through a periodic box for one period; div B on the faces must stay at round-off,
+    and the loop keeps a reported fraction of its magnetic energy (GLM shown for comparison). (2) A fully 3D
+    field from a vector potential in a uniform 3D flow, periodic: div B at round-off after 40 steps."""
+    from sieve.solver3d import MHDSolver3D
+    print("\n--- Constrained transport: div B ---"); sys.stdout.flush()
+    A0, R = 1e-3, 0.3
+    loop = lambda X, Y: A0 * np.maximum(R - np.sqrt(X**2 + Y**2), 0.0)
+    res = {}
+    for mode in ("ct", "glm"):
+        cfg = Config(nx=128, ny=64, x_min=-1, x_max=1, y_min=-0.5, y_max=0.5, t_end=2.0, cfl=0.4, gamma=5 / 3,
+                     mach=1.0, B_transverse=1e-3, bc_x_type="periodic", bc_y_type="periodic", div_b=mode,
+                     diag_interval=10**9, snapshot_times=[])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        W = xp.zeros((NVAR, s.nx_tot, s.ny_tot))
+        W[iRHO], W[iPR], W[iVX], W[iVY] = 1.0, 1.0, 2.0, 1.0
+        s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+        s.set_vector_potential(loop)
+        Em0 = float(xp.sum(s.U[iBX]**2 + s.U[iBY]**2))
+        div0 = s.div_b_max()
+        _march(s, cfg.t_end)
+        res[mode] = (float(xp.sum(s.U[iBX]**2 + s.U[iBY]**2)) / Em0, div0, s.div_b_max())
+    # 3D: ABC-like potential, uniform oblique flow
+    k = 2 * np.pi
+    cfg = Config(nx=16, ny=16, nz=16, x_max=1.0, y_max=1.0, z_max=1.0, t_end=1.0, cfl=0.3, mach=1.0,
+                 B_transverse=0.1, bc_x_type="periodic", diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s3 = MHDSolver3D(cfg)
+    W = xp.zeros((NVAR,) + s3.U.shape[1:])
+    W[iRHO], W[iPR], W[iVX], W[iVY], W[iVZ] = 1.0, 1.0, 1.0, 0.5, 0.25
+    s3.U = prim_to_cons(W, s3.eos); s3.t = 0.0; s3.step = 0
+    s3.set_vector_potential(lambda x, y, z: 0.1 * np.sin(k * z) / k, lambda x, y, z: 0.1 * np.sin(k * x) / k,
+                            lambda x, y, z: 0.1 * np.sin(k * y) / k)
+    d3_0 = s3.div_b_max()
+    for _ in range(40):
+        s3.dt = s3.compute_dt(cons_to_prim(s3.U, s3.eos)); s3.step_ssprk3(); s3.t += s3.dt
+    d3 = s3.div_b_max()
+    ct_ok = res["ct"][1] < 1e-12 and res["ct"][2] < 1e-12 and res["ct"][0] > 0.7 and d3_0 < 1e-12 and d3 < 1e-12
+    print(f"  field loop, 128x64, one period: CT div B {res['ct'][1]:.1e} -> {res['ct'][2]:.1e}, magnetic energy "
+          f"kept {res['ct'][0]:.3f}; GLM div B {res['glm'][2]:.1e}, energy kept {res['glm'][0]:.3f}")
+    print(f"  3D field from a vector potential in a 3D flow, 16^3: div B {d3_0:.1e} -> {d3:.1e} after 40 steps  "
+          f"[{'PASS' if ct_ok else 'FAIL'}]")
+    return ct_ok
+
+
 def galilean_test(U=6.49):
     """Interface frame: the interface must stay put, energy must close, and the interface growth must match
     the lab frame (within 10%). Mixing-layer enstrophy is reported, not asserted: the scheme is not exactly
@@ -828,6 +1239,8 @@ VERIFICATION_TESTS = {
     "alfven": alfven_convergence_test,
     "reflection": boundary_reflection_test,
     "conservation": conservation_test,
+    "ct": ct_test,
+    "cylindrical": cylindrical_test,
     "equilibrium": equilibrium_test,
     "z_invariance": z_invariance_test,
     "alfven_z": alfven_z_test,
@@ -839,6 +1252,11 @@ VERIFICATION_TESTS = {
     "eos_positivity": eos_positivity_test,
     "radiation": radiation_decay_test,
     "conduction": conduction_test,
+    "wall_conduction": wall_conduction_test,
+    "transport": transport_test,
+    "twotemp": twotemp_test,
+    "viscosity": viscosity_test,
+    "strength": strength_test,
     "parity3d": parity3d_test,
     "galilean": galilean_test,
     "rmi_mhd": rmi_mhd_smoke_test,

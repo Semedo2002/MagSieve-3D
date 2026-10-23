@@ -134,7 +134,7 @@ def diagnostics_for_solver(solver):
     # is used because local normalisation blows up at the nulls of striped fields.
     b_max = _scalar(xp.max(xp.sqrt(b2)))
     div_b_rel_max = div_b_max * min(cfg.dx, cfg.dy) / b_max if b_max > 0 else 0.0
-    energy_total = _scalar(xp.sum(solver.U[EN, ng:-ng, ng:-ng]) * cfg.dx * cfg.dy)
+    energy_total = _scalar(xp.sum(solver.U[EN, ng:-ng, ng:-ng] * getattr(solver, "dV", cfg.dx * cfg.dy)))
 
     x_downstream = cfg.interface_x + 0.3
     ix_ds = max(int(xp.searchsorted(x_arr, xp.asarray(x_downstream))), 0)
@@ -224,7 +224,9 @@ def hotspot_conduction(U, eos, cfg, h, periodic, core, frac=0.5):
     tmax = float(xp.max(xp.where(core, theta, 0.0)))
     hot = core & (theta > frac * tmax)
     dV = float(np.prod(h))
-    r = conduction_rate(U, eos, cfg.cond_kappa0, cfg.cond_x0, cfg.cond_tracer_max, h, periodic)
+    wall = cfg.cond_wall_T if cfg.cond_wall == "isothermal" else None
+    r = conduction_rate(U, eos, cfg.cond_kappa0, cfg.cond_x0, cfg.cond_tracer_max, h, periodic, wall_T=wall,
+                        perp=cfg.cond_perp)
     P = -float(xp.sum(xp.where(hot, r, 0.0))) * dV
     nd = theta.ndim
     g = [xp.gradient(theta, h[k], axis=k) for k in range(nd)]
@@ -235,7 +237,8 @@ def hotspot_conduction(U, eos, cfg, h, periodic, core, frac=0.5):
     g2 = sum(gk * gk for gk in g)
     kpar = cfg.cond_kappa0 * theta**2.5
     x = cfg.cond_x0 * Bm * theta**1.5 / rho
-    kperp = kpar / (1.0 + x * x)
+    from .physics import _kperp
+    kperp = _kperp(kpar, x, cfg.cond_perp)
     on = float(xp.sum(xp.where(hot, kperp * g2 + (kpar - kperp) * bg * bg, 0.0)))
     off = float(xp.sum(xp.where(hot, kpar * g2, 0.0)))
     supp = off / on if on > 0 else 1.0

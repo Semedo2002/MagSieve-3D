@@ -47,7 +47,7 @@ Lx, Ly, Lz = 10.0, 2.0, 1.0
 nx, ny, nz = (120, 24, 12) if args.quick else (240, 48, 24)
 T_END = 1.5 if args.quick else 5.0
 h = Lx / nx
-BASE = dict(nx=nx, ny=ny, nz=nz, x_max=Lx, y_max=Ly, z_max=Lz, t_end=T_END, cfl=0.3, mach=10.0,
+BASE = dict(div_b="glm", nx=nx, ny=ny, nz=nz, x_max=Lx, y_max=Ly, z_max=Lz, t_end=T_END, cfl=0.3, mach=10.0,
             interface_x=4.0, perturbation_amp=0.02, perturbation_mode=4, density_ratio=3.0,
             bc_x_type="inflow_outflow", diag_interval=20, B_modulation_mode=1,
             x_min_bc="plateau", x_max_bc="plateau")

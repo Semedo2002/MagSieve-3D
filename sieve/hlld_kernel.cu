@@ -13,24 +13,29 @@ void hlld_flux_x_kernel(
     const double* __restrict__ eint_R,    // speed from the EOS, read only when use_eos != 0
     const double* __restrict__ csq_L,     // (otherwise ideal gas with the scalar gamma); for a
     const double* __restrict__ csq_R,     // stiffened gas: (p + g p_inf)/(g - 1) and g (p + p_inf)/rho
-    const int use_eos
-) {
+    const int use_eos,
+    const int axn                         // face normal axis 0, 1, 2: components are rotated in place (x, y, z),
+) {                                       // (y, x, z), (z, y, x) instead of permuting the arrays on the host
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= n_faces) return;
 
-    const int NVAR = 10;
+    const int NVAR = 11;
+    const int c1 = (axn == 0) ? 1 : ((axn == 1) ? 2 : 3);   // global velocity index of local x, y, z
+    const int c2 = (axn == 1) ? 1 : 2;
+    const int c3 = (axn == 2) ? 1 : 3;
 
     double rhoL = WL[0*n_faces + idx]; if (rhoL < floor_rho) rhoL = floor_rho;
     double rhoR = WR[0*n_faces + idx]; if (rhoR < floor_rho) rhoR = floor_rho;
-    double vxL = WL[1*n_faces + idx], vyL = WL[2*n_faces + idx], vzL = WL[3*n_faces + idx];
-    double vxR = WR[1*n_faces + idx], vyR = WR[2*n_faces + idx], vzR = WR[3*n_faces + idx];
-    double BxL = WL[4*n_faces + idx], ByL = WL[5*n_faces + idx], BzL = WL[6*n_faces + idx];
-    double BxR = WR[4*n_faces + idx], ByR = WR[5*n_faces + idx], BzR = WR[6*n_faces + idx];
+    double vxL = WL[c1*n_faces + idx], vyL = WL[c2*n_faces + idx], vzL = WL[c3*n_faces + idx];
+    double vxR = WR[c1*n_faces + idx], vyR = WR[c2*n_faces + idx], vzR = WR[c3*n_faces + idx];
+    double BxL = WL[(c1+3)*n_faces + idx], ByL = WL[(c2+3)*n_faces + idx], BzL = WL[(c3+3)*n_faces + idx];
+    double BxR = WR[(c1+3)*n_faces + idx], ByR = WR[(c2+3)*n_faces + idx], BzR = WR[(c3+3)*n_faces + idx];
     // with an EOS the face pressures were already floored above cavitation on the host
     double pL = WL[7*n_faces + idx]; if (!use_eos && pL < floor_pr) pL = floor_pr;
     double pR = WR[7*n_faces + idx]; if (!use_eos && pR < floor_pr) pR = floor_pr;
     double psiL = WL[8*n_faces + idx], psiR = WR[8*n_faces + idx];
     double CL_v = WL[9*n_faces + idx], CR_v = WR[9*n_faces + idx];
+    double SL_v = WL[10*n_faces + idx], SR_v = WR[10*n_faces + idx];   // electron entropy s_e, passive like C
 
     double Bx_f, psi_f;
     if (ch > 0.0) {
@@ -86,21 +91,24 @@ void hlld_flux_x_kernel(
     double sqLS = sqrt(rhoLS);
     double sqRS = sqrt(rhoRS);
 
-    double eps_rel = 1e-8 * fmax(fabs(ptS), 1.0);
+    // star-state transverse v and B; when the fast and Alfven waves coincide (rho dS (S - SM) = Bx^2) the
+    // formulas are 0/0 and the outer state is the correct limit (Miyoshi & Kusano 2005)
     double dnL = rhoL*dSL*dSL_SM - Bx2;
     double dnR = rhoR*dSR*dSR_SM - Bx2;
-    if (fabs(dnL) < eps_rel) dnL = (dnL >= 0.0) ? eps_rel : -eps_rel;
-    if (fabs(dnR) < eps_rel) dnR = (dnR >= 0.0) ? eps_rel : -eps_rel;
-
-    double vyLS = vyL - Bx_f*ByL*(SM - vxL)/dnL;
-    double vzLS = vzL - Bx_f*BzL*(SM - vxL)/dnL;
-    double ByLS = ByL*(rhoL*dSL*dSL - Bx2)/dnL;
-    double BzLS = BzL*(rhoL*dSL*dSL - Bx2)/dnL;
-
-    double vyRS = vyR - Bx_f*ByR*(SM - vxR)/dnR;
-    double vzRS = vzR - Bx_f*BzR*(SM - vxR)/dnR;
-    double ByRS = ByR*(rhoR*dSR*dSR - Bx2)/dnR;
-    double BzRS = BzR*(rhoR*dSR*dSR - Bx2)/dnR;
+    double vyLS = vyL, vzLS = vzL, ByLS = ByL, BzLS = BzL;
+    double vyRS = vyR, vzRS = vzR, ByRS = ByR, BzRS = BzR;
+    if (fabs(dnL) > 1e-8 * fmax(fabs(ptS), 1e-300)) {
+        vyLS = vyL - Bx_f*ByL*(SM - vxL)/dnL;
+        vzLS = vzL - Bx_f*BzL*(SM - vxL)/dnL;
+        ByLS = ByL*(rhoL*dSL*dSL - Bx2)/dnL;
+        BzLS = BzL*(rhoL*dSL*dSL - Bx2)/dnL;
+    }
+    if (fabs(dnR) > 1e-8 * fmax(fabs(ptS), 1e-300)) {
+        vyRS = vyR - Bx_f*ByR*(SM - vxR)/dnR;
+        vzRS = vzR - Bx_f*BzR*(SM - vxR)/dnR;
+        ByRS = ByR*(rhoR*dSR*dSR - Bx2)/dnR;
+        BzRS = BzR*(rhoR*dSR*dSR - Bx2)/dnR;
+    }
 
     double vBL = vxL*Bx_f + vyL*ByL + vzL*BzL;
     double vBLS = SM*Bx_f + vyLS*ByLS + vzLS*BzLS;
@@ -129,7 +137,7 @@ void hlld_flux_x_kernel(
     double ELDS = ELS - sqLS*(vBLS - vBDS)*sBx;
     double ERDS = ERS + sqRS*(vBRS - vBDS)*sBx;
 
-    double f[10];
+    double f[11];
 
     if (SL >= 0.0) {
         f[0] = rhoL*vxL;
@@ -142,6 +150,7 @@ void hlld_flux_x_kernel(
         f[7] = (EL + ptL)*vxL - Bx_f*vBL;
         f[8] = (ch > 0.0) ? Bx_f*ch*ch : 0.0;
         f[9] = rhoL*CL_v*vxL;
+        f[10] = rhoL*SL_v*vxL;
     } else if (SR <= 0.0) {
         f[0] = rhoR*vxR;
         f[1] = rhoR*vxR*vxR + ptR - Bx2;
@@ -153,8 +162,9 @@ void hlld_flux_x_kernel(
         f[7] = (ER + ptR)*vxR - Bx_f*vBR;
         f[8] = (ch > 0.0) ? Bx_f*ch*ch : 0.0;
         f[9] = rhoR*CR_v*vxR;
+        f[10] = rhoR*SR_v*vxR;
     } else {
-        double FL[10], UL_c[10], ULS_c[10];
+        double FL[11], UL_c[11], ULS_c[11];
         FL[0] = rhoL*vxL;
         FL[1] = rhoL*vxL*vxL + ptL - Bx2;
         FL[2] = rhoL*vyL*vxL - Bx_f*ByL;
@@ -165,17 +175,18 @@ void hlld_flux_x_kernel(
         FL[7] = (EL + ptL)*vxL - Bx_f*vBL;
         FL[8] = (ch > 0.0) ? Bx_f*ch*ch : 0.0;
         FL[9] = rhoL*CL_v*vxL;
+        FL[10] = rhoL*SL_v*vxL;
 
         UL_c[0]=rhoL; UL_c[1]=rhoL*vxL; UL_c[2]=rhoL*vyL; UL_c[3]=rhoL*vzL;
-        UL_c[4]=Bx_f; UL_c[5]=ByL; UL_c[6]=BzL; UL_c[7]=EL; UL_c[8]=psiL; UL_c[9]=rhoL*CL_v;
+        UL_c[4]=Bx_f; UL_c[5]=ByL; UL_c[6]=BzL; UL_c[7]=EL; UL_c[8]=psiL; UL_c[9]=rhoL*CL_v; UL_c[10]=rhoL*SL_v;
 
         ULS_c[0]=rhoLS; ULS_c[1]=rhoLS*SM; ULS_c[2]=rhoLS*vyLS; ULS_c[3]=rhoLS*vzLS;
-        ULS_c[4]=Bx_f; ULS_c[5]=ByLS; ULS_c[6]=BzLS; ULS_c[7]=ELS; ULS_c[8]=psi_f; ULS_c[9]=rhoLS*CL_v;
+        ULS_c[4]=Bx_f; ULS_c[5]=ByLS; ULS_c[6]=BzLS; ULS_c[7]=ELS; ULS_c[8]=psi_f; ULS_c[9]=rhoLS*CL_v; ULS_c[10]=rhoLS*SL_v;
 
-        double FLS[10];
-        for (int v=0; v<10; v++) FLS[v] = FL[v] + SL*(ULS_c[v] - UL_c[v]);
+        double FLS[11];
+        for (int v=0; v<11; v++) FLS[v] = FL[v] + SL*(ULS_c[v] - UL_c[v]);
 
-        double FR[10], UR_c[10], URS_c[10];
+        double FR[11], UR_c[11], URS_c[11];
         FR[0] = rhoR*vxR;
         FR[1] = rhoR*vxR*vxR + ptR - Bx2;
         FR[2] = rhoR*vyR*vxR - Bx_f*ByR;
@@ -186,35 +197,36 @@ void hlld_flux_x_kernel(
         FR[7] = (ER + ptR)*vxR - Bx_f*vBR;
         FR[8] = (ch > 0.0) ? Bx_f*ch*ch : 0.0;
         FR[9] = rhoR*CR_v*vxR;
+        FR[10] = rhoR*SR_v*vxR;
 
         UR_c[0]=rhoR; UR_c[1]=rhoR*vxR; UR_c[2]=rhoR*vyR; UR_c[3]=rhoR*vzR;
-        UR_c[4]=Bx_f; UR_c[5]=ByR; UR_c[6]=BzR; UR_c[7]=ER; UR_c[8]=psiR; UR_c[9]=rhoR*CR_v;
+        UR_c[4]=Bx_f; UR_c[5]=ByR; UR_c[6]=BzR; UR_c[7]=ER; UR_c[8]=psiR; UR_c[9]=rhoR*CR_v; UR_c[10]=rhoR*SR_v;
 
         URS_c[0]=rhoRS; URS_c[1]=rhoRS*SM; URS_c[2]=rhoRS*vyRS; URS_c[3]=rhoRS*vzRS;
-        URS_c[4]=Bx_f; URS_c[5]=ByRS; URS_c[6]=BzRS; URS_c[7]=ERS; URS_c[8]=psi_f; URS_c[9]=rhoRS*CR_v;
+        URS_c[4]=Bx_f; URS_c[5]=ByRS; URS_c[6]=BzRS; URS_c[7]=ERS; URS_c[8]=psi_f; URS_c[9]=rhoRS*CR_v; URS_c[10]=rhoRS*SR_v;
 
-        double FRS[10];
-        for (int v=0; v<10; v++) FRS[v] = FR[v] + SR*(URS_c[v] - UR_c[v]);
+        double FRS[11];
+        for (int v=0; v<11; v++) FRS[v] = FR[v] + SR*(URS_c[v] - UR_c[v]);
 
-        double ULDS[10], URDS[10];
+        double ULDS[11], URDS[11];
         ULDS[0]=rhoLS; ULDS[1]=rhoLS*SM; ULDS[2]=rhoLS*vyDS; ULDS[3]=rhoLS*vzDS;
-        ULDS[4]=Bx_f; ULDS[5]=ByDS; ULDS[6]=BzDS; ULDS[7]=ELDS; ULDS[8]=psi_f; ULDS[9]=rhoLS*CL_v;
+        ULDS[4]=Bx_f; ULDS[5]=ByDS; ULDS[6]=BzDS; ULDS[7]=ELDS; ULDS[8]=psi_f; ULDS[9]=rhoLS*CL_v; ULDS[10]=rhoLS*SL_v;
 
         URDS[0]=rhoRS; URDS[1]=rhoRS*SM; URDS[2]=rhoRS*vyDS; URDS[3]=rhoRS*vzDS;
-        URDS[4]=Bx_f; URDS[5]=ByDS; URDS[6]=BzDS; URDS[7]=ERDS; URDS[8]=psi_f; URDS[9]=rhoRS*CR_v;
+        URDS[4]=Bx_f; URDS[5]=ByDS; URDS[6]=BzDS; URDS[7]=ERDS; URDS[8]=psi_f; URDS[9]=rhoRS*CR_v; URDS[10]=rhoRS*SR_v;
 
-        double FLDS[10], FRDS[10];
-        for (int v=0; v<10; v++) FLDS[v] = FLS[v] + SAL*(ULDS[v] - ULS_c[v]);
-        for (int v=0; v<10; v++) FRDS[v] = FRS[v] + SAR*(URDS[v] - URS_c[v]);
+        double FLDS[11], FRDS[11];
+        for (int v=0; v<11; v++) FLDS[v] = FLS[v] + SAL*(ULDS[v] - ULS_c[v]);
+        for (int v=0; v<11; v++) FRDS[v] = FRS[v] + SAR*(URDS[v] - URS_c[v]);
 
         if (SAL >= 0.0) {
-            for (int v=0; v<10; v++) f[v] = FLS[v];
+            for (int v=0; v<11; v++) f[v] = FLS[v];
         } else if (SM >= 0.0) {
-            for (int v=0; v<10; v++) f[v] = FLDS[v];
+            for (int v=0; v<11; v++) f[v] = FLDS[v];
         } else if (SAR >= 0.0) {
-            for (int v=0; v<10; v++) f[v] = FRDS[v];
+            for (int v=0; v<11; v++) f[v] = FRDS[v];
         } else {
-            for (int v=0; v<10; v++) f[v] = FRS[v];
+            for (int v=0; v<11; v++) f[v] = FRS[v];
         }
 
         if (ch > 0.0) {
@@ -223,7 +235,10 @@ void hlld_flux_x_kernel(
         }
     }
 
-    for (int v = 0; v < 10; v++) {
-        F[v*n_faces + idx] = f[v];
+    for (int v = 0; v < 11; v++) {
+        int gv = v;
+        if (v == 1) gv = c1; else if (v == 2) gv = c2; else if (v == 3) gv = c3;
+        else if (v == 4) gv = c1 + 3; else if (v == 5) gv = c2 + 3; else if (v == 6) gv = c3 + 3;
+        F[gv*n_faces + idx] = f[v];
     }
 }

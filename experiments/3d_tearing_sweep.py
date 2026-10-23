@@ -35,7 +35,7 @@ nx, ny, nz = (128, 32, 16) if args.quick else (192, 48, 24)
 Lx, Ly, Lz, t_end = 8.0, 2.0, 1.0, (0.3 if args.quick else 0.6)
 h = Lx / nx
 SEED = dict(z_pert_vel=0.01, z_pert_amp=0.005, z_pert_mode=4, z_pert_seed=1)
-BASE = dict(nx=nx, ny=ny, nz=nz, x_max=Lx, y_max=Ly, z_max=Lz, t_end=t_end, cfl=0.3, mach=10.0,
+BASE = dict(div_b="glm", nx=nx, ny=ny, nz=nz, x_max=Lx, y_max=Ly, z_max=Lz, t_end=t_end, cfl=0.3, mach=10.0,
             interface_x=1.5, perturbation_amp=0.02, perturbation_mode=4, density_ratio=3.0,
             bc_x_type="inflow_outflow", B_modulation_mode=4, diag_interval=10)
 DEEP = dict(B_field_type="striped", B_transverse=6.0)               # field-free gaps: B_x reverses

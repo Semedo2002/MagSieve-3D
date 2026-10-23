@@ -63,8 +63,8 @@ print(f"NumPy {np.__version__}, CuPy {cp.__version__}, Python {sys.version.split
 
 from .config import (
     NVAR, FLOOR_RHO, FLOOR_PR,
-    RHO, MX, MY, MZ, BX, BY, BZ, EN, PSI, RHOC,
-    iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iPSI, iCLR,
+    RHO, MX, MY, MZ, BX, BY, BZ, EN, PSI, RHOC, RHOSE,
+    iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iPSI, iCLR, iSE,
 )
 
 
@@ -82,6 +82,14 @@ _hlld_kernel = _hlld_module.get_function("hlld_flux_x_kernel")
 # ============================================================
 # GPU Vectorized Operations
 # ============================================================
+# fused single-launch kernels for the hot paths (sieve/fused.py); off on the NumPy fallback
+try:
+    from . import fused as _fz
+    _FUSED = xp.__name__ == "cupy"
+except Exception:                            # pragma: no cover - CPU-only installs
+    _FUSED = False
+
+
 def _ideal(eos):
     return isinstance(eos, (int, float))
 
@@ -93,6 +101,8 @@ def _tracer_is_vf(eos):
 def cons_to_prim(U, gamma):
     """Conservative to primitive -- fully on GPU. gamma is a float (one ideal gas) or an eos.EOS;
     with a volume-fraction tracer U[RHOC] holds the fraction itself, not rho times it."""
+    if _FUSED and _ideal(gamma):
+        return _fz.cons_to_prim_ideal(U, gamma)
     W = xp.empty_like(U)
     rho = xp.maximum(U[RHO], FLOOR_RHO)
     ri = 1.0 / rho
@@ -105,6 +115,7 @@ def cons_to_prim(U, gamma):
     W[iBZ] = U[BZ]
     W[iPSI] = U[PSI]
     W[iCLR] = U[RHOC] if _tracer_is_vf(gamma) else U[RHOC] * ri
+    W[iSE] = U[RHOSE] * ri
     KE = 0.5 * rho * (W[iVX]**2 + W[iVY]**2 + W[iVZ]**2)
     ME = 0.5 * (U[BX]**2 + U[BY]**2 + U[BZ]**2)
     if _ideal(gamma):
@@ -117,6 +128,8 @@ def cons_to_prim(U, gamma):
 
 def prim_to_cons(W, gamma):
     """Primitive to conservative -- fully on GPU."""
+    if _FUSED and _ideal(gamma):
+        return _fz.prim_to_cons_ideal(W, gamma)
     U = xp.empty_like(W)
     rho = xp.maximum(W[iRHO], FLOOR_RHO)
     U[RHO] = rho
@@ -128,6 +141,7 @@ def prim_to_cons(W, gamma):
     U[BZ] = W[iBZ]
     U[PSI] = W[iPSI]
     U[RHOC] = W[iCLR] if _tracer_is_vf(gamma) else rho * W[iCLR]
+    U[RHOSE] = rho * W[iSE]
     KE = 0.5 * rho * (W[iVX]**2 + W[iVY]**2 + W[iVZ]**2)
     ME = 0.5 * (W[iBX]**2 + W[iBY]**2 + W[iBZ]**2)
     if _ideal(gamma):
@@ -154,7 +168,7 @@ def pressure_margin(U, gamma):
     return gamma.pressure(rho, eps, a) - gamma.p_min(rho, a)
 
 
-def radiate(U, gamma, coeff, T_min, tracer_max, dt):
+def radiate(U, gamma, coeff, T_min, tracer_max, dt, electron_Z=None):
     """Optically thin bremsstrahlung over dt, in place on U[EN]; returns the energy removed per cell.
 
     Q = coeff rho^2 sqrt(theta), theta = p/rho. At fixed density the internal energy changes as
@@ -163,13 +177,23 @@ def radiate(U, gamma, coeff, T_min, tracer_max, dt):
     only where the liner fraction is below tracer_max. Exact, so no stability limit on dt."""
     W = cons_to_prim(U, gamma)
     rho, p, a = W[iRHO], W[iPR], xp.clip(W[iCLR], 0.0, 1.0)
-    theta = p / rho
+    if electron_Z is not None:               # two-temperature: the electrons radiate, at T_e
+        from . import twotemp
+        Z = electron_Z
+        _, _, pe = twotemp.pressures(U, gamma)
+        theta = (1 + Z) / Z * pe / rho
+        phi1 = Z / ((1 + Z) * (gamma - 1))   # d eps_e / d(rho theta_e)
+    else:
+        theta = p / rho
+        phi1 = 1.0 / (gamma - 1) if _ideal(gamma) else gamma.coeffs(rho, a)[0]
     on = (theta > T_min) & (a < tracer_max)
-    phi1 = 1.0 / (gamma - 1) if _ideal(gamma) else gamma.coeffs(rho, a)[0]
     K = coeff * rho / phi1
     s = xp.maximum(xp.sqrt(theta) - 0.5 * K * dt, np.sqrt(T_min))
     dE = xp.where(on, phi1 * rho * (theta - s * s), 0.0)
     U[EN] -= dE
+    if electron_Z is not None:
+        from . import twotemp
+        twotemp.set_pe(U, pe - (gamma - 1) * dE, gamma)
     return dE
 
 
@@ -180,7 +204,7 @@ def _along(nd, axis, s, rest=slice(None)):
     return tuple(idx)
 
 
-def vf_advection_rate(F, WL, WR, a_c, axis, h):
+def vf_advection_rate(F, WL, WR, a_c, axis, h, wf=None, wc=None):
     """Volume-fraction tracer, da/dt + u.grad(a) = 0, along one spatial axis: -(div(u a) - a div u) with the
     face a the HLLD kernel used for the energy flux (F_a = mass flux * a_upwind) and u_f = mass flux /
     upwind density. F, WL, WR hold the faces along `axis` (variables first); a_c is the tracer on the
@@ -192,7 +216,19 @@ def vf_advection_rate(F, WL, WR, a_c, axis, h):
     ua = u_f * a_f
     nd, n = a_c.ndim, a_c.shape[axis]
     hi, lo = _along(nd, axis, slice(1, 1 + n)), _along(nd, axis, slice(0, n))
+    if wf is not None:                       # cylindrical radius: face weights r_f, cell weights r_c
+        ua, u_f = ua * wf, u_f * wf
+        return -((ua[hi] - ua[lo]) - a_c * (u_f[hi] - u_f[lo])) / (h * wc)
     return -((ua[hi] - ua[lo]) - a_c * (u_f[hi] - u_f[lo])) / h
+
+
+def braginskii_kperp_ratio(x):
+    """Braginskii (1965) electron k_perp / k_par, Z = 1: (4.664 x^2 + 11.92) / (3.1616 (x^4 + 14.79 x^2 + 3.7703))"""
+    return (4.664 * x * x + 11.92) / (3.1616 * (x**4 + 14.79 * x * x + 3.7703))
+
+
+def _kperp(kpar, x, perp):
+    return kpar * braginskii_kperp_ratio(x) if perp == "braginskii" else kpar / (1.0 + x * x)
 
 
 def _vl(a, b):
@@ -208,7 +244,8 @@ def _pad1(f, periodic):
     return f
 
 
-def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=2.5):
+def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=2.5, radial=None, wall_T=None,
+                   perp="braginskii"):
     """-div q for magnetized (Braginskii-type) conduction on interior cells, 2D or 3D:
         q = -[k_perp I + (k_par - k_perp) b b] . grad(theta),  k_par = kappa0 theta^T_exp,
         k_perp = k_par / (1 + x^2),  x = omega_ce tau_e = x0 |B| theta^1.5 / rho.
@@ -216,7 +253,11 @@ def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=
     gradients: van Leer limited average of the four one-sided differences around the face (Sharma &
     Hammett 2007), which keeps strongly anisotropic conduction from moving heat from cold to hot. Faces
     touching the liner (tracer >= tracer_max) and non-periodic domain faces carry no heat.
-    theta, rho, a: interior arrays; B: three interior arrays (Bz enters |B| and b in 2D)."""
+    theta, rho, a: interior arrays; B: three interior arrays (Bz enters |B| and b in 2D).
+    radial = (r_faces, r_cells) along axis 0 for cylindrical geometry: div q = (1/r) d(r q_r)/dr + ...
+    wall_T: if given, a face between fuel and liner conducts from the fuel cell to a wall at temperature wall_T
+    on the face (half a cell away, i.e. a Dirichlet condition with the fuel's anisotropic k); the heat goes into
+    the liner cell, so energy stays conserved. Otherwise such faces are insulating."""
     nd = theta.ndim
     tp, rp, ap = (_pad1(f, periodic) for f in (theta, rho, a))
     Bp = [_pad1(f, periodic) for f in B]
@@ -232,8 +273,18 @@ def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=
         tf = xp.maximum(0.5 * (tp[L] + tp[R]), 0.0)
         kpar = kappa0 * tf**T_exp
         x = x0 * Bm * tf**1.5 / (0.5 * (rp[L] + rp[R]))
-        kperp = kpar / (1.0 + x * x)
+        kperp = _kperp(kpar, x, perp)
         bg = b[ax] * gn
+        fuelL, fuelR = ap[L] < tracer_max, ap[R] < tracer_max
+        wall = wall_T is not None
+        if wall:                                 # fuel on one side, liner on the other: conduct to the wall
+            wL = fuelL & ~fuelR
+            tf = xp.where(wL, tp[L], tp[R])
+            gw = xp.where(wL, wall_T - tp[L], tp[R] - wall_T) / (0.5 * h[ax])
+            kw = kappa0 * tf**T_exp
+            xw = x0 * Bm * tf**1.5 / xp.where(wL, rp[L], rp[R])
+            kpw = _kperp(kw, xw, perp)
+            bgw = b[ax] * gw
         for t in range(nd):
             if t == ax:
                 continue
@@ -244,12 +295,23 @@ def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=
                 c, up, dn = tuple(c), tuple(up), tuple(dn)
                 side.append(_vl((tp[c] - tp[dn]) / h[t], (tp[up] - tp[c]) / h[t]))
             bg = bg + b[t] * _vl(side[0], side[1])
+            if wall:                             # transverse gradient from the fuel side only
+                bgw = bgw + b[t] * xp.where(wL, side[0], side[1])
         q = -(kperp * gn + (kpar - kperp) * b[ax] * bg)
-        q = xp.where((ap[L] < tracer_max) & (ap[R] < tracer_max), q, 0.0)
+        if wall:
+            qw = -(kpw * gw + (kw - kpw) * b[ax] * bgw)
+            q = xp.where(fuelL & fuelR, q, xp.where(fuelL ^ fuelR, qw, 0.0))
+        else:
+            q = xp.where(fuelL & fuelR, q, 0.0)
         if not periodic[ax]:
             n = q.shape[ax]
             q[_along(nd, ax, 0)] = 0.0
             q[_along(nd, ax, n - 1)] = 0.0
+        if ax == 0 and radial is not None:
+            q = q * radial[0].reshape((-1,) + (1,) * (nd - 1))
+            div -= ((q[_along(nd, ax, slice(1, None))] - q[_along(nd, ax, slice(0, -1))])
+                    / (h[ax] * radial[1].reshape((-1,) + (1,) * (nd - 1))))
+            continue
         div -= (q[_along(nd, ax, slice(1, None))] - q[_along(nd, ax, slice(0, -1))]) / h[ax]
     return div
 
@@ -282,7 +344,8 @@ def rkl2(y0, L, dt, dt_expl, s_max=60):
     return y, s * nsub
 
 
-def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5):
+def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5, radial=None, wall_T=None,
+            perp="braginskii", electron_Z=None):
     """Split step: anisotropic conduction over dt on the interior conservative array U (in place on U[EN]),
     with density, momentum and B frozen, by RKL2. Returns the number of stages used (0 if nothing to do)."""
     rho = xp.maximum(U[RHO], FLOOR_RHO)
@@ -291,26 +354,44 @@ def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5):
     fixed = 0.5 * (U[MX]**2 + U[MY]**2 + U[MZ]**2) / rho + 0.5 * (U[BX]**2 + U[BY]**2 + U[BZ]**2)
     B = (U[BX], U[BY], U[BZ])
 
-    def theta_of(E):
+    def p_of(E):
         eps = E - fixed
-        p = (gamma - 1) * eps if _ideal(gamma) else gamma.pressure(rho, eps, a)
-        return xp.maximum(p, 0.0) / rho
+        return (gamma - 1) * eps if _ideal(gamma) else gamma.pressure(rho, eps, a)
+
+    if electron_Z is not None:               # two-temperature: electron conduction at T_e, ions held fixed
+        from . import twotemp
+        Z = electron_Z
+        _, p_start, pe_start = twotemp.pressures(U, gamma)
+        p_ion = p_start - pe_start
+
+        def theta_of(E):
+            return (1 + Z) / Z * xp.maximum(p_of(E) - p_ion, 0.0) / rho
+    else:
+        def theta_of(E):
+            return xp.maximum(p_of(E), 0.0) / rho
 
     def rate(E):
-        return conduction_div(theta_of(E), B, rho, a, kappa0, x0, tracer_max, h, periodic)
+        return conduction_div(theta_of(E), B, rho, a, kappa0, x0, tracer_max, h, periodic, radial=radial,
+                              wall_T=wall_T, perp=perp)
 
     # forward-Euler limit from the largest diffusivity k_par / (rho phi1), phi1 = d eps / d p
     phi1 = 1.0 / (gamma - 1) if _ideal(gamma) else gamma.coeffs(rho, a)[0]
+    if electron_Z is not None:
+        phi1 = electron_Z / ((1 + electron_Z) * (gamma - 1))
     D = xp.where(a < tracer_max, kappa0 * theta_of(U[EN])**2.5 / (rho * phi1), 0.0)
     D_max = float(xp.max(D))
     if D_max <= 0:
         return 0
     dt_expl = cfl / (2.0 * D_max * sum(1.0 / hh**2 for hh in h))
+    if wall_T is not None:
+        dt_expl *= 0.5                           # a wall face sits half a cell away: twice the stiffness
     U[EN], stages = rkl2(U[EN], rate, dt, dt_expl)
+    if electron_Z is not None:
+        twotemp.set_pe(U, xp.maximum(p_of(U[EN]) - p_ion, 0.0), gamma)
     return stages
 
 
-def conduction_rate(U, gamma, kappa0, x0, tracer_max, h, periodic):
+def conduction_rate(U, gamma, kappa0, x0, tracer_max, h, periodic, radial=None, wall_T=None, perp="braginskii"):
     """Instantaneous -div q (energy per volume per time) of the conduction model for a conservative
     interior array U: a diagnostic (e.g. heat leaving a hot spot, or the same with x0 = 0 to see how much
     the field insulates). The time integration is done by conduct()."""
@@ -318,7 +399,7 @@ def conduction_rate(U, gamma, kappa0, x0, tracer_max, h, periodic):
     rho = xp.maximum(W[iRHO], FLOOR_RHO)
     theta = xp.maximum(W[iPR], 0.0) / rho
     return conduction_div(theta, (W[iBX], W[iBY], W[iBZ]), rho, xp.clip(W[iCLR], 0.0, 1.0), kappa0, x0,
-                          tracer_max, h, periodic)
+                          tracer_max, h, periodic, radial=radial, wall_T=wall_T, perp=perp)
 
 
 def sound_speed2(W, gamma):
@@ -341,6 +422,12 @@ def _floor_faces(WL, WR, eos):
 
 def muscl_x(W, eos=None):
     """MUSCL reconstruction in x -- GPU vectorized with van Leer limiter."""
+    if _FUSED:
+        e = 1.4 if eos is None else eos
+        WL, WR = _fz.muscl(W, 0, floor_p=_ideal(e))
+        if not _ideal(e):
+            _floor_faces(WL, WR, e)
+        return WL, WR
     dm = W[:, 1:-1, :] - W[:, :-2, :]
     dp = W[:, 2:, :] - W[:, 1:-1, :]
     ab = dm * dp
@@ -353,6 +440,12 @@ def muscl_x(W, eos=None):
 
 def muscl_y(W, eos=None):
     """MUSCL reconstruction in y -- GPU vectorized with van Leer limiter."""
+    if _FUSED:
+        e = 1.4 if eos is None else eos
+        WL, WR = _fz.muscl(W, 1, floor_p=_ideal(e))
+        if not _ideal(e):
+            _floor_faces(WL, WR, e)
+        return WL, WR
     dm = W[:, :, 1:-1] - W[:, :, :-2]
     dp = W[:, :, 2:] - W[:, :, 1:-1]
     ab = dm * dp
@@ -366,7 +459,7 @@ def muscl_y(W, eos=None):
 _NO_EOS = None
 
 
-def hlld_flux_x(WL, WR, gamma, ch):
+def hlld_flux_x(WL, WR, gamma, ch, axn=0):
     """HLLD flux using CUDA kernel -- one thread per interface. With an eos.EOS the kernel gets each face
     state's internal energy and squared sound speed instead of one gamma."""
     global _NO_EOS
@@ -391,20 +484,15 @@ def hlld_flux_x(WL, WR, gamma, ch):
         (WL, WR, F, smax_arr,
          np.int32(n_faces), np.float64(g0), np.float64(ch),
          np.float64(FLOOR_RHO), np.float64(FLOOR_PR),
-         eL, eR, c2L, c2R, np.int32(use_eos))
+         eL, eR, c2L, c2R, np.int32(use_eos), np.int32(axn))
     )
 
-    smax = float(xp.max(smax_arr))
-    return F, smax
+    return F, smax_arr                       # per-face max signal speed, left on the device (no sync)
 
 
 def hlld_flux_y(WL, WR, gamma, ch):
-    """HLLD flux in y by coordinate rotation."""
-    perm = list(range(NVAR))
-    perm[int(iVX)], perm[int(iVY)] = int(iVY), int(iVX)
-    perm[int(iBX)], perm[int(iBY)] = int(iBY), int(iBX)
-    Fr, sm = hlld_flux_x(WL[perm], WR[perm], gamma, ch)
-    return Fr[perm], sm
+    """HLLD flux in y (the kernel rotates the components itself)"""
+    return hlld_flux_x(WL, WR, gamma, ch, axn=1)
 
 
 # ============================================================
@@ -724,7 +812,7 @@ def face_eta(eta, axis, mean="harmonic"):
     return 2.0 * a * b / xp.maximum(a + b, 1e-300)
 
 
-def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic"):
+def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic", rc=None, rf=None):
     """Resistive induction and energy terms in conservative form.
 
     Induction: dB/dt = -curl(eta J), J = curl(B), with all three current
@@ -742,12 +830,14 @@ def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic"):
     [1:-1, 1:-1] (diagnostic only), built from each current component on the faces
     where its derivative is compact. In 1D it equals the discrete magnetic energy
     loss exactly (summation by parts).
+    rc, rf: cell and face radii along x for cylindrical geometry (x = r, y = z, z = -phi): then the axial
+    current on r-faces is -(1/r) d(r B_w)/dr and the energy flux divergence is r-weighted.
     """
     R = xp.zeros_like(U)
     Gx = xp.zeros((U.shape[1] - 1, U.shape[2]), dtype=U.dtype)
     Gy = xp.zeros((U.shape[1], U.shape[2] - 1), dtype=U.dtype)
     q = xp.zeros(U.shape[1:], dtype=U.dtype)
-    if eta_max_of(eta) <= 0:
+    if isinstance(eta, (int, float)) and eta <= 0:
         return R, Gx, Gy, q
     ex = face_eta(eta, 0, face_mean)
     ey = face_eta(eta, 1, face_mean)
@@ -764,7 +854,11 @@ def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic"):
 
     # Currents on x-faces (i+1/2, j): compact normal derivative, averaged transverse.
     Jx_xf = 0.5 * (dBz_dy[1:, :] + dBz_dy[:-1, :])
-    Jy_xf = -(Bz[1:, :] - Bz[:-1, :]) / dx
+    if rc is None:
+        Jy_xf = -(Bz[1:, :] - Bz[:-1, :]) / dx
+    else:
+        rcc, rff = rc[:, None], rf[1:-1, None]
+        Jy_xf = -(rcc[1:] * Bz[1:, :] - rcc[:-1] * Bz[:-1, :]) / (dx * xp.where(rff == 0, 1.0, rff))
     Jz_xf = (By[1:, :] - By[:-1, :]) / dx - 0.5 * (dBx_dy[1:, :] + dBx_dy[:-1, :])
 
     # Currents on y-faces (i, j+1/2).
@@ -787,8 +881,13 @@ def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic"):
     Bx_yf = 0.5 * (Bx[:, 1:] + Bx[:, :-1]); Bz_yf = 0.5 * (Bz[:, 1:] + Bz[:, :-1])
     Gx[...] = Ey_xf * Bz_xf - Ez_xf * By_xf
     Gy[...] = Ez_yf * Bx_yf - Ex_yf * Bz_yf
-    R[EN, 1:-1, 1:-1] = (-(Gx[1:, 1:-1] - Gx[:-1, 1:-1]) / dx
-                         - (Gy[1:-1, 1:] - Gy[1:-1, :-1]) / dy)
+    if rc is None:
+        R[EN, 1:-1, 1:-1] = (-(Gx[1:, 1:-1] - Gx[:-1, 1:-1]) / dx
+                             - (Gy[1:-1, 1:] - Gy[1:-1, :-1]) / dy)
+    else:
+        rG = Gx * rf[1:-1, None]
+        R[EN, 1:-1, 1:-1] = (-(rG[1:, 1:-1] - rG[:-1, 1:-1]) / (dx * rc[1:-1, None])
+                             - (Gy[1:-1, 1:] - Gy[1:-1, :-1]) / dy)
 
     # Ohmic heating: Jy is compact on x-faces, Jx on y-faces, Jz on both (half weight each)
     qx = Ey_xf * Jy_xf + 0.5 * Ez_xf * Jz_xf
@@ -796,39 +895,3 @@ def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic"):
     q[1:-1, 1:-1] = (0.5 * (qx[1:, 1:-1] + qx[:-1, 1:-1])
                      + 0.5 * (qy[1:-1, 1:] + qy[1:-1, :-1]))
     return R, Gx, Gy, q
-
-    Bx, By, Bz = U[BX], U[BY], U[BZ]
-
-    # Cell-centred transverse derivatives (zero on the outermost ring).
-    dBx_dy = xp.zeros_like(Bx); dBz_dy = xp.zeros_like(Bz)
-    dBy_dx = xp.zeros_like(By); dBz_dx = xp.zeros_like(Bz)
-    dBx_dy[:, 1:-1] = (Bx[:, 2:] - Bx[:, :-2]) / (2.0 * dy)
-    dBz_dy[:, 1:-1] = (Bz[:, 2:] - Bz[:, :-2]) / (2.0 * dy)
-    dBy_dx[1:-1, :] = (By[2:, :] - By[:-2, :]) / (2.0 * dx)
-    dBz_dx[1:-1, :] = (Bz[2:, :] - Bz[:-2, :]) / (2.0 * dx)
-
-    # Currents on x-faces (i+1/2, j): compact normal derivative, averaged transverse.
-    Jx_xf = 0.5 * (dBz_dy[1:, :] + dBz_dy[:-1, :])
-    Jy_xf = -(Bz[1:, :] - Bz[:-1, :]) / dx
-    Jz_xf = (By[1:, :] - By[:-1, :]) / dx - 0.5 * (dBx_dy[1:, :] + dBx_dy[:-1, :])
-
-    # Currents on y-faces (i, j+1/2).
-    Jx_yf = (Bz[:, 1:] - Bz[:, :-1]) / dy
-    Jz_yf = 0.5 * (dBy_dx[:, 1:] + dBy_dx[:, :-1]) - (Bx[:, 1:] - Bx[:, :-1]) / dy
-
-    # Induction, curl form: dBx/dt = -d(eta Jz)/dy, dBy/dt = d(eta Jz)/dx,
-    # dBz/dt = -d(eta Jy)/dx + d(eta Jx)/dy.
-    R[BX, 1:-1, 1:-1] = -eta * (Jz_yf[1:-1, 1:] - Jz_yf[1:-1, :-1]) / dy
-    R[BY, 1:-1, 1:-1] = eta * (Jz_xf[1:, 1:-1] - Jz_xf[:-1, 1:-1]) / dx
-    R[BZ, 1:-1, 1:-1] = (-eta * (Jy_xf[1:, 1:-1] - Jy_xf[:-1, 1:-1]) / dx
-                         + eta * (Jx_yf[1:-1, 1:] - Jx_yf[1:-1, :-1]) / dy)
-
-    # Resistive Poynting flux eta (J x B) on faces.
-    Bx_xf = 0.5 * (Bx[1:, :] + Bx[:-1, :]); By_xf = 0.5 * (By[1:, :] + By[:-1, :])
-    Bz_xf = 0.5 * (Bz[1:, :] + Bz[:-1, :])
-    Bx_yf = 0.5 * (Bx[:, 1:] + Bx[:, :-1]); Bz_yf = 0.5 * (Bz[:, 1:] + Bz[:, :-1])
-    Gx[...] = eta * (Jy_xf * Bz_xf - Jz_xf * By_xf)
-    Gy[...] = eta * (Jz_yf * Bx_yf - Jx_yf * Bz_yf)
-    R[EN, 1:-1, 1:-1] = (-(Gx[1:, 1:-1] - Gx[:-1, 1:-1]) / dx
-                         - (Gy[1:-1, 1:] - Gy[1:-1, :-1]) / dy)
-    return R, Gx, Gy

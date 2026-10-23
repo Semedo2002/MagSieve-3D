@@ -21,11 +21,17 @@ matplotlib.rcParams.update({
 
 from .config import (
     Config, NVAR, FLOOR_RHO, FLOOR_PR,
-    RHO, MX, MY, MZ, BX, BY, BZ, EN, PSI, RHOC,
+    RHO, MX, MY, MZ, BX, BY, BZ, EN, PSI, RHOC, RHOSE,
     iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iPSI, iCLR,
 )
 from .diagnostics import diagnostics_for_solver
 from .eos import make_eos
+from . import ct
+from . import fused
+from . import transport
+from . import twotemp
+from .viscosity import viscous_step
+from . import strength as stren
 from .physics import (
     xp, cp,
     cons_to_prim, prim_to_cons,
@@ -109,11 +115,27 @@ class MHDSolver:
         # float gamma for one ideal gas, eos.EOS for two materials
         self.eos = make_eos(config)
         self._vf = not isinstance(self.eos, (int, float)) and self.eos.volume_fraction
+        # constrained transport: face fields Bf = [Bx on x-faces, By on y-faces], built from U on first use
+        self.ct = config.div_b == "ct"
+        self.Bf = None
+        self._faces_owner = None
+        self.cyl = config.geometry == "cylindrical"
+        self.strength = config.strength
+        if self.cyl and abs(config.x_min) > 0:
+            raise ValueError("cylindrical geometry needs x_min = 0 (the axis)")
         self.ng = 2
         self.nx_tot = config.nx + 2 * self.ng
         self.ny_tot = config.ny + 2 * self.ng
 
         self.x = xp.asarray(config.x_min + (np.arange(self.nx_tot) - self.ng + 0.5) * config.dx)
+        # radii (cylindrical) and the interior cell volume element, dx dy or r dr dz (per radian)
+        self.rf = xp.asarray(config.x_min + (np.arange(self.nx_tot + 1) - self.ng) * config.dx)
+        self.rc = self.x
+        self._r0, self._r1 = config.x_min, config.x_max          # radii of the x boundaries (no device reads)
+        if config.geometry == "cylindrical":
+            self.dV = (self.rc[self.ng:self.ng + config.nx] * config.dx * config.dy)[:, None]
+        else:
+            self.dV = config.dx * config.dy
         self.y = xp.asarray(config.y_min + (np.arange(self.ny_tot) - self.ng + 0.5) * config.dy)
         self.X, self.Y = xp.meshgrid(self.x, self.y, indexing='ij')
 
@@ -121,6 +143,10 @@ class MHDSolver:
         self.U_temp = xp.empty_like(self.U)
         self.U_stage = xp.empty_like(self.U)
         self.dU = xp.empty_like(self.U)
+        if config.strength:                          # deviatoric stress (S_xx, S_yy, S_xy) and damage
+            self.S = xp.zeros((4, self.nx_tot, self.ny_tot))
+            self._S1 = xp.zeros_like(self.S)
+            self._dS = xp.zeros_like(self.S)
         self.t = 0.0
         self.step = 0
         self.dt = 0.0
@@ -360,6 +386,11 @@ class MHDSolver:
             for i in range(ng):
                 U[:, i, :] = U[:, ng, :]
                 U[:, -(i+1), :] = U[:, -(ng+1), :]
+            if self.cyl:                             # axis: mirror, odd in v_r, v_phi, B_r, B_phi
+                for k in range(ng):
+                    U[:, ng - 1 - k, :] = U[:, ng + k, :]
+                for v in (MX, MZ, BX, BZ):
+                    U[v, :ng, :] = -U[v, :ng, :]
         else:
             raise ValueError(f"Unknown bc_x_type {bc_x!r}")
         if cfg.bc_y_type == "periodic":
@@ -418,7 +449,11 @@ class MHDSolver:
         cfg = self.cfg
         rho = xp.maximum(W[iRHO], FLOOR_RHO)
         B2 = W[iBX]**2 + W[iBY]**2 + W[iBZ]**2
-        cf = xp.sqrt(sound_speed2(W, self.eos) + B2 / rho)
+        c2 = sound_speed2(W, self.eos)
+        if self.strength:                            # longitudinal elastic waves: c^2 + 4 G / (3 rho)
+            G = cfg.shear_modulus * xp.clip(W[iCLR], 0, 1) * (1 - self.S[stren.DMG])
+            c2 = c2 + 4.0 * G / (3.0 * rho)
+        cf = xp.sqrt(c2 + B2 / rho)
         sx = xp.abs(W[iVX]) + cf
         sy = xp.abs(W[iVY]) + cf
         # GLM speed = largest MHD signal speed (Dedner et al. 2002). psi waves
@@ -430,6 +465,13 @@ class MHDSolver:
                      cfg.glm_ch / min(cfg.dx, cfg.dy))
         dt = cfg.cfl / inv_dt if inv_dt > 1e-14 else cfg.cfl * min(cfg.dx, cfg.dy)
         self._dt_limiter = "hyperbolic"
+        if cfg.nernst_coeff > 0:                     # Nernst advection of B
+            vx, vy, _, _, _ = transport.nernst_velocity(W, cfg.nernst_coeff, cfg.cond_x0, cfg.cond_tracer_max,
+                                                        cfg.dx, cfg.dy, None)
+            vN = float(xp.max(xp.maximum(xp.abs(vx) / cfg.dx, xp.abs(vy) / cfg.dy)))
+            if vN > 0 and cfg.cfl / vN < dt:
+                dt = cfg.cfl / vN
+                self._dt_limiter = "nernst"
         if cfg.is_resistive():
             # Explicit diffusion of B: FTCS 2D limit dt <= 1 / (2 eta (1/dx^2 + 1/dy^2))
             # (= dx^2 / 4 eta for dx = dy); SSP-RK3 is stable to ~2.5x this.
@@ -475,21 +517,124 @@ class MHDSolver:
         S[EN] = -divB * vB
         return S
 
-    def compute_rhs(self, U, out=None):
+    def _ct_sync(self):
+        """build the face fields from self.U if it was (re)assigned since they were made; cell B becomes the
+        face average (total energy unchanged)"""
+        if not self.ct or self._faces_owner is self.U:
+            return
+        U = self.U
+        if self.cyl:
+            self.apply_bc(U)
+        self.Bf = ct.faces_from_cells(U, 2)
+        if self.cyl:
+            self.Bf[0][self.ng] = 0.0                    # B_r = 0 on the axis
+        ct.cells_from_faces(U, self.Bf, (slice(None), slice(None)))   # E kept, so the budget is unaffected
+        self._faces_owner = U
+        self._Bf1 = [xp.empty_like(f) for f in self.Bf]
+        self._dBf = [xp.empty_like(f) for f in self.Bf]
+
+    def set_vector_potential(self, Az):
+        """Set the in-plane field from Az(x, y) (numpy callable, evaluated on cell corners): faces are its
+        discrete curl, so div B = 0 to round-off; cell B and the magnetic energy in E follow, pressure kept.
+        Call after setting U."""
+        cfg, ng = self.cfg, self.ng
+        xf = cfg.x_min + (np.arange(self.nx_tot + 1) - ng) * cfg.dx
+        yf = cfg.y_min + (np.arange(self.ny_tot + 1) - ng) * cfg.dy
+        Bf = ct.faces_from_potential(Az, (to_numpy(self.x), to_numpy(self.y)), (xf, yf))
+        U = self.U
+        B2 = U[BX]**2 + U[BY]**2
+        if self.ct:
+            self.Bf = Bf
+            self._faces_owner = U
+            self._Bf1 = [xp.empty_like(f) for f in Bf]
+            self._dBf = [xp.empty_like(f) for f in Bf]
+        ct.cells_from_faces(U, Bf, (slice(None), slice(None)))
+        U[EN] += 0.5 * (U[BX]**2 + U[BY]**2 - B2)
+
+    def _te_sync(self):
+        """two-temperature: start electrons at T_e = T_i where the electron entropy was never set"""
+        if not self.cfg.two_temp or getattr(self, "_te_owner", None) is self.U:
+            return
+        if float(xp.max(xp.abs(self.U[RHOSE]))) == 0.0:
+            twotemp.init_equal(self.U, self.cfg.gamma, self.cfg.z_ion)
+        self._te_owner = self.U
+
+    def temperatures(self):
+        """(theta_e, theta_i) on all cells; equal to p/rho without two_temp"""
+        if self.cfg.two_temp:
+            self._te_sync()
+            return twotemp.temperatures(self.U, self.cfg.gamma, self.cfg.z_ion)
+        W = cons_to_prim(self.U, self.eos)
+        return W[iPR] / W[iRHO], W[iPR] / W[iRHO]
+
+    def _axis_faces(self, Bf):
+        """faces behind the axis: B_r odd, B_z even"""
+        ng = self.ng
+        Bf[0][ng] = 0.0
+        for k in range(1, ng + 1):
+            Bf[0][ng - k] = -Bf[0][ng + k]
+        for k in range(ng):
+            Bf[1][ng - 1 - k] = Bf[1][ng + k]
+
+    def _periodic(self):
+        return (self.cfg.get_bc_x() == "periodic", self.cfg.bc_y_type == "periodic")
+
+    def div_b_max(self):
+        """max |div B| h / max |B| on interior cells: face divergence with CT, central differences with GLM"""
+        cfg, ng = self.cfg, self.ng
+        if self.ct and self.cyl:
+            self._ct_sync()
+            Bx, By = self.Bf
+            rf, rc = self.rf[ng:ng + cfg.nx + 1, None], self.rc[ng:ng + cfg.nx, None]
+            rB = Bx[ng:ng + cfg.nx + 1, ng:ng + cfg.ny] * rf
+            d = (rB[1:] - rB[:-1]) / (rc * cfg.dx) + (By[ng:ng + cfg.nx, ng + 1:ng + cfg.ny + 1]
+                                                      - By[ng:ng + cfg.nx, ng:ng + cfg.ny]) / cfg.dy
+        elif self.ct:
+            self._ct_sync()
+            d = ct.div_faces(self.Bf, (cfg.dx, cfg.dy), ng, (cfg.nx, cfg.ny))
+        else:
+            W = cons_to_prim(self.U, self.eos)
+            d = ((W[iBX][ng+1:-ng+1 or None, ng:-ng] - W[iBX][ng-1:-ng-1, ng:-ng]) / (2 * cfg.dx)
+                 + (W[iBY][ng:-ng, ng+1:-ng+1 or None] - W[iBY][ng:-ng, ng-1:-ng-1]) / (2 * cfg.dy))
+        Bm = float(xp.max(xp.sqrt(self.U[BX]**2 + self.U[BY]**2 + self.U[BZ]**2)))
+        return float(xp.max(xp.abs(d))) * min(cfg.dx, cfg.dy) / max(Bm, 1e-300)
+
+    def compute_rhs(self, U, out=None, Bf=None, dBf=None, S=None, dS=None):
         cfg = self.cfg; ng = self.ng; nx = cfg.nx; ny = cfg.ny
         g = cfg.gamma; ch = self._glm_ch_frozen
+        inner = (slice(ng, ng + nx), slice(ng, ng + ny))
+        if self.ct:
+            ch = 0.0
+            ct.cells_from_faces(U, Bf, inner)
         U = self.apply_bc(U)
+        if self.ct:
+            ct.ghost_faces(Bf, U, ng, (nx, ny), self._periodic())
+            if self.cyl:
+                self._axis_faces(Bf)
         eos = self.eos
         W = cons_to_prim(U, eos)
+        if self.strength:
+            stren.bc(S, ng, nx, ny, self._periodic(), self.cyl)
+            spalled = (S[stren.DMG] > 0.5) & (W[iCLR] > 0.5)       # spalled liner carries no tension
+            W[iPR] = xp.where(spalled, xp.maximum(W[iPR], 0.0), W[iPR])
         WLx, WRx = muscl_x(W, eos); s = WLx.shape
+        if self.ct:                                  # normal field on a face is the face value
+            WLx[iBX] = WRx[iBX] = Bf[0][2:self.nx_tot - 1, :]
         Fx, _ = hlld_flux_x(xp.ascontiguousarray(WLx.reshape(NVAR, -1)),
                              xp.ascontiguousarray(WRx.reshape(NVAR, -1)), eos, ch)
         Fx = Fx.reshape(s)
         WLy, WRy = muscl_y(W, eos); s2 = WLy.shape
+        if self.ct:
+            WLy[iBY] = WRy[iBY] = Bf[1][:, 2:self.ny_tot - 1]
         Fy, _ = hlld_flux_y(xp.ascontiguousarray(WLy.reshape(NVAR, -1)),
                              xp.ascontiguousarray(WRy.reshape(NVAR, -1)), eos, ch)
         Fy = Fy.reshape(s2)
-        dFx = Fx[:, 1:1+nx, :] - Fx[:, 0:nx, :]
+        if self.cyl:                                 # (1/r) d(r F)/dr with face radii
+            rfx = self.rf[2:self.nx_tot - 1][None, :, None]
+            rFx = Fx * rfx
+            dFx = (rFx[:, 1:1+nx, :] - rFx[:, 0:nx, :]) / self.rc[ng:ng+nx][None, :, None]
+        else:
+            dFx = Fx[:, 1:1+nx, :] - Fx[:, 0:nx, :]
         dFy = Fy[:, :, 1:1+ny] - Fy[:, :, 0:ny]
         R = xp.zeros_like(U) if out is None else out
         R[...] = 0.0
@@ -499,37 +644,127 @@ class MHDSolver:
             # volume fraction: da/dt + u.grad(a) = 0, written as div(u a) - a div(u) with the face a
             # the kernel used for the energy flux (F_a = mass flux * a_upwind), so uniform p and u stay
             # uniform across the material interface
-            R[RHOC, ng:ng+nx, ng:ng+ny] = (self._vf_rate(Fx, WLx, WRx, W, 0, cfg.dx)[:, ng:ng+ny]
+            R[RHOC, ng:ng+nx, ng:ng+ny] = (self._vf_rate(Fx, WLx, WRx, W, 0, cfg.dx, self.cyl)[:, ng:ng+ny]
                                           + self._vf_rate(Fy, WLy, WRy, W, 1, cfg.dy)[ng:ng+nx, :])
         # Net energy inflow through the domain faces, from the same fluxes that
         # update U[EN]. Fx[:, 0] / Fx[:, nx] are the x_min / x_max faces.
-        boundary_rate = (xp.sum(Fx[EN, 0, ng:ng+ny] - Fx[EN, nx, ng:ng+ny]) * cfg.dy
-                         + xp.sum(Fy[EN, ng:ng+nx, 0] - Fy[EN, ng:ng+nx, ny]) * cfg.dx)
+        if self.cyl:
+            r0, r1 = self._r0, self._r1
+            boundary_rate = (xp.sum(r0 * Fx[EN, 0, ng:ng+ny] - r1 * Fx[EN, nx, ng:ng+ny]) * cfg.dy
+                             + xp.sum((Fy[EN, ng:ng+nx, 0] - Fy[EN, ng:ng+nx, ny]) * self.rc[ng:ng+nx]) * cfg.dx)
+        else:
+            boundary_rate = (xp.sum(Fx[EN, 0, ng:ng+ny] - Fx[EN, nx, ng:ng+ny]) * cfg.dy
+                             + xp.sum(Fy[EN, ng:ng+nx, 0] - Fy[EN, ng:ng+nx, ny]) * cfg.dx)
+        if self.cyl:
+            # geometric sources (x = r, y = z, third = -phi): radial momentum (rho w^2 - B_w^2 + p_T)/r,
+            # azimuthal momentum -(rho u w - B_x B_w)/r, B_phi: +F_r[B_w]/r
+            Wi = W[:, ng:ng+nx, ng:ng+ny]
+            ri = self.rc[ng:ng+nx][:, None]
+            pT = Wi[iPR] + 0.5 * (Wi[iBX]**2 + Wi[iBY]**2 + Wi[iBZ]**2)
+            R[MX, ng:ng+nx, ng:ng+ny] += (Wi[iRHO] * Wi[iVZ]**2 - Wi[iBZ]**2 + pT) / ri
+            R[MZ, ng:ng+nx, ng:ng+ny] -= (Wi[iRHO] * Wi[iVX] * Wi[iVZ] - Wi[iBX] * Wi[iBZ]) / ri
+            R[BZ, ng:ng+nx, ng:ng+ny] += (Wi[iVX] * Wi[iBZ] - Wi[iVZ] * Wi[iBX]) / ri
         powell_rate = xp.zeros(())
         ohmic_rate = xp.zeros(())
-        # Powell source for ANY MHD case (uniform or striped)
-        if cfg.powell_source and cfg.is_mhd():
+        # Powell source for ANY MHD case (uniform or striped); not with CT
+        if cfg.powell_source and cfg.is_mhd() and not self.ct:
             S = self._compute_powell_source(U, W)
             R[:, ng:ng+nx, ng:ng+ny] += S[:, ng:ng+nx, ng:ng+ny]
             powell_rate = xp.sum(S[EN, ng:ng+nx, ng:ng+ny]) * cfg.dx * cfg.dy
         # Resistive MHD: -curl(eta J) in induction, -div(eta J x B) in energy
+        eta = None
         if cfg.is_resistive():
             eta = resistivity_field(W, cfg)
-            R_resist, Gx, Gy, q = compute_resistive_terms(U, eta, cfg.dx, cfg.dy, cfg.eta_face_mean)
+            rc_, rf_ = (self.rc, self.rf) if self.cyl else (None, None)
+            R_resist, Gx, Gy, q = compute_resistive_terms(U, eta, cfg.dx, cfg.dy, cfg.eta_face_mean, rc_, rf_)
             R[:, ng:ng+nx, ng:ng+ny] += R_resist[:, ng:ng+nx, ng:ng+ny]
-            ohmic_rate = xp.sum(q[ng:ng+nx, ng:ng+ny]) * cfg.dx * cfg.dy
-            boundary_rate = boundary_rate + (
-                xp.sum(Gx[ng-1, ng:ng+ny] - Gx[ng+nx-1, ng:ng+ny]) * cfg.dy
-                + xp.sum(Gy[ng:ng+nx, ng-1] - Gy[ng:ng+nx, ng+ny-1]) * cfg.dx)
+            ohmic_rate = xp.sum(q[ng:ng+nx, ng:ng+ny] * self.dV)
+            if cfg.two_temp:                         # Ohmic heat goes to the electrons
+                rho_i = W[iRHO, ng:ng+nx, ng:ng+ny]
+                R[RHOSE, ng:ng+nx, ng:ng+ny] += (cfg.gamma - 1) * q[ng:ng+nx, ng:ng+ny] * rho_i**(1 - cfg.gamma)
+            if self.cyl:
+                boundary_rate = boundary_rate + (
+                    xp.sum(self._r0 * Gx[ng-1, ng:ng+ny] - self._r1 * Gx[ng+nx-1, ng:ng+ny]) * cfg.dy
+                    + xp.sum((Gy[ng:ng+nx, ng-1] - Gy[ng:ng+nx, ng+ny-1]) * self.rc[ng:ng+nx]) * cfg.dx)
+            else:
+                boundary_rate = boundary_rate + (
+                    xp.sum(Gx[ng-1, ng:ng+ny] - Gx[ng+nx-1, ng:ng+ny]) * cfg.dy
+                    + xp.sum(Gy[ng:ng+nx, ng-1] - Gy[ng:ng+nx, ng+ny-1]) * cfg.dx)
+        if self.ct:
+            # in-plane B lives on the faces: dB/dt = -curl E with E_z on the cell corners
+            R[BX] = 0.0
+            R[BY] = 0.0
+            E = fused.emf2d(Fx, Fy, W, nx, ny, cfg.dx, cfg.dy)
+            if cfg.nernst_coeff > 0:
+                # Nernst EMF (and the out-of-plane field it carries), Poynting + Ettingshausen energy flux
+                En, dBw, Gnx, Gny, _, divqE = transport.nernst_2d(W, Bf, cfg.nernst_coeff, cfg.cond_x0,
+                                                                  cfg.cond_tracer_max, cfg.dx, cfg.dy, nx, ny)
+                if cfg.two_temp:                     # the Ettingshausen heat flux is carried by the electrons
+                    rho_i = W[iRHO, ng:ng+nx, ng:ng+ny]
+                    R[RHOSE, ng:ng+nx, ng:ng+ny] -= (cfg.gamma - 1) * divqE * rho_i**(1 - cfg.gamma)
+                E = E + En
+                R[BZ, ng:ng+nx, ng:ng+ny] += dBw
+                if self.cyl:
+                    rG = Gnx * self.rf[2:nx + 3][:, None]
+                    R[EN, ng:ng+nx, ng:ng+ny] -= (rG[1:, ng:ng+ny] - rG[:-1, ng:ng+ny]) / (cfg.dx * self.rc[ng:ng+nx][:, None])
+                    boundary_rate = boundary_rate + (
+                        xp.sum(self._r0 * Gnx[0, ng:ng+ny] - self._r1 * Gnx[nx, ng:ng+ny]) * cfg.dy
+                        + xp.sum((Gny[ng:ng+nx, 0] - Gny[ng:ng+nx, ny]) * self.rc[ng:ng+nx]) * cfg.dx)
+                else:
+                    R[EN, ng:ng+nx, ng:ng+ny] -= (Gnx[1:, ng:ng+ny] - Gnx[:-1, ng:ng+ny]) / cfg.dx
+                    boundary_rate = boundary_rate + (
+                        xp.sum(Gnx[0, ng:ng+ny] - Gnx[nx, ng:ng+ny]) * cfg.dy
+                        + xp.sum(Gny[ng:ng+nx, 0] - Gny[ng:ng+nx, ny]) * cfg.dx)
+                R[EN, ng:ng+nx, ng:ng+ny] -= (Gny[ng:ng+nx, 1:] - Gny[ng:ng+nx, :-1]) / cfg.dy
+            if eta is not None:
+                J = ct.edge_current([f[..., None] for f in Bf], 0, 1, cfg.dx, cfg.dy, nx, ny)[..., 0]
+                E = E + ct.edge_eta(eta, nx, ny) * J
+            dBf[0][...] = 0.0
+            dBf[1][...] = 0.0
+            if self.cyl:
+                E[0, :] = 0.0                        # E_phi = 0 on the axis
+                dBf[0][2:nx + 3, 2:ny + 2] = -(E[:, 1:] - E[:, :-1]) / cfg.dy
+                rE = E * self.rf[2:nx + 3][:, None]
+                dBf[1][2:nx + 2, 2:ny + 3] = (rE[1:, :] - rE[:-1, :]) / (cfg.dx * self.rc[2:nx + 2][:, None])
+            else:
+                dBf[0][2:nx + 3, 2:ny + 2] = -(E[:, 1:] - E[:, :-1]) / cfg.dy
+                dBf[1][2:nx + 2, 2:ny + 3] = (E[1:, :] - E[:-1, :]) / cfg.dx
+        if self.strength:
+            G = cfg.shear_modulus * xp.clip(W[iCLR], 0, 1) * (1 - S[stren.DMG])
+            rc_, rf_ = (self.rc, self.rf) if self.cyl else (None, None)
+            dSi, fx, fy, hoop = stren.rates(S, W, Fx, Fy, WLx, WRx, WLy, WRy, G, (cfg.dx, cfg.dy), ng, (nx, ny),
+                                            rc_, rf_)
+            dS[...] = 0.0
+            dS[:, ng:ng+nx, ng:ng+ny] = dSi
+            for var, gx, gy in ((MX, fx[0], fy[0]), (MY, fx[1], fy[1]), (EN, fx[2], fy[2])):
+                if self.cyl:
+                    rg = gx * self.rf[2:nx + 3][:, None]
+                    R[var, ng:ng+nx, ng:ng+ny] -= (rg[1:, ng:ng+ny] - rg[:-1, ng:ng+ny]) / (cfg.dx * self.rc[ng:ng+nx][:, None])
+                else:
+                    R[var, ng:ng+nx, ng:ng+ny] -= (gx[1:, ng:ng+ny] - gx[:-1, ng:ng+ny]) / cfg.dx
+                R[var, ng:ng+nx, ng:ng+ny] -= (gy[ng:ng+nx, 1:] - gy[ng:ng+nx, :-1]) / cfg.dy
+            if self.cyl:
+                R[MX, ng:ng+nx, ng:ng+ny] += hoop
+                r0, r1 = self._r0, self._r1
+                boundary_rate = boundary_rate + (
+                    xp.sum(r0 * fx[2][0, ng:ng+ny] - r1 * fx[2][nx, ng:ng+ny]) * cfg.dy
+                    + xp.sum((fy[2][ng:ng+nx, 0] - fy[2][ng:ng+nx, ny]) * self.rc[ng:ng+nx]) * cfg.dx)
+            else:
+                boundary_rate = boundary_rate + (
+                    xp.sum(fx[2][0, ng:ng+ny] - fx[2][nx, ng:ng+ny]) * cfg.dy
+                    + xp.sum(fy[2][ng:ng+nx, 0] - fy[2][ng:ng+nx, ny]) * cfg.dx)
         self._stage_boundary_rate = boundary_rate
         self._stage_powell_rate = powell_rate
         self._stage_ohmic_rate = ohmic_rate
         return R
 
-    def _vf_rate(self, F, WL, WR, W, axis, h):
+    def _vf_rate(self, F, WL, WR, W, axis, h, radial=False):
         """-(div(u a) - a div u) along one axis, on interior cells along that axis"""
         ng, n = self.ng, (self.cfg.nx if axis == 0 else self.cfg.ny)
         a_c = W[iCLR, ng:ng+n, :] if axis == 0 else W[iCLR, :, ng:ng+n]
+        if radial:
+            return vf_advection_rate(F, WL, WR, a_c, axis, h, self.rf[2:self.nx_tot - 1][:, None],
+                                     self.rc[ng:ng+n][:, None])
         return vf_advection_rate(F, WL, WR, a_c, axis, h)
 
     def _accumulate_energy_budget(self, weight):
@@ -539,18 +774,65 @@ class MHDSolver:
 
     def step_ssprk3(self):
         dt = self.dt; self._glm_ch_frozen = self.cfg.glm_ch
-        U0 = self.U
+        self._ct_sync()
+        self._te_sync()
+        if self.ct and self.cfg.use_cuda_graphs and xp.__name__ == "cupy":
+            self._rk_graph(dt)
+        else:
+            self._rk_core(dt)
+        self._post_step(dt)
 
-        # SSP-RK3: U^{n+1} = U^n + dt (L0 + L1 + 4 L2) / 6
-        self.compute_rhs(U0, out=self.dU)
+    def _rk_graph(self, dt):
+        """the RK core as a captured CUDA graph: captured once (dt read from a device scalar, temporaries from
+        a private memory pool the rest of the code never touches), replayed every step; recaptured if U, the
+        faces or the stress array are replaced"""
+        import cupy as cp
+        key = (id(self.U), id(self.Bf[0]), id(getattr(self, "S", None)))
+        if getattr(self, "_graph_key", None) != key:
+            if getattr(self, "_graph_warm", None) != key:  # first call: run normally so every buffer exists
+                self._graph_warm = key
+                self._rk_core(dt)
+                return
+            self._dtd = cp.zeros(())
+            self._gpool = cp.cuda.MemoryPool()
+            self._gstream = cp.cuda.Stream(non_blocking=True)
+            cp.cuda.Device().synchronize()
+            with cp.cuda.using_allocator(self._gpool.malloc), self._gstream:
+                self._gstream.begin_capture()
+                self._rk_core(self._dtd)
+                self._graph = self._gstream.end_capture()
+            self._graph_key = key
+        self._dtd.fill(dt)
+        cp.cuda.Device().synchronize()
+        self._graph.launch(stream=self._gstream)
+        self._gstream.synchronize()
+
+    def _rk_core(self, dt):
+        """SSP-RK3 stages (U, CT faces, stress); dt is a float or a device scalar"""
+        U0 = self.U
+        F0, F1, dF = (self.Bf, self._Bf1, self._dBf) if self.ct else (None, None, None)
+        S0, S1, dS = (self.S, self._S1, self._dS) if self.strength else (None, None, None)
+
+        # SSP-RK3: U^{n+1} = U^n + dt (L0 + L1 + 4 L2) / 6 (face fields and stress alongside)
+        self.compute_rhs(U0, out=self.dU, Bf=F0, dBf=dF, S=S0, dS=dS)
         self._accumulate_energy_budget(dt / 6.0)
+        if self.strength:
+            xp.add(S0, dt * dS, out=S1)
+        if self.ct:
+            for f0, f1, d in zip(F0, F1, dF):
+                xp.add(f0, dt * d, out=f1)
         xp.multiply(self.dU, dt, out=self.dU)
         xp.add(U0, self.dU, out=self.U_temp)
         self.enforce_scalar_bounds(self.U_temp)
         self.apply_bc(self.U_temp)
 
-        self.compute_rhs(self.U_temp, out=self.dU)
+        self.compute_rhs(self.U_temp, out=self.dU, Bf=F1, dBf=dF, S=S1, dS=dS)
         self._accumulate_energy_budget(dt / 6.0)
+        if self.strength:
+            S1[...] = 0.75 * S0 + 0.25 * (S1 + dt * dS)
+        if self.ct:
+            for f0, f1, d in zip(F0, F1, dF):
+                f1[...] = 0.75 * f0 + 0.25 * (f1 + dt * d)
         xp.multiply(self.dU, dt, out=self.dU)
         xp.add(self.U_temp, self.dU, out=self.U_stage)
         xp.multiply(self.U_stage, 0.25, out=self.U_stage)
@@ -559,8 +841,13 @@ class MHDSolver:
         self.enforce_scalar_bounds(self.U_temp)
         self.apply_bc(self.U_temp)
 
-        self.compute_rhs(self.U_temp, out=self.dU)
+        self.compute_rhs(self.U_temp, out=self.dU, Bf=F1, dBf=dF, S=S1, dS=dS)
         self._accumulate_energy_budget(2.0 * dt / 3.0)
+        if self.strength:
+            S0[...] = S0 / 3.0 + 2.0 / 3.0 * (S1 + dt * dS)
+        if self.ct:
+            for f0, f1, d in zip(F0, F1, dF):
+                f0[...] = f0 / 3.0 + 2.0 / 3.0 * (f1 + dt * d)
         xp.multiply(self.dU, dt, out=self.dU)
         xp.add(self.U_temp, self.dU, out=self.U_stage)
         xp.multiply(self.U_stage, 2.0 / 3.0, out=self.U_stage)
@@ -568,21 +855,54 @@ class MHDSolver:
         xp.add(self.dU, self.U_stage, out=self.dU)
         xp.copyto(self.U, self.dU)
         self.enforce_scalar_bounds(self.U)
+        if self.ct:
+            ct.cells_from_faces(self.U, self.Bf, (slice(self.ng, self.ng + self.cfg.nx),
+                                                  slice(self.ng, self.ng + self.cfg.ny)))
+
+    def _post_step(self, dt):
+        """split steps after the RK stages: plasticity, radiation, conduction, equilibration, viscosity"""
+        if self.strength:                            # radial return to the yield surface, spall damage
+            Wn = cons_to_prim(self.U, self.eos)
+            stren.plastic(self.S, xp.clip(Wn[iCLR], 0, 1), Wn[iPR], self.cfg.yield_strength,
+                          self.cfg.spall_strength, self.ng)
         if self.cfg.rad_coeff > 0:
             ng, cfg = self.ng, self.cfg
             inner = (slice(None), slice(ng, ng + cfg.nx), slice(ng, ng + cfg.ny))
             Ui = self.U[inner]
-            dE = radiate(Ui, self.eos, cfg.rad_coeff, cfg.rad_T_min, cfg.rad_tracer_max, dt)
+            dE = radiate(Ui, self.eos, cfg.rad_coeff, cfg.rad_T_min, cfg.rad_tracer_max, dt,
+                         electron_Z=cfg.z_ion if cfg.two_temp else None)
             self.U[inner] = Ui
-            self._acc_rad += xp.sum(dE) * cfg.dx * cfg.dy
+            self._acc_rad += xp.sum(dE * self.dV)
         if self.cfg.cond_kappa0 > 0:
             ng, cfg = self.ng, self.cfg
             Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
             per = (cfg.get_bc_x() == "periodic", cfg.bc_y_type == "periodic")
+            radial = (self.rf[ng:ng + cfg.nx + 1], self.rc[ng:ng + cfg.nx]) if self.cyl else None
+            wall = cfg.cond_wall_T if cfg.cond_wall == "isothermal" else None
             self.cond_stages = conduct(Ui, self.eos, cfg.cond_kappa0, cfg.cond_x0, cfg.cond_tracer_max,
-                                       (cfg.dx, cfg.dy), per, dt)
+                                       (cfg.dx, cfg.dy), per, dt, radial=radial, wall_T=wall, perp=cfg.cond_perp,
+                                       electron_Z=cfg.z_ion if cfg.two_temp else None)
+        cfg, ng = self.cfg, self.ng
+        if cfg.two_temp and cfg.te_eq_coeff > 0:
+            Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
+            fuel = xp.clip(cons_to_prim(Ui, self.eos)[iCLR], 0, 1) < cfg.cond_tracer_max
+            twotemp.equilibrate(Ui, cfg.gamma, cfg.z_ion, cfg.te_eq_coeff, fuel, dt)
+        if cfg.visc_coeff > 0:
+            Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
+            Wi = cons_to_prim(Ui, self.eos)
+            fuel = xp.clip(Wi[iCLR], 0, 1) < cfg.cond_tracer_max
+            if cfg.two_temp:
+                theta_i = twotemp.temperatures(Ui, cfg.gamma, cfg.z_ion)[1]
+            else:
+                theta_i = Wi[iPR] / Wi[iRHO]
+            eta = cfg.visc_coeff * xp.maximum(theta_i, 0.0)**2.5
+            self.visc_stages = viscous_step(Ui, eta, (cfg.dx, cfg.dy), self._periodic(), fuel, dt)
         self.apply_bc(self.U)
-        if self._glm_ch_frozen > 0:
+        if self.ct:
+            ct.ghost_faces(self.Bf, self.U, self.ng, (self.cfg.nx, self.cfg.ny), self._periodic())
+            if self.cyl:
+                self._axis_faces(self.Bf)
+        if self._glm_ch_frozen > 0 and not self.ct:
             decay = np.exp(-self.cfg.glm_alpha * self._glm_ch_frozen * dt / min(self.cfg.dx, self.cfg.dy))
             self.U[PSI] *= decay
 

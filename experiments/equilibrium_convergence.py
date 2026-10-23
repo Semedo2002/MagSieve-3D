@@ -6,7 +6,7 @@ from sieve.solver import MHDSolver
 from sieve.physics import xp, cons_to_prim, prim_to_cons
 
 def far_v(nx, balanced=True, B0=5.0, t_end=0.05):
-    cfg = Config(nx=nx, ny=nx // 2, t_end=t_end, mach=10.0, B_transverse=B0, B_field_type="striped",
+    cfg = Config(div_b="glm", nx=nx, ny=nx // 2, t_end=t_end, mach=10.0, B_transverse=B0, B_field_type="striped",
                  B_stripe_component="x", bc_x_type="inflow_outflow", diag_interval=10**9, snapshot_times=[])
     s = MHDSolver(cfg)
     with contextlib.redirect_stdout(io.StringIO()):
