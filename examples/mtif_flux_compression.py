@@ -175,6 +175,7 @@ def run(a, out):
     r_, b_ = frame(s); rho_f.append(r_); bz_f.append(b_); t_f.append(s.t)
 
     # save
+    os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "diagnostics.csv"), "w", newline="") as fh:
         wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
         wr.writeheader(); wr.writerows(rows)
@@ -210,7 +211,7 @@ def run(a, out):
         summary.update({
             "cond_loss_pct_of_peak_hotspot_Eth": 100 * float(d["cond_loss"][-1]) / Eh,
             "cond_suppression_at_turnaround": float(d["cond_suppression"][i_turn]),
-            "cond_note": "heat conducted out of the hot spot (core gas above half the peak core temperature), integrated over the run, as a percentage of the hot spot's peak thermal energy; suppression = sum of grad T . K . grad T over the hot spot with the field off / with it on, for the state at turnaround (instantaneous). In 2D the field is axial, so all in-plane conduction is across B; the liner wall is insulating. For an unmagnetized run to compare with, use --kappa-ratio 1.",
+            "cond_note": "heat conducted out of the hot spot (core gas above half the peak core temperature), integrated over the run, as a percentage of the hot spot's peak thermal energy; suppression = sum of grad T . K . grad T over the hot spot with the field off / with it on, for the state at turnaround (instantaneous). In 2D the field is axial, so all in-plane conduction is across B; the fuel conducts into the liner as an isothermal wall (cond_wall_T), with its anisotropic conductivity. For an unmagnetized run to compare with, use --kappa-ratio 1, and compare E_th_core rather than this loss: without a field the core is nearly isothermal and heat crossing the moving half-maximum surface back and forth inflates it.",
         })
     with open(os.path.join(out, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=2)

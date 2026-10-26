@@ -239,7 +239,7 @@ def run(a, out):
     L0, v0 = a.r_ref_mm * 1e-3 / R0, a.v_ref_kms * 1e3
     summary = {
         "note": "illustrative 3D study; tilt is a sinusoidal axis displacement with maximum slope equal to the "
-                "tilt angle (periodic z); the liner wall is insulating for conduction; compare each 3D case with "
+                "tilt angle (periodic z); the fuel conducts into the liner as an isothermal wall; compare each 3D case with "
                 "the 3D reference to separate the asymmetry from 3D discretization effects",
         "params": {k: v for k, v in vars(a).items() if k != "phys"}, "physics_code": a.phys,
         "si_scales": {"length_unit_m": L0, "velocity_unit_m_s": v0, "liner_speed_km_s": a.mach * np.sqrt(GAMMA) * a.v_ref_kms,

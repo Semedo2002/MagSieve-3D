@@ -221,6 +221,8 @@ def hotspot_conduction(U, eos, cfg, h, periodic, core, frac=0.5):
     W = cons_to_prim(U, eos)
     rho = W[iRHO]
     theta = xp.maximum(W[iPR], 0.0) / rho
+    # only cells the scheme conducts as fuel: cells at or above cond_tracer_max are the wall's heat sink
+    core = core & (xp.clip(W[iCLR], 0.0, 1.0) < cfg.cond_tracer_max)
     tmax = float(xp.max(xp.where(core, theta, 0.0)))
     hot = core & (theta > frac * tmax)
     dV = float(np.prod(h))

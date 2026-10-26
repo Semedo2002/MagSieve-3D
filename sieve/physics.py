@@ -300,6 +300,9 @@ def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=
         q = -(kperp * gn + (kpar - kperp) * b[ax] * bg)
         if wall:
             qw = -(kpw * gw + (kw - kpw) * b[ax] * bgw)
+            # second law at the wall: an oblique field's transverse term must not pump heat from the wall up
+            # the fuel-wall temperature difference
+            qw = xp.where(qw * gw > 0, 0.0, qw)
             q = xp.where(fuelL & fuelR, q, xp.where(fuelL ^ fuelR, qw, 0.0))
         else:
             q = xp.where(fuelL & fuelR, q, 0.0)

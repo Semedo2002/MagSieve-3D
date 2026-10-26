@@ -23,7 +23,7 @@ sieve/            solver package
   diagnostics.py  mixing, enstrophy, interface spectrum, div B, energy
 main.py           CLI: verification tests, single cases, legacy campaign
 examples/         MTIF liner flux compression; synthetic magnetic probes (SI units); 3D target asymmetries;
-                  MagLIF-style r-z implosion
+                  MagLIF-style r-z implosion; metal-liner flux compression generator (FCG)
 experiments/      sweeps A-H and analysis scripts; data/ holds the saved results
 paper/            figure and .docx generators, figures/, magnetic_sieve.docx
 rmi_output_gpu/   figures and GIFs written by the solver
@@ -90,7 +90,7 @@ x = omega_ce tau_e = `cond_x0` |B| T^3/2 / rho (T = p/rho), in the fuel (liner f
 insulates it); the heat goes into the liner cell, so total energy is conserved exactly. `cond_wall="insulating"`
 and `cond_perp="simple"` (1/(1 + x^2)) restore the earlier choices; non-periodic domain faces are insulating. Fluxes live on cell faces; the gradient normal to a face is a two-point
 difference and the transverse gradients are van Leer limited (Sharma & Hammett 2007), which keeps strongly
-anisotropic conduction from moving heat from cold to hot. It is a split step integrated with RKL2
+anisotropic conduction from creating new temperature extrema. It is a split step integrated with RKL2
 super-time-stepping (Meyer, Balsara & Aslam 2014), about sqrt(dt/dt_explicit) stages, so it never limits the
 hydrodynamic time step. `units.braginskii_kwargs` gives the Spitzer-Braginskii coefficients in code units (k_par
 at 1 keV within 1.1% of the Spitzer value). Ion conduction is left out.
@@ -182,7 +182,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | ohmic | periodic box, eta varying 10x: thermal energy gained matches the integral of eta J^2 to 0.14%, total energy to 2e-14 |
 | eos_impact | 10 km/s Al impact: stiffened Al on stiffened Cu vs the exact impedance match, and Mie-Gruneisen Al on Al vs the Us-Up Hugoniot; shock speeds, pressure, densities and velocity within 0.5% |
 | eos_interface | Al slab in gas at uniform p and u: volume-fraction tracer keeps p uniform to 1e-9 (round-off times p_inf/p); mass-fraction blending, for comparison, is off by 3e5 p within 0.002 us |
-| wall_conduction | fuel slab cooling into a cold liner wall: mean temperature follows the exact series to 0.3%, 10x slower with the field parallel to the wall (k_par/k_perp = 10) |
+| wall_conduction | fuel slab cooling into a cold liner wall: mean temperature follows the exact series to 0.3%, 10x slower with the field parallel to the wall (k_par/k_perp = 10); with an oblique field (80 deg, k_par/k_perp = 1e4) no liner cell gives heat back to the fuel (without the wall's second-law limit one did) |
 | transport | Braginskii fit limits; Nernst: field bumps in B_y (faces) and B_w (cells) travel down a temperature gradient along the exact path to 0.06 cells; Ettingshausen conserves energy to 2e-14 |
 | twotemp | theta_e - theta_i relaxes as the exact ODE to 0.3% at fixed energy (1.5e-16); Sod: electron entropy behind the shock equals the upstream value (electrons compressed adiabatically), T_i/T_e >= 1.13 there; bremsstrahlung cools only the electrons |
 | viscosity | sound-wave damping from Braginskii parallel viscosity: 4/3 eta k^2/(2 rho) for B along k, 1/3 for B across k, 4/3 (Navier-Stokes) for B = 0, all within 3%; energy 6e-14 |
@@ -191,6 +191,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | parity3d | 3D slabs reproduce the 2D solver to round-off for a stiffened Al/Cu impact (5e-14), bremsstrahlung decay (2e-15) and conduction in an oblique field (7e-15) |
 | radiation | uniform hydrogen plasma, T0 = 500 eV, n = 1e20 cm^-3: T(t) matches (sqrt(T0) - K t/2)^2 to 1e-14 down to the 10 eV cutoff; E + E_rad conserved to 1e-15; no cooling in liner material or below the cutoff |
 | eos_positivity | stiffened Al pulled apart at 5 and 8 km/s (cavitation) and a gas/Al interface: p + p_inf > 0, c^2 > 0, finite state |
+| fcg | flux compression generator on a 64 x 4 r-z grid (Al liner, Mie-Gruneisen, strength and spall, CT, resistivity): axis field passes 20 B0 with >80% of the flux left in the cavity, no spall, div B at round-off, energy budget below 1e-12, output files written |
 
 ## Reproducing the study
 
@@ -240,6 +241,8 @@ shock compression, each verified against an analytic solution in `python main.py
   conserved to 7e-16.
 - **Two-temperature plasma, Braginskii viscosity, Nernst and Ettingshausen transport.**
 - **Liner strength:** von Mises plasticity with a Hugoniot elastic limit, and spall.
+- **Flux compression generators:** Al or Cu liners crushing a seed field in r-z, with b-dot probe signals,
+  flux retention and liner stress diagnostics (`examples/fcg_flux_compression.py`, below).
 - **Magnetized thermal conduction:** anisotropic, k_par ~ T^5/2 along B and Braginskii k_perp across it, with limited transverse gradients and RKL2 super-time-stepping. A hot spot with
   k_par/k_perp = 1e4 spreads along B as 2 D t and stays confined across it; for an oblique field the numerical
   cross-field leakage falls at second order with resolution.
@@ -270,15 +273,23 @@ python examples/mtif_3d_asymmetry.py --tilts 0.5 1 2 --modes 2 4
 # MagLIF-style implosion in axisymmetric (r, z) with an axial liner ripple (magneto-Rayleigh-Taylor seed);
 # --enable-conduction --nernst --v-ref-kms 100 --r-ref-mm 0.5 adds magnetized transport on a hot small target
 python examples/maglif_rz.py
+
+# flux compression generator: a metal liner coasting at v0 squeezes a seed field in r-z (see below)
+python examples/fcg_flux_compression.py --liner-material al --b0-tesla 5 --v0-kms 3 --enable-strength
+python examples/fcg_flux_compression.py --liner-material cu --enable-strength --out results/fcg_compression_cu
 ```
 
 With conduction on, the summaries report the heat conducted out of the hot spot (core gas above half the
 peak core temperature) as a percentage of its peak thermal energy, and the field's suppression of conduction
 there: the sum of grad T . K . grad T over the hot spot with the field off divided by the sum with it on, for
-the state at turnaround. In 2D the field is axial, so all in-plane conduction is across B; the liner wall is
-insulating. On the 0.5 mm, 100 km/s target the hot spot loses 1.7% of its peak thermal energy with
-Braginskii magnetization and 2.8% unmagnetized (`--kappa-ratio 1`); at the examples' default scales (fuel near
-0.01 eV) conduction is negligible.
+the state at turnaround. In 2D the field is axial, so all in-plane conduction is across B; the fuel conducts
+into the liner as an isothermal wall. On the 0.5 mm, 100 km/s target (512^2) the hot spot loses 7.9% of its
+peak thermal energy with Braginskii magnetization, and at turnaround the core holds 39.8 units of thermal
+energy against 21.9 unmagnetized (`--kappa-ratio 1`): the field keeps 1.8x more heat in the fuel. Without a
+field the hot-spot loss is not a useful number: the core is nearly isothermal, so heat crosses the moving
+half-maximum surface back and forth and the integral (130x the hot spot's peak energy, more than the whole
+system's thermal energy) counts that gross flow, not a net loss; compare core thermal energies instead. At
+the examples' default scales (fuel near 0.01 eV) conduction is negligible.
 
 ### 3D multi-physics parity and magnetized conduction
 
@@ -286,7 +297,7 @@ The two-material EOS with volume-fraction interfaces, bremsstrahlung and anisotr
 the 3D solver, sharing their kernels with 2D; a z-invariant 3D slab reproduces the 2D solver to round-off
 (`--test parity3d`). Conduction follows k_par ~ T^5/2 along B and k_perp = k_par/(1 + (omega_ce tau_e)^2)
 across it, with Sharma & Hammett (2007) limited transverse gradients so that strongly anisotropic heat flow
-never runs from cold to hot, and RKL2 super-time-stepping so that it never limits the hydrodynamic time step.
+creates no new temperature extrema, and RKL2 super-time-stepping so that it never limits the hydrodynamic time step.
 
 ### 3D target asymmetries
 
@@ -297,21 +308,74 @@ R (1 + 0.02 cos(m phi)). Conduction on, Braginskii magnetization, 0.5 mm / 100 k
 
 | case | convergence ratio | peak mean core B / B0 | peak-B spread in z | field tilt (rms B_perp/B_z) | hot-spot conduction loss | field suppression at turnaround |
 |---|---|---|---|---|---|---|
-| 2D baseline | 5.01 | 20.73 | - | - | 0.95% | 9.2e4 |
-| 3D reference | 5.01 | 20.73 | 0 | 0 | 0.95% | 9.2e4 |
-| tilt 0.5 deg | 5.01 | 20.73 | 6.3e-4 | 3.6e-3 | 0.95% | 7.1e4 |
-| tilt 1 deg | 5.01 | 20.73 | 1.3e-3 | 7.1e-3 | 0.97% | 4.8e4 |
-| tilt 2 deg | 4.96 | 20.64 | 2.1e-3 | 1.4e-2 | 1.08% | 2.1e4 |
-| m = 2 | 4.73 | 20.24 | 0 | 0 | 1.29% | 1.8e5 |
-| m = 4 | 4.48 | 19.76 | 0 | 0 | 1.08% | 1.0e5 |
+| 2D baseline | 5.01 | 21.52 | - | - | 3.64% | 5.2e4 |
+| 3D reference | 5.01 | 21.52 | 0 | 0 | 3.64% | 5.2e4 |
+| tilt 0.5 deg | 5.01 | 21.51 | 5.5e-4 | 4.3e-3 | 3.91% | 4.2e4 |
+| tilt 1 deg | 5.01 | 21.51 | 8.9e-4 | 8.0e-3 | 4.12% | 2.9e4 |
+| tilt 2 deg | 5.01 | 21.50 | 1.0e-3 | 1.6e-2 | 4.86% | 1.4e4 |
+| m = 2 | 4.73 | 20.96 | 0 | 0 | 4.64% | 1.1e5 |
+| m = 4 | 4.48 | 20.39 | 0 | 0 | 4.70% | 5.5e4 |
 
 The unperturbed 3D run matches the 2D baseline exactly. Up to 2 deg, tilt barely changes the compression
-(peak field -0.4% at 2 deg) but bends the core field lines in proportion to the tilt, which opens a parallel
-conduction path: the field's suppression of conduction in the hot spot falls 4.5x between 0 and 2 deg. The
-2% azimuthal modes cost more peak field (-2.4% for m = 2, -4.7% for m = 4) and raise the conductive loss
-through the larger hot-spot surface, while the field lines stay axial. The axis displacement is at most 0.18
-cells at this resolution, so it is invisible in density slices and shows only in these integrated metrics;
-energy closes to 1e-14 in every run.
+(peak field -0.1% at 2 deg) but bends the core field lines in proportion to the tilt, which opens a parallel
+conduction path: the field's suppression of conduction in the hot spot falls 3.8x between 0 and 2 deg and the
+hot spot's conductive loss rises from 3.6% to 4.9% of its peak thermal energy. The 2% azimuthal modes cost
+more peak field (-2.6% for m = 2, -5.3% for m = 4) and raise the loss to 4.6-4.7% through the larger hot-spot
+surface, while the field lines stay axial. The axis displacement is at most 0.18 cells at this resolution, so
+it is invisible in density slices and shows only in these integrated metrics; energy closes to 3e-14 or
+better in every run. The loss counts only cells the scheme conducts as fuel (liner fraction below
+`cond_tracer_max`); cells above it are the isothermal wall's heat sink.
+
+## Flux compression generator (FCG)
+
+`examples/fcg_flux_compression.py` models a cylindrical magnetic flux compression generator in axisymmetric
+(r, z): a solid aluminium or copper liner, already launched inward at v0 by an explosive or pulsed-power
+drive, crushes an axial seed field B0 trapped in its cavity. Constrained transport keeps div B at round-off;
+the liner has a Mie-Gruneisen EOS (linear Us-Up Hugoniot), optional von Mises strength and spall
+(`--enable-strength`), and its cold metal conductivity (Al 3.5e7, Cu 5.8e7 S/m), with Spitzer resistivity
+(capped at `--sigma-min`) in the cavity gas and Ohmic heating everywhere. Each run writes `diagnostics.csv`
+(time, on-axis and peak B, the b-dot voltage of a 1 mm^2 loop, flux in the cavity, magnetic pressure over
+yield P_B/Y, von Mises stress, spall), `summary.json`, `fcg_signals.png` and `fcg_implosion.gif` (density and
+von Mises stress with field lines).
+
+```
+python examples/fcg_flux_compression.py --liner-material al --b0-tesla 5 --v0-kms 3 --enable-strength
+python examples/fcg_flux_compression.py --liner-material cu --enable-strength --out results/fcg_compression_cu
+python examples/fcg_flux_compression.py --quick --check      # 128 x 16 smoke run
+```
+
+Liner R0 = 30 mm, 3 mm thick, 20 mm axial period with a 0.5% mode-2 ripple, v0 = 3 km/s at mid-wall, B0 = 5 T,
+256 x 128 cells (0.16 mm):
+
+| | Al (6061) | Cu (OFHC) |
+|---|---|---|
+| turnaround | 8.42 us | 8.46 us |
+| peak on-axis field | 506 T (101 B0) | 1079 T (216 B0) |
+| field-radius convergence | 10.1 | 14.6 |
+| flux left in the cavity at turnaround | 93.6% (ideal MHD: 99.1%) | 93.3% |
+| peak b-dot | 1.33e3 T/us (1.3 kV per mm^2 turn) | 1.34e3 T/us |
+| peak P_B/Y | 358 | 3926 |
+| spalled liner mass | 0 | 0 |
+| div B, energy error | 4e-14, 7.9e-13 | 4e-14, 9.2e-13 |
+
+![FCG signals, aluminium liner](results/fcg_compression/fcg_signals.png)
+
+The liner yields within the first 0.1 us and stays plastic (P_B/Y in the hundreds to thousands), so near
+peak field it behaves as a fluid and strength matters only early on. The copper liner carries 3.3x the
+aluminium's kinetic energy and reaches twice the field. About 5.5% of the cavity flux soaks into the
+aluminium liner by resistive diffusion; the ideal-MHD run loses 0.9%, which is the numerical diffusion at
+this resolution. The early spikes in the on-axis field are fast magnetosonic waves from the liner focusing
+on the axis (the cavity rings); by peak compression the cavity field is uniform. Energy closes to 1e-12 over
+13 000 to 15 000 steps: the error grows linearly at about 6e-17 per step, so it is accumulated round-off.
+
+Limits: the liner coasts, so the drive (explosive, or a pulsed-power current) and any load circuit are not
+modelled; the field is purely axial (no B_theta), so there is no current-driven instability; the 0.1 kg/m^3,
+0.1 bar fill stands in for an evacuated cavity, whose Alfven speed would make the time step vanish. At
+turnaround the cavity spans about 19 cells while the smeared liner surface is 16 to 17 cells wide, so the field
+radius (where the cavity flux sits at the on-axis field) and the tracer radius differ by about 0.6 mm; both
+are in the summary. Mixed cells in that layer use the tangent stiffened-gas closure. A thick liner must start
+with v ~ 1/r (incompressible): a uniform v0 makes the shell ring radially at about rho c v0 dR/R, a few GPa,
+which spalled it at 0.9 us before the field mattered. The parameters are illustrative, not a specific device.
 
 ## Benchmark: high-Mach MHD Richtmyer-Meshkov instability
 

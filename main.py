@@ -741,6 +741,22 @@ def wall_conduction_test(tol=0.01):
         ok = ok and good
         out.append(f"  {name}: t = {t_end:.1f}, mean excess {excess:.4f} of the initial (exact {exact:.4f}); "
                    f"energy {dE:.1e}  [{'PASS' if good else 'FAIL'}]")
+    # second law at the wall: field 80 deg from the wall normal, k_par/k_perp = 1e4, fuel temperature varying strongly
+    # along the wall; the cold (T = 0) liner may only gain heat
+    from sieve.physics import conduction_div
+    n = 32
+    X, Yg = xp.meshgrid(xp.arange(n) / n, xp.arange(n) / n, indexing="ij")
+    a = xp.where(X >= 0.5, 1.0, 0.0)
+    theta = xp.where(a > 0, 0.0, 1.0 + 0.9 * xp.sin(2 * np.pi * 3 * Yg))
+    ang = np.radians(80.0)
+    B = (xp.full_like(X, np.cos(ang)), xp.full_like(X, np.sin(ang)), xp.zeros_like(X))
+    div = conduction_div(theta, B, xp.ones_like(X), a, 1.0, x_for_kappa_ratio(1e4), 0.1, (1 / n, 1 / n),
+                         (False, True), wall_T=0.0)
+    gain_min = float(xp.min(div[n // 2]))                       # liner column at the wall
+    good = gain_min >= 0.0
+    ok = ok and good
+    out.append(f"  oblique field at a cold wall, k_par/k_perp = 1e4: min heat gain of a liner cell {gain_min:.2e} "
+               f"(must be >= 0)  [{'PASS' if good else 'FAIL'}]")
     print("\n".join(out))
     return ok
 
@@ -1234,6 +1250,32 @@ def rmi_mhd_smoke_test():
     return ok
 
 
+def fcg_smoke_test():
+    """Flux compression generator (examples/fcg_flux_compression.py) on a small r-z grid: Al liner (R0 = 10 mm,
+    1.5 mm thick) at 3 km/s on a 5 T seed with Mie-Gruneisen, strength/spall, CT and resistivity together.
+    Energy closes, div B stays at round-off, the axis field passes 20 B0 with >80% of the flux left in the
+    cavity gas, the liner does not spall, and the output files are written."""
+    print("\n--- FCG flux compression smoke test ---"); sys.stdout.flush()
+    import argparse
+    import tempfile
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples"))
+    import fcg_flux_compression as fcg
+    out = tempfile.mkdtemp(prefix="fcg_smoke_")
+    a = argparse.Namespace(liner_material="al", b0_tesla=5.0, v0_kms=3.0, enable_strength=True, eta_model="spitzer",
+                           sigma_gas=None, sigma_min=5e6, r0=10.0, dr=1.5, r_max=14.0, lz=1.0, mode=1, amp=0.0,
+                           rho_gas=0.1, p_gas_bar=0.1, nr=64, nz=4, t_end=8.0, frame_dt=10.0, diag_every=5)
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = fcg.run(a, out)
+    files = all(os.path.exists(os.path.join(out, f)) for f in ("diagnostics.csv", "summary.json", "frames.npz"))
+    ok = (files and r["energy_error_max"] < 1e-12 and r["div_B_max"] < 1e-12 and r["B_axis_peak_T"] > 20 * a.b0_tesla
+          and r["flux_retention_at_turnaround"] > 0.8 and r["spall_cells_final"] == 0)
+    print(f"  {r['steps']} steps: axis B peak {r['B_axis_peak_T']:.0f} T from {a.b0_tesla:g} T, flux kept "
+          f"{r['flux_retention_at_turnaround']:.3f}, P_B/Y peak {r['PB_over_Y_peak']:.0f}, spalled cells "
+          f"{r['spall_cells_final']}; div B {r['div_B_max']:.1e}, energy error {r['energy_error_max']:.1e}; files "
+          f"{'ok' if files else 'MISSING'}  [{'PASS' if ok else 'FAIL'}]")
+    return ok
+
+
 VERIFICATION_TESTS = {
     "brio_wu": brio_wu_test,
     "alfven": alfven_convergence_test,
@@ -1260,6 +1302,7 @@ VERIFICATION_TESTS = {
     "parity3d": parity3d_test,
     "galilean": galilean_test,
     "rmi_mhd": rmi_mhd_smoke_test,
+    "fcg": fcg_smoke_test,
 }
 
 

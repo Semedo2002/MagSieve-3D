@@ -256,7 +256,7 @@ def run(a, out):
         summary.update({
             "cond_loss_pct_of_peak_hotspot_Eth": 100 * s._cond_loss / Eh,
             "cond_suppression_at_peak_compression": float(s._cond_samples[int(np.argmin(np.abs(ts - t_peak)))][1]),
-            "cond_note": "heat conducted out of the hot spot (fuel above half the peak core temperature), integrated over the run, as a percentage of the hot spot's peak thermal energy; suppression = sum of grad T . K . grad T over the hot spot with the field off / with it on, for the state at peak compression (sampled every 10 steps) (instantaneous). In 2D the field is axial, so all in-plane conduction is across B; the liner wall is insulating. For an unmagnetized run to compare with, use --kappa-ratio 1.",
+            "cond_note": "heat conducted out of the hot spot (fuel above half the peak core temperature), integrated over the run, as a percentage of the hot spot's peak thermal energy; suppression = sum of grad T . K . grad T over the hot spot with the field off / with it on, for the state at peak compression (sampled every 10 steps) (instantaneous). In 2D the field is axial, so all in-plane conduction is across B; the fuel conducts into the liner as an isothermal wall (cond_wall_T), with its anisotropic conductivity. For an unmagnetized run to compare with, use --kappa-ratio 1.",
         })
     with open(os.path.join(out, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=2)
