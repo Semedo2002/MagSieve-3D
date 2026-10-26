@@ -14,6 +14,7 @@ between rows and drift measure numerical reconnection), energy budget.
     python examples/maglif_rz.py                   # 256 x 256, run + plots
     python examples/maglif_rz.py --quick --check   # smoke test
     python examples/maglif_rz.py --plot-only
+    python examples/maglif_rz.py --capacitance-uf 2 --voltage-kv 40 --inductance-nh 20   # liner at rest, RLC drive
 
 Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
@@ -37,6 +38,7 @@ with contextlib.redirect_stdout(io.StringIO()):
     from sieve.diagnostics import cavitation_split
     from sieve.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
                              add_radiation_args, radiation_from_args, add_conduction_args, conduction_from_args)
+    from sieve.circuit import LinerDrive, add_circuit_args, circuit_from_args
 
 GAMMA = 5.0 / 3.0
 R0, R1 = 0.5, 0.7
@@ -97,23 +99,36 @@ def diag(s, state):
     p_pure, n_mixed = cavitation_split(pressure_margin(U, s.eos), C)
     E = float(xp.sum(U[EN] * s.dV))
     budget = s._cumulative_boundary_energy + s._cumulative_powell_energy - s.cumulative_radiated_energy
+    drive = state.get("drive")
+    if drive:
+        budget += drive.work_grid
     state.setdefault("E0", E)
     state.setdefault("flux0", float(np.mean(flux_z)))
-    return {"t": s.t, "step": s.step, "R_mean": float(np.mean(Rz)), "R_amp": float(0.5 * (Rz.max() - Rz.min())),
+    row = {"t": s.t, "step": s.step, "R_mean": float(np.mean(Rz)), "R_amp": float(0.5 * (Rz.max() - Rz.min())),
             "R_area": float(np.sqrt(area / np.pi)),
             "B_core_mean": float(xp.sum(xp.where(core, Bz * rr, 0.0)) / max(float(xp.sum(xp.where(core, rr, 0.0))), 1e-300)),
             "B_max": float(xp.max(xp.abs(Bz))), "core_flux": float(np.mean(flux_z)),
             "core_flux_spread": float(np.std(flux_z) / max(abs(np.mean(flux_z)), 1e-300)),
             "div_B": s.div_b_max(), "p_min": p_pure, "mixed_cells_at_floor": n_mixed,
             "energy_error": (E - state["E0"] - budget) / state["E0"]}
+    if drive:
+        row.update({"I_MA": drive.c.I / 1e6, "P_drive_GPa": drive.P_B, "L_load_nH": drive.L_energy * 1e9,
+                    "L_load_geom_nH": drive.L_geom * 1e9})
+    return row
 
 
 def run(a, out):
     os.makedirs(out, exist_ok=True)
     s, V = setup(a)
-    print(f"r-z grid {a.nr} x {a.nz}, liner Mach {a.mach:g} (v = {V:.3f}), rho_liner {a.rho_liner:g}, "
-          f"B0 {a.B0:g}, axial mode {a.mode} amp {a.amp:g}", flush=True)
     state = {}
+    bank = circuit_from_args(a) if hasattr(a, "capacitance_uf") else None
+    if bank:
+        L0 = a.r_ref_mm * 1e-3 / R0
+        r_ret = (a.r_return_mm * 1e-3) if a.r_return_mm else s.cfg.x_max * L0
+        state["drive"] = LinerDrive(s, bank, r_ret, L0, a.rho_ref, a.v_ref_kms * 1e3)
+    print(f"r-z grid {a.nr} x {a.nz}, liner Mach {a.mach:g} (v = {V:.3f}), rho_liner {a.rho_liner:g}, "
+          f"B0 {a.B0:g}, axial mode {a.mode} amp {a.amp:g}"
+          + (f", RLC drive {bank.E0 / 1e3:.3g} kJ" if bank else ""), flush=True)
     rows = [diag(s, state)]
     frames, times = [], list(np.linspace(0, a.t_end, a.frames))
     best = (np.inf, None)
@@ -124,6 +139,8 @@ def run(a, out):
             frames.append((s.t, to_numpy(cons_to_prim(s.U, s.eos)[iRHO, s.ng:-s.ng, s.ng:-s.ng]).astype(np.float32)))
         s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), a.t_end - s.t)
         s.step_ssprk3()
+        if bank:
+            state["drive"].step(s.dt)
         s.t += s.dt
         s.step += 1
         if s.step % 5 == 0:
@@ -153,6 +170,12 @@ def run(a, out):
         "div_B_max": float(d["div_B"].max()), "energy_error_max": float(np.max(np.abs(d["energy_error"]))),
         "p_min": float(d["p_min"].min()),
     }
+    if bank:
+        summary["circuit"] = {"bank_energy_J": bank.E0, "I_peak_MA": float(d["I_MA"].max()),
+                              "P_drive_peak_GPa": float(d["P_drive_GPa"].max()),
+                              "work_on_liner_J": state["drive"].work_grid * state["drive"].Eu,
+                              "work_mismatch_over_bank": state["drive"].work_mismatch(),
+                              "circuit_budget_error": bank.budget_error()}
     with open(os.path.join(out, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=2)
     np.savez_compressed(os.path.join(out, "frames.npz"), r=to_numpy(s.x[s.ng:-s.ng]), z=to_numpy(s.y[s.ng:-s.ng]),
@@ -213,7 +236,7 @@ def main():
     ap.add_argument("--lz", type=float, default=1.0, help="axial period")
     ap.add_argument("--mode", type=int, default=4, help="axial liner ripple mode number")
     ap.add_argument("--amp", type=float, default=0.01, help="relative ripple amplitude")
-    ap.add_argument("--mach", type=float, default=4.0)
+    ap.add_argument("--mach", type=float, default=None, help="liner Mach number (default 4; 0 with a drive circuit)")
     ap.add_argument("--B0", type=float, default=1.0)
     ap.add_argument("--rho-liner", dest="rho_liner", type=float, default=None)
     ap.add_argument("--t-end", dest="t_end", type=float, default=0.25)
@@ -230,7 +253,10 @@ def main():
     add_eos_args(ap)
     add_radiation_args(ap)
     add_conduction_args(ap)
+    add_circuit_args(ap)
     a = ap.parse_args()
+    if a.mach is None:
+        a.mach = 0.0 if circuit_from_args(a) else 4.0
     if a.quick:
         a.nr = a.nz = 96
         a.frames = 10

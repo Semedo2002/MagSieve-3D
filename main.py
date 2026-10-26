@@ -1276,6 +1276,566 @@ def fcg_smoke_test():
     return ok
 
 
+def solid_nernst_3d_test(tol=1e-12):
+    """3D liner strength and Nernst transport (sieve/solver3d.py). Parity: z-invariant 3D slabs reproduce the
+    2D solver to round-off for (1) stiffened Al with strength, a velocity blob that drives the metal plastic, and
+    (2) Nernst + Ettingshausen with a temperature varying in x and y and field on every face (1e-10: the 2D
+    solver moves the out-of-plane field as a cell-centred upwind divergence, the 3D one through CT edges, the
+    same sums in a different order). With spall on, the same blob spalls its core: a cell at the threshold
+    may flip a step apart on round-off, so the damaged regions are compared, not the fields. Genuinely 3D: (3) an elastic shear wave along z (S_xz, absent in 2D) oscillates at
+    w = k sqrt(G/rho) (Jaumann/Hooke in the third direction); (4) a field bump in a temperature gradient along z
+    travels down it on the exact Nernst path, div B at round-off."""
+    from sieve.solver3d import MHDSolver3D
+    from sieve.eos import stiffened_from_hugoniot
+    from sieve import strength as st
+    print("\n--- 3D strength and Nernst ---"); sys.stdout.flush()
+    gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 1.0)
+    G, rho0 = 26.0, AL["rho0"]
+    metal = dict(eos_liner="stiffened", gamma_liner=gA, p_inf_liner=piA, material_tracer="volume_fraction",
+                 strength=True, shear_modulus=G)
+
+    def make(cls, n, L, nz=None, Lz=None, **kw):
+        c = dict(nx=n[0], ny=n[1], x_max=L[0], y_max=L[1], t_end=1.0, cfl=0.3, mach=1.0, B_transverse=0.0,
+                 powell_source=False, bc_x_type="periodic", bc_y_type="periodic", diag_interval=10**9,
+                 snapshot_times=[])
+        c.update(kw)
+        if nz:
+            c.update(nz=nz, z_max=Lz)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return cls(Config(**c))
+
+    def grids(s):
+        sh = s.U.shape[1:]
+        X = s.x.reshape((-1,) + (1,) * (len(sh) - 1))
+        Y = s.y.reshape((1, -1) + (1,) * (len(sh) - 2))
+        return X, Y, sh
+
+    def compare(s2, s3, keys, extra=()):
+        ng = s2.ng
+        W2 = cons_to_prim(s2.U, s2.eos)[:, ng:-ng, ng:-ng]
+        W3 = cons_to_prim(s3.U, s3.eos)[:, ng:-ng, ng:-ng, ng:-ng]
+        pairs = [(W2[i], W3[i]) for i in keys] + [(a[ng:-ng, ng:-ng], b[ng:-ng, ng:-ng, ng:-ng]) for a, b in extra]
+        d = max(float(xp.max(xp.abs(b - a[:, :, None]))) / max(float(xp.max(xp.abs(a))), 1e-300) for a, b in pairs)
+        zv = max(float(xp.max(xp.abs(b - b[:, :, :1]))) for _, b in pairs)
+        return d, zv
+
+    res = []
+    # (1) strength: outward velocity blob, plastic flow (and with spall on, a spalled core)
+    def blob(spall):
+        out = []
+        for cls, nz in ((MHDSolver, None), (MHDSolver3D, 4)):
+            s = make(cls, (48, 48), (1.0, 1.0), nz, 4 / 48, yield_strength=0.29, spall_strength=spall, **metal)
+            X, Y, sh = grids(s)
+            r2 = (X - 0.5)**2 + (Y - 0.45)**2
+            W = xp.zeros((NVAR,) + sh)
+            W[iRHO], W[iPR], W[iCLR] = rho0, 1e-4, 1.0
+            W[iVX] = 0.5 * (X - 0.5) / 0.1 * xp.exp(-r2 / 0.1**2) + 0.0 * Y
+            W[iVY] = 0.5 * (Y - 0.45) / 0.1 * xp.exp(-r2 / 0.1**2) + 0.0 * X
+            s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+            _march(s, 0.02)
+            out.append(s)
+        return out
+    s2, s3 = blob(0.0)
+    d, zv = compare(s2, s3, (iRHO, iPR, iVX, iVY), [(s2.S[c], s3.S[c]) for c in (st.SXX, st.SYY, st.SXY)])
+    plastic = float(xp.max(st.von_mises(s3.S))) > 0.99 * 0.29
+    off = max(float(xp.max(xp.abs(s3.S[c]))) for c in (st.SXZ, st.SYZ))
+    res.append(("strength (plastic flow)", d, zv, s2.step, s3.step, plastic and off == 0.0, tol))
+    s2, s3 = blob(1.2)
+    n2, n3 = int(xp.sum(s2.S[st.DMG] > 0.5)), int(xp.sum(s3.S[st.DMG, :, :, s3.ng:-s3.ng] > 0.5))
+    D3 = s3.S[st.DMG, s3.ng:-s3.ng, s3.ng:-s3.ng, s3.ng:-s3.ng]
+    dz = float(xp.max(xp.abs(D3 - D3[:, :, :1])))
+    spall_ok = n2 > 0 and abs(n3 / 4 - n2) <= 0.02 * n2 and dz == 0.0
+    print(f"  spall: damaged cells 2D {n2}, 3D {n3 / 4:g} per z layer, z-invariant {dz == 0.0}  "
+          f"[{'PASS' if spall_ok else 'FAIL'}]")
+
+    # (2) Nernst + Ettingshausen
+    for_both = []
+    for cls, nz in ((MHDSolver, None), (MHDSolver3D, 4)):
+        s = make(cls, (64, 16), (1.0, 0.25), nz, 4 / 64, gamma=5 / 3, B_transverse=1e-6, bc_x_type="extrapolation",
+                 cond_x0=1.0, nernst_coeff=31.0)
+        X, Y, sh = grids(s)
+        T = 1.0 + 0.02 * (X - 0.5) + 0.01 * xp.cos(2 * np.pi * Y / 0.25)
+        W = xp.zeros((NVAR,) + sh)
+        W[iPR], W[iRHO] = 1.0, 1.0 / T
+        bump = 1e-2 * xp.exp(-((X - 0.6) / 0.08)**2)
+        W[iBX] = 1e-2 * xp.cos(2 * np.pi * Y / 0.25) + 0.0 * X
+        W[iBY] = bump + 0.0 * Y
+        W[iBZ] = bump * (1 + 0.5 * xp.cos(2 * np.pi * Y / 0.25))
+        s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+        _march(s, 0.3)
+        for_both.append(s)
+    s2, s3 = for_both
+    d, zv = compare(s2, s3, (iRHO, iPR, iVX, iVY, iBX, iBY, iBZ))
+    res.append(("Nernst + Ettingshausen", d, zv, s2.step, s3.step, s3.div_b_max() < 1e-12, 1e-10))
+
+    ok = spall_ok
+    for name, d, zv, n2, n3, extra, tl in res:
+        good = d < tl and zv == 0.0 and n2 == n3 and extra
+        ok = ok and good
+        print(f"  parity, {name}: steps 2D/3D {n2}/{n3}, max rel diff {d:.1e}, z-variation {zv:.1e}  "
+              f"[{'PASS' if good else 'FAIL'}]")
+
+    # (3) shear wave along z: v_x = A sin(k z) cos(w t), w = k sqrt(G/rho)
+    Lz, A = 1.0, 1e-4
+    s = make(MHDSolver3D, (4, 4), (4 / 64, 4 / 64), 64, Lz, yield_strength=1e3, **metal)
+    sh = s.U.shape[1:]
+    Z = s.z.reshape(1, 1, -1)
+    W = xp.zeros((NVAR,) + sh)
+    W[iRHO], W[iPR], W[iCLR] = rho0, 1e-4, 1.0
+    W[iVX] = A * xp.sin(2 * np.pi * Z / Lz) + 0.0 * W[iRHO]
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    k, ng = 2 * np.pi / Lz, s.ng
+    w = k * np.sqrt(G / rho0)
+    proj = lambda: float(xp.mean(cons_to_prim(s.U, s.eos)[iVX, ng:-ng, ng:-ng, ng:-ng] * xp.sin(k * Z[..., ng:-ng]))) * 2 / A
+    a0, errs = proj(), []
+    for frac in (0.125, 0.25, 0.375):
+        _march(s, frac * 2 * np.pi / w)
+        errs.append(abs(proj() / a0 - np.cos(w * s.t)))
+    shear_ok = max(errs) < 0.01
+    print(f"  shear wave along z (S_xz): amplitude vs cos(k sqrt(G/rho) t) at 1/8, 1/4, 3/8 period, max error "
+          f"{max(errs):.1e} of the amplitude  [{'PASS' if shear_ok else 'FAIL'}]")
+
+    # (4) Nernst along z: isobaric periodic T(z) = 1 + 0.01 sin(2 pi z), field bumps in B_x and B_y travel down
+    # the gradient (from z = 0.5, where it is steepest, toward the cold side)
+    nz, cN, x0, t_end, Z0, wb = 200, 31.0, 1.0, 0.1, 0.5, 0.05
+    s = make(MHDSolver3D, (4, 4), (4 / nz, 4 / nz), nz, 1.0, gamma=5 / 3, B_transverse=1e-6, cond_x0=x0,
+             nernst_coeff=cN)
+    sh = s.U.shape[1:]
+    Z = s.z.reshape(1, 1, -1)
+    T = 1.0 + 0.01 * xp.sin(2 * np.pi * Z)
+    W = xp.zeros((NVAR,) + sh)
+    W[iPR], W[iRHO] = 1.0, 1.0 / T + 0.0 * W[iPR]
+    bump = 1e-4 * xp.exp(-((Z - Z0) / wb)**2) + 0.0 * W[iPR]
+    W[iBX], W[iBY] = bump, bump
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    _march(s, t_end)
+    zc = to_numpy(s.z[ng:-ng])
+    Wf = cons_to_prim(s.U, s.eos)
+    cen = lambda b: float(np.sum(zc * b) / np.sum(b))
+    zx, zy = cen(to_numpy(Wf[iBX, ng, ng, ng:-ng])), cen(to_numpy(Wf[iBY, ng, ng, ng:-ng]))
+    Ze, m = Z0, 4000
+    for _ in range(m):                               # dZ/dt = -c_N x0 theta^2.5 (beta_wedge/x)(0) dtheta/dz
+        th = 1.0 + 0.01 * np.sin(2 * np.pi * Ze)
+        Ze += -cN * x0 * th**2.5 * (3.053 / 3.7703) * 0.02 * np.pi * np.cos(2 * np.pi * Ze) * (t_end / m)
+    nz_ok = abs(zx - Ze) < 1.5 / nz and abs(zy - Ze) < 1.5 / nz and s.div_b_max() < 1e-12
+    print(f"  Nernst along z: bumps moved {Z0:.2f} -> {zx:.4f} (B_x), {zy:.4f} (B_y), exact {Ze:.4f}; div B "
+          f"{s.div_b_max():.1e}  [{'PASS' if nz_ok else 'FAIL'}]")
+    return ok and shear_ok and nz_ok
+
+
+def mpi_test():
+    """Slab domain decomposition (sieve/parallel.py): scripts/mpi_check.py under mpiexec with 2 and 3 ranks
+    (uneven slabs) must match the single-domain solver to round-off for 2D Orszag-Tang with resistivity, 2D
+    aluminium with strength and spall, and a 3D Orszag-Tang-like box: same steps, same total energy, div B at
+    round-off. Skipped (reported, not failed) when mpi4py or mpiexec is missing."""
+    import shutil
+    import subprocess
+    print("\n--- MPI domain decomposition ---"); sys.stdout.flush()
+    here = os.path.dirname(os.path.abspath(__file__))
+    exe = shutil.which("mpiexec") or next((p for p in (os.path.join(sys.prefix, "Library", "bin", "mpiexec.exe"),
+                                                       os.path.join(sys.prefix, "bin", "mpiexec")) if os.path.exists(p)), None)
+    try:
+        import mpi4py  # noqa: F401
+    except ImportError:
+        exe = None
+    if exe is None:
+        print("  SKIPPED: mpi4py or mpiexec not found (pip install mpi4py, plus an MPI runtime)")
+        return True
+    env = dict(os.environ)
+    env["PATH"] = os.path.dirname(exe) + os.pathsep + env.get("PATH", "")
+    ok = True
+    for n in (2, 3):
+        r = subprocess.run([exe, "-n", str(n), sys.executable, os.path.join(here, "scripts", "mpi_check.py"), "--quick"],
+                           capture_output=True, text=True, env=env, timeout=3600)
+        lines = [l for l in r.stdout.splitlines() if l.startswith("  ") or l.startswith("MPI_CHECK")]
+        print("\n".join(lines) if lines else (r.stdout + r.stderr)[-2000:])
+        ok = ok and r.returncode == 0 and any(l == "MPI_CHECK PASS" for l in lines)
+    return ok
+
+
+def fld_test():
+    """Grey flux-limited diffusion radiation (sieve/fld.py). (1) Uniform gas (theta = 1) and no radiation, Planck
+    coupling: theta and E_r follow the exact ODE pair to 1% (backward Euler, rate x dt = 0.01) and settle on the
+    equilibrium a theta^4 = E_r with gas + radiation energy conserved to round-off. (2) Optically thick (chi
+    R << 1, so D = c/(3 chi)): a Gaussian E_r pulse spreads as <x^2> + 2 D t per direction, in 2D, in r-z
+    (<r^2> + 4 D t) and in 3D (<r^2> + 6 D t), each to 1%. (3) Optically thin, a hot wall: the Levermore-
+    Pomraning limiter keeps the radiation front at or behind c t (without it diffusion would fill the slab at
+    once). (4) Radiation carried by a uniform flow with the hydrodynamics running: the pulse moves with the gas
+    and gas + radiation energy closes to round-off."""
+    from sieve import fld
+    from sieve.solver3d import MHDSolver3D
+    print("\n--- Grey FLD radiation ---"); sys.stdout.flush()
+
+    def make(cls, n, L, **kw):
+        c = dict(nx=n[0], ny=n[1], x_max=L[0], y_max=L[1], t_end=1.0, cfl=0.3, mach=1.0, gamma=5 / 3,
+                 B_transverse=0.0, bc_x_type="periodic", bc_y_type="periodic", diag_interval=10**9, snapshot_times=[],
+                 fld=True, fld_c=1.0, fld_kr0=1.0)
+        if len(n) == 3:
+            c.update(nz=n[2], z_max=L[2])
+        c.update(kw)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = cls(Config(**c))
+        W = xp.zeros((NVAR,) + s.U.shape[1:])
+        W[iRHO], W[iPR] = 1.0, 1.0
+        s.U = prim_to_cons(W, s.eos)
+        s.t, s.step = 0.0, 0
+        return s
+
+    def interior(s):
+        return s.U[(slice(None),) + (slice(s.ng, -s.ng),) * (s.U.ndim - 1)]
+
+    def per(s):
+        return s._periodic()
+
+    ok = True
+    # (1) equilibration: rho cv theta' = -c k (a theta^4 - E), E' = c k (a theta^4 - E), cv = 3/2
+    a, c, k, dt = 1.0, 10.0, 1.0, 1e-3
+    s = make(MHDSolver, (8, 8), (1.0, 1.0), fld_a=a, fld_c=c, fld_kp0=k, fld_advect=False)
+    Ui = interior(s)
+    E0 = float(xp.sum(Ui[EN])) * s.dV + s.radiation_energy()
+    th, Er, ref = 1.0, 0.0, []
+    for _ in range(50000):                                    # RK4 reference to t = 0.05
+        f = lambda y: np.array([-c * k * (a * y[0]**4 - y[1]) / 1.5, c * k * (a * y[0]**4 - y[1])])
+        y = np.array([th, Er]); h = 0.05 / 50000
+        k1 = f(y); k2 = f(y + h / 2 * k1); k3 = f(y + h / 2 * k2); k4 = f(y + h * k3)
+        th, Er = y + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+    for i in range(int(0.05 / dt + 0.5)):
+        fld.step(s.Er, Ui, s.eos, s.cfg, (s.cfg.dx, s.cfg.dy), per(s), dt, advect=False)
+    th_s = float(xp.mean(cons_to_prim(Ui, s.eos)[iPR]))
+    e_tr = abs(th_s - th) / abs(1.0 - th)
+    for i in range(2000):
+        fld.step(s.Er, Ui, s.eos, s.cfg, (s.cfg.dx, s.cfg.dy), per(s), dt, advect=False)
+    th_f = float(xp.mean(cons_to_prim(Ui, s.eos)[iPR]))
+    eq = abs(a * th_f**4 - float(xp.mean(s.Er))) / float(xp.mean(s.Er))
+    dE = abs(float(xp.sum(Ui[EN])) * s.dV + s.radiation_energy() - E0) / E0
+    good = e_tr < 0.01 and eq < 1e-6 and dE < 1e-13
+    ok = ok and good
+    print(f"  equilibration: gas temperature at t = 0.05 within {100 * e_tr:.2f}% of the exact ODE (of its change); "
+          f"final a T^4 = E_r to {eq:.1e}; gas + radiation energy {dE:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+    # (2) optically thick diffusion of a Gaussian: chi = 1e4, D = c / (3 chi) = 0.1
+    D, t2, w0 = 0.1, 0.05, 0.05
+    cases = []
+    for name, cls, n, L, kw, dims in (("2D", MHDSolver, (128, 128), (1.0, 1.0), {}, 2),
+                                      ("r-z", MHDSolver, (128, 8), (1.0, 8 / 128),
+                                       dict(geometry="cylindrical", bc_x_type="extrapolation", div_b="ct"), 2),
+                                      ("3D", MHDSolver3D, (48, 48, 48), (1.0, 1.0, 1.0), {}, 3)):
+        s = make(cls, n, L, fld_c=3e3, fld_kr0=1e4, fld_advect=False, **kw)
+        ng = s.ng
+        cyl = kw.get("geometry") == "cylindrical"
+        X = s.x[ng:-ng].reshape((-1,) + (1,) * (len(n) - 1))
+        Y = s.y[ng:-ng].reshape((1, -1) + (1,) * (len(n) - 2))
+        r2 = X**2 if cyl else (X - 0.5)**2 + (Y - 0.5)**2
+        if dims == 3:
+            r2 = r2 + (s.z[ng:-ng].reshape(1, 1, -1) - 0.5)**2
+        s.Er[...] = 1.0 + xp.exp(-r2 / w0**2) + 0.0 * s.Er          # background 1 keeps R << 1
+        Vw = getattr(s, "dV", s.cfg.dx * s.cfg.dy * s.cfg.dz)
+        m2 = lambda: float(xp.sum((s.Er - 1.0) * r2 * Vw)) / float(xp.sum((s.Er - 1.0) * Vw))
+        a0 = m2()
+        Ui = interior(s)
+        h = (s.cfg.dx, s.cfg.dy) + ((s.cfg.dz,) if dims == 3 else ())
+        radial = (s.rf[ng:ng + s.cfg.nx + 1], s.rc[ng:ng + s.cfg.nx]) if cyl else None
+        for _ in range(10):
+            fld.step(s.Er, Ui, s.eos, s.cfg, h, per(s), t2 / 10, radial=radial, advect=False)
+        ndir = 2 if cyl else dims
+        err = abs((m2() - a0) / (2 * ndir * D * t2) - 1)
+        cases.append((name, err, ndir))
+    good = all(e < 0.01 for _, e, _ in cases)
+    ok = ok and good
+    print("  optically thick Gaussian: second moment growth vs 2 D t per direction: "
+          + ", ".join(f"{nm} {100 * e:.2f}% off" for nm, e, _ in cases) + f"  [{'PASS' if good else 'FAIL'}]")
+
+    # (3) optically thin slab lit from x = 0 (E = 1): front at most c t
+    s = make(MHDSolver, (400, 4), (1.0, 0.01), bc_x_type="extrapolation", fld_kr0=1e-6, fld_E_xmin=1.0,
+             fld_advect=False)
+    s.Er[...] = 1e-10
+    Ui = interior(s)
+    t, dt3 = 0.0, 0.0025
+    while t < 0.5 - 1e-12:
+        fld.step(s.Er, Ui, s.eos, s.cfg, (s.cfg.dx, s.cfg.dy), per(s), dt3, advect=False)
+        t += dt3
+    E = to_numpy(s.Er[:, 0])
+    x = (np.arange(400) + 0.5) / 400
+    front = float(x[np.argmax(E < 0.5)])
+    good = 0.9 * t <= front <= t + 2 / 400
+    ok = ok and good
+    print(f"  optically thin, hot wall: front (E_r = 1/2) at x = {front:.4f} at c t = {t:.2f}  "
+          f"[{'PASS' if good else 'FAIL'}]")
+
+    # (4) advection by a uniform flow with the hydrodynamics running
+    s = make(MHDSolver, (128, 4), (1.0, 4 / 128), fld_c=1.0, fld_kr0=1e8, fld_a=0.0)
+    W = cons_to_prim(s.U, s.eos)
+    W[iVX] = 0.5
+    s.U = prim_to_cons(W, s.eos)
+    xc = to_numpy(s.x[s.ng:-s.ng])
+    s.Er[...] = xp.asarray(np.exp(-((xc - 0.3) / 0.05)**2))[:, None] + 0.0 * s.Er
+    cen0 = float(np.sum(to_numpy(s.Er[:, 0]) * xc) / np.sum(to_numpy(s.Er[:, 0])))
+    E0 = _energy(s) + s.radiation_energy()
+    _march(s, 0.4)
+    cen = float(np.sum(to_numpy(s.Er[:, 0]) * xc) / np.sum(to_numpy(s.Er[:, 0])))
+    dE = abs(_energy(s) + s.radiation_energy() - E0 - s._cumulative_boundary_energy) / E0
+    good = abs(cen - cen0 - 0.5 * 0.4) < 1e-3 and dE < 1e-13
+    ok = ok and good
+    print(f"  advection with the flow (v = 0.5, t = 0.4): pulse centre moved {cen - cen0:.4f} (exact 0.2000); "
+          f"gas + radiation energy {dE:.1e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
+def render3d_test():
+    """3D output and rendering (sieve/io3d.py, scripts/render_3d.py): a 32^3 state with a liner shell, a hot core
+    and a twisted field is written as .vti (+ .pvd) and .h5, read back to the same arrays, and rendered off
+    screen (volume, liner isosurface, hot-spot contours, field lines) to non-blank PNGs and an MP4. Skipped
+    (reported, not failed) without pyvista."""
+    import tempfile
+    print("\n--- 3D output and rendering ---"); sys.stdout.flush()
+    try:
+        import pyvista  # noqa: F401
+    except ImportError:
+        print("  SKIPPED: pyvista not installed (pip install pyvista imageio imageio-ffmpeg h5py)")
+        return True
+    from sieve.solver3d import MHDSolver3D
+    from sieve import io3d
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    import render_3d
+    cfg = Config(nx=32, ny=32, nz=32, x_min=-1, x_max=1, y_min=-1, y_max=1, z_max=2.0, t_end=1.0, cfl=0.3,
+                 mach=1.0, B_transverse=1.0, bc_x_type="periodic", bc_y_type="periodic", powell_source=False,
+                 diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver3D(cfg)
+    X, Y, Z = s.x[:, None, None], s.y[None, :, None], s.z[None, None, :]
+    r = xp.sqrt(X**2 + Y**2) + 0.0 * Z
+    W = xp.zeros((NVAR,) + s.U.shape[1:])
+    shell = 0.5 * (1 + xp.tanh((r - 0.5) / 0.05)) * 0.5 * (1 - xp.tanh((r - 0.7) / 0.05))
+    W[iRHO] = 1.0 + 9.0 * shell
+    W[iPR] = 1.0 + 4.0 * xp.exp(-(r / 0.25)**2 - ((Z - 1.0) / 0.4)**2)
+    W[iCLR] = shell
+    W[iBZ] = 1.0 + 0.0 * r
+    W[iBX], W[iBY] = -0.3 * Y * xp.exp(-r**2), 0.3 * X * xp.exp(-r**2)     # twist about the axis
+    s.U = prim_to_cons(W, s.eos)
+    out = tempfile.mkdtemp(prefix="render3d_")
+    rec = io3d.Recorder(out, fmt=("vti", "h5"))
+    rec(s)
+    s.t = 0.1
+    s.U[iBZ] *= 1.2                                          # conserved and primitive B share the index
+    rec(s)
+    a = io3d.fields(s)
+    g1, g2 = render_3d.load(os.path.join(out, "vtk", "frame_0001.vti")), render_3d.load(os.path.join(out, "h5", "frame_0001.h5"))
+    back = max(float(np.max(np.abs(np.asarray(g.cell_data["rho"]) - a["rho"].ravel(order="F")))) for g in (g1, g2))
+    with contextlib.redirect_stdout(io.StringIO()):
+        pngs, mp4 = render_3d.render(render_3d.frames_from([os.path.join(out, "series.pvd")]),
+                                     os.path.join(out, "renders"), size=(640, 480), fps=4)
+    import imageio.v2 as imageio
+    spread = min(float(np.std(imageio.imread(p)[..., :3])) for p in pngs)
+    good = back < 1e-6 and len(pngs) == 2 and spread > 5.0 and mp4 is not None and os.path.getsize(mp4) > 1000
+    print(f"  wrote 2 frames (.vti/.pvd and .h5), read back to {back:.1e}; rendered {len(pngs)} PNGs (pixel spread "
+          f"{spread:.0f}) and {os.path.basename(mp4) if mp4 else 'no movie'}  [{'PASS' if good else 'FAIL'}]")
+    return good
+
+
+def tabular_test():
+    """Tabulated EOS and opacities (sieve/tabular.py). (1) A Mie-Gruneisen aluminium table with power-law
+    opacities written as SESAME ASCII (tables 301, 502, 505) reads back to the same arrays. (2) An ideal-gas
+    table as the liner over the whole of a Sod shock tube reproduces the analytic ideal-gas run (log-log
+    interpolation is exact for power laws). (3) The aluminium table reproduces the analytic Mie-Gruneisen
+    liner in a 2 km/s impact, and p(rho, e) stays continuous where the states leave the table for the
+    analytic fallback. (4) FLD with the opacities from a table matches FLD with the same power laws."""
+    import tempfile
+    from sieve import tabular, fld
+    print("\n--- Tabular EOS and opacities ---"); sys.stdout.flush()
+    tmp = tempfile.mkdtemp(prefix="tab_")
+    ok = True
+    # (1) SESAME round trip
+    tab = tabular.mie_gruneisen_table(2700.0, 5328.0, 1.338, 2.0, 900.0, (1500.0, 6000.0), (10.0, 3e5), 60, 70,
+                                      kappa=(1e-2, 4e-2, 1.0, -1.5))
+    nr, nt = len(tab["rho"]), len(tab["T"])
+    w301 = np.concatenate([[nr, nt], tab["rho"] / 1e3, tab["T"], tab["p"].T.ravel() / 1e9, tab["e"].T.ravel() / 1e6,
+                           np.zeros(nr * nt)])
+    lk = lambda k: np.concatenate([[nr, nt], np.log10(tab["rho"] / 1e3), np.log10(tab["T"] / 11604.518),
+                                   np.log10(k.T.ravel() / 0.1)])
+    path = os.path.join(tmp, "al_test.ses")
+    tabular.write_sesame(path, 3719, {301: w301, 502: lk(tab["kappa_R"]), 505: lk(tab["kappa_P"])})
+    back = tabular.load(path)
+    rt = max(float(np.max(np.abs(back[k] - tab[k]) / np.max(np.abs(tab[k])))) for k in ("rho", "T", "p", "e", "kappa_R", "kappa_P"))
+    good = rt < 1e-12
+    ok = ok and good
+    print(f"  SESAME ASCII (301, 502, 505) round trip: {rt:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+    # (2) ideal-gas table vs ideal gas, Sod (code units = SI here: R = 1, theta = T)
+    ig = os.path.join(tmp, "ideal.npz")
+    np.savez(ig, **tabular.ideal_gas_table(1.4, 1.0, (0.01, 10.0), (0.01, 100.0), 40, 50))
+    runs = []
+    for table in ("", ig):
+        cfg = Config(nx=400, ny=4, x_max=1.0, y_max=0.01, t_end=0.2, cfl=0.3, mach=1.0, gamma=1.4, B_transverse=0.0,
+                     bc_x_type="extrapolation", bc_y_type="periodic", material_tracer="volume_fraction",
+                     eos_liner="ideal", gamma_liner=1.4, eos_table=table, tab_rho_unit=1.0, tab_v_unit=1.0,
+                     diag_interval=10**9, snapshot_times=[])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        W = xp.zeros((NVAR,) + s.U.shape[1:])
+        left = s.X < 0.5
+        W[iRHO], W[iPR], W[iCLR] = xp.where(left, 1.0, 0.125), xp.where(left, 1.0, 0.1), 1.0
+        s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+        _march(s, 0.2)
+        runs.append((to_numpy(cons_to_prim(s.U, s.eos)[:, s.ng:-s.ng, s.ng]), s.step))
+    (Wa, na), (Wt, nt_) = runs
+    d = max(float(np.max(np.abs(Wt[k] - Wa[k]))) / float(np.max(np.abs(Wa[k]))) for k in (iRHO, iPR, iVX))
+    good = d < 1e-8 and na == nt_
+    ok = ok and good
+    print(f"  ideal-gas table vs ideal gas, Sod: {na}/{nt_} steps, max rel diff {d:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+    # (3) Mie-Gruneisen table vs analytic MG: Al on Al at 2 km/s (g/cc, km/s, GPa)
+    alp = os.path.join(tmp, "al.npz")
+    np.savez(alp, **tabular.mie_gruneisen_table(2700.0, 5328.0, 1.338, 2.0, 900.0, (2000.0, 4500.0), (10.0, 4e4), 80, 80))
+    mg = dict(eos_liner="mie_gruneisen", mg_rho0=2.7, mg_c0=5.328, mg_s=1.338, mg_gamma0=2.0)
+    runs = []
+    for table in ("", alp):
+        cfg = Config(nx=400, ny=4, x_max=1.0, y_max=0.01, t_end=0.06, cfl=0.3, mach=1.0, gamma=1.4, B_transverse=0.0,
+                     bc_x_type="extrapolation", bc_y_type="periodic", material_tracer="volume_fraction", eos_table=table,
+                     tab_rho_unit=1000.0, tab_v_unit=1000.0, diag_interval=10**9, snapshot_times=[], **mg)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        W = xp.zeros((NVAR,) + s.U.shape[1:])
+        W[iRHO], W[iPR], W[iCLR] = 2.7, 1e-4, 1.0
+        W[iVX] = xp.where(s.X < 0.5, 2.0, 0.0)
+        s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+        _march(s, 0.06)
+        runs.append(to_numpy(cons_to_prim(s.U, s.eos)[:, s.ng:-s.ng, s.ng]))
+    Wa, Wt = runs
+    pa, pt = float(Wa[iPR][Wa[iVX].size // 2]), float(Wt[iPR][Wt[iVX].size // 2])
+    d = max(float(np.max(np.abs(Wt[k] - Wa[k]))) / float(np.max(np.abs(Wa[k]))) for k in (iRHO, iPR, iVX))
+    # continuity into the fallback: sweep e across the top of the table at fixed density
+    tm = s.eos.tab
+    rho = xp.full(4000, 3.0)
+    e = xp.linspace(0.0, 2.0 * float(tm.g.host["e"].max()) if not tm.g.logs["e"] else 2 * float(10**tm.g.host["e"].max()), 4000)
+    p = to_numpy(tm.pressure(rho, e))
+    jump = float(np.max(np.abs(np.diff(p)))) / float(np.max(np.abs(p)))
+    good = d < 5e-3 and jump < 2e-3
+    ok = ok and good
+    print(f"  Mie-Gruneisen table vs analytic, 2 km/s Al impact: shocked p {pt:.3f} vs {pa:.3f} GPa, max rel diff "
+          f"{d:.1e}; p(e) across the table edge: largest step {jump:.1e} of the range (4000 samples)  "
+          f"[{'PASS' if good else 'FAIL'}]")
+
+    # (4) opacity table vs the same power laws in FLD (code = SI; kappa = k0 rho theta^-1.5)
+    op = os.path.join(tmp, "kap.npz")
+    rho_k, T_k = np.geomspace(0.1, 10, 30), np.geomspace(0.1, 10, 30)
+    R_, T_ = np.meshgrid(rho_k, T_k, indexing="ij")
+    np.savez(op, rho=rho_k, T=T_k, kappa_R=2.0 * R_ * T_**-1.5, kappa_P=5.0 * R_ * T_**-1.5)
+    res = []
+    for table in ("", op):
+        kw = dict(fld=True, fld_c=10.0, fld_a=1.0, fld_advect=False)
+        kw.update(dict(fld_opacity_table=op, tab_rho_unit=1.0, tab_L_unit=1.0, tab_T_unit=1.0) if table else
+                  dict(fld_kr0=2.0, fld_kr_rho=1.0, fld_kr_T=-1.5, fld_kp0=5.0, fld_kp_rho=1.0, fld_kp_T=-1.5))
+        cfg = Config(nx=64, ny=64, x_max=1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=5 / 3, B_transverse=0.0,
+                     bc_x_type="periodic", bc_y_type="periodic", diag_interval=10**9, snapshot_times=[], **kw)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        W = xp.zeros((NVAR,) + s.U.shape[1:])
+        r2 = (s.X - 0.5)**2 + (s.Y - 0.5)**2
+        W[iRHO], W[iPR] = 1.0 + 0.5 * xp.exp(-r2 / 0.02), 1.0 + 2.0 * xp.exp(-r2 / 0.01)
+        s.U = prim_to_cons(W, s.eos)
+        s.Er[...] = 0.5
+        Ui = s.U[:, s.ng:-s.ng, s.ng:-s.ng]
+        for _ in range(20):
+            fld.step(s.Er, Ui, s.eos, s.cfg, (s.cfg.dx, s.cfg.dy), (True, True), 2e-3, advect=False)
+        res.append((to_numpy(s.Er), to_numpy(cons_to_prim(Ui, s.eos)[iPR])))
+    d = max(float(np.max(np.abs(res[1][k] - res[0][k]))) / float(np.max(np.abs(res[0][k]))) for k in (0, 1))
+    good = d < 1e-9
+    ok = ok and good
+    print(f"  FLD with tabulated opacities vs the same power laws: max rel diff {d:.1e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
+def validation_test():
+    """Goodness of fit and calibration (sieve/validation.py) on analytic signals with known noise:
+    (1) data = model + Gaussian noise (sigma known): chi^2_nu of the true model within its statistical spread
+    (|chi^2_nu - 1| < 4 sqrt(2/dof)), RMS within 10% of sigma; (2) a model delayed by 37 ns: the peak offset and
+    the fitted timing shift recover the delay to 2 ns; (3) a 1-parameter scan: the parabola recovers the true
+    amplitude within 3 sigma, and sigma matches the Fisher value sigma / sqrt(sum f^2) to 5%; (4) CSV round
+    trip of a trace."""
+    import tempfile
+    from sieve import validation as val
+    print("\n--- Validation metrics and calibration ---"); sys.stdout.flush()
+    rng = np.random.default_rng(3)
+    t = np.linspace(0.0, 4.0, 801)
+    model = lambda t, A=1.0, d=0.0: A * np.exp(-((t - 2.0 - d) / 0.4)**2) * np.sin(6 * (t - d))
+    sig = 0.02
+    tr = val.Trace("sig", t, model(t) + rng.normal(0, sig, t.size), sig, "V", "bdot")
+    ts = np.linspace(-0.5, 4.5, 5001)
+    m = val.compare(tr, ts, model(ts))
+    ok1 = abs(m["chi2_nu"] - 1) < 4 * np.sqrt(2 / m["dof"]) and abs(m["rms"] / sig - 1) < 0.1
+    m2 = val.compare(tr, ts, model(ts, d=0.037), fit_shift=True, max_shift=0.1)
+    ok2 = abs(m2["peak_offset"] - 0.037) < 0.002 and abs(m2["shift"] + 0.037) < 0.002
+    vals = np.linspace(0.9, 1.1, 5)
+    chi = [val.compare(tr, ts, model(ts, A=v))["chi2"] for v in vals]
+    best, s, _ = val.calibrate(vals, chi)
+    fisher = sig / np.sqrt(np.sum(model(t)**2 / 1.0**2))
+    ok3 = abs(best - 1.0) < 3 * fisher and abs(s / fisher - 1) < 0.05
+    p = os.path.join(tempfile.mkdtemp(prefix="val_"), "t.csv")
+    val.save_trace(p, tr)
+    back = val.load_trace(p, kind="bdot")
+    ok4 = float(np.max(np.abs(back.y - tr.y))) < 1e-12 and float(np.max(np.abs(back.sigma - tr.sigma))) < 1e-15
+    print(f"  true model: chi2_nu {m['chi2_nu']:.3f} (dof {m['dof']}), RMS {m['rms'] / sig:.3f} sigma  "
+          f"[{'PASS' if ok1 else 'FAIL'}]")
+    print(f"  37 ns delay: peak offset {1e3 * m2['peak_offset']:.1f} ns, fitted shift {1e3 * m2['shift']:+.1f} ns  "
+          f"[{'PASS' if ok2 else 'FAIL'}]")
+    print(f"  amplitude scan: {best:.4f} +- {s:.4f} (true 1, Fisher sigma {fisher:.4f})  [{'PASS' if ok3 else 'FAIL'}]")
+    print(f"  CSV round trip  [{'PASS' if ok4 else 'FAIL'}]")
+    return ok1 and ok2 and ok3 and ok4
+
+
+def circuit_test():
+    """RLC drive circuit (sieve/circuit.py). (1) Fixed load: the underdamped discharge I = V0/(w L) e^(-a t)
+    sin(w t) to 1e-6 of the peak at 4000 steps, bank energy budget to round-off. (2) An Al liner (R 10-11 mm,
+    10 mm long) at rest, driven by a 200 uF, 30 kV bank on a 64 x 4 r-z grid: bank + grid conserve energy
+    to round-off, the hydro energy budget closes with the drive work, and at 5 us (drive below 1.5 GPa, so
+    the metal barely compresses) the outer radius and current match an incompressible thick shell on the
+    same circuit."""
+    print("\n--- RLC drive circuit ---"); sys.stdout.flush()
+    import argparse
+    import csv as _csv
+    import tempfile
+    from sieve.circuit import RLCCircuit, thick_shell
+    C, V, L, R, n, T = 100e-6, 40e3, 30e-9, 2e-3, 4000, 8e-6
+    c = RLCCircuit(C, V, L, R)
+    a_, w = R / (2 * L), np.sqrt(1 / (L * C) - (R / (2 * L))**2)
+    err = 0.0
+    for i in range(n):
+        c.advance(T / n, L)
+        t = (i + 1) * T / n
+        err = max(err, abs(c.I - V / (w * L) * np.exp(-a_ * t) * np.sin(w * t)))
+    rel = err / (V / (w * L) * np.exp(-a_ * np.arctan(w / a_) / w) * np.sin(np.arctan(w / a_)))
+    ok1 = rel < 1e-6 and abs(c.budget_error()) < 1e-13
+    print(f"  fixed load: current within {rel:.1e} of the exact discharge, bank budget {c.budget_error():.1e}  "
+          f"[{'PASS' if ok1 else 'FAIL'}]")
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples"))
+    import fcg_flux_compression as fcg
+    out = tempfile.mkdtemp(prefix="circuit_")
+    t_end = 5.0
+    a = argparse.Namespace(liner_material="al", b0_tesla=1.0, v0_kms=0.0, enable_strength=False, eta_model="ideal",
+                           sigma_gas=None, sigma_min=5e6, r0=10.0, dr=1.0, r_max=14.0, lz=10.0, mode=1, amp=0.0,
+                           rho_gas=0.1, p_gas_bar=0.1, nr=64, nz=4, t_end=t_end, frame_dt=10.0, diag_every=5,
+                           capacitance_uf=200.0, voltage_kv=30.0, inductance_nh=15.0, resistance_mohm=1.0,
+                           r_return_mm=14.0)
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = fcg.run(a, out)
+    rows = list(_csv.DictReader(open(os.path.join(out, "diagnostics.csv"))))
+    last = {k: float(v) for k, v in rows[-1].items()}
+    ts, rs, Is = thick_shell(200e-6, 30e3, 15e-9, 1e-3, 11e-3, 10e-3, 2700.0, 10e-3, 14e-3, last["t_us"] * 1e-6,
+                            n=20000)
+    dr_ = abs(last["r_out_mm"] - rs[-1] * 1e3) / (11.0 - rs[-1] * 1e3)    # error relative to the distance moved
+    dI = abs(last["I_MA"] - Is[-1] / 1e6) / (np.abs(Is).max() / 1e6)           # relative to the peak
+    cc = r["circuit"]
+    ok2 = (r["energy_error_max"] < 1e-12 and cc["work_mismatch_over_bank"] < 1e-12
+           and abs(cc["circuit_budget_error"]) < 1e-12 and dr_ < 0.03 and dI < 0.01)
+    print(f"  driven liner, {r['steps']} steps to {last['t_us']:.2f} us: I {last['I_MA']:.3f} MA (thick shell "
+          f"{Is[-1] / 1e6:.3f}), outer radius {last['r_out_mm']:.3f} mm (thick shell {rs[-1] * 1e3:.3f}; "
+          f"{100 * dr_:.1f}% of the distance moved); bank + grid energy {cc['work_mismatch_over_bank']:.1e}, hydro "
+          f"budget {r['energy_error_max']:.1e}; load L from work vs radius {100 * cc['L_energy_vs_geom_max_rel']:.2g}% "
+          f"apart  [{'PASS' if ok2 else 'FAIL'}]")
+    return ok1 and ok2
+
+
 VERIFICATION_TESTS = {
     "brio_wu": brio_wu_test,
     "alfven": alfven_convergence_test,
@@ -1303,6 +1863,13 @@ VERIFICATION_TESTS = {
     "galilean": galilean_test,
     "rmi_mhd": rmi_mhd_smoke_test,
     "fcg": fcg_smoke_test,
+    "circuit": circuit_test,
+    "solid_nernst_3d": solid_nernst_3d_test,
+    "mpi": mpi_test,
+    "fld": fld_test,
+    "render3d": render3d_test,
+    "tabular": tabular_test,
+    "validation": validation_test,
 }
 
 

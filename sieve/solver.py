@@ -26,6 +26,7 @@ from .config import (
 )
 from .diagnostics import diagnostics_for_solver
 from .eos import make_eos
+from . import fld
 from . import ct
 from . import fused
 from . import transport
@@ -186,6 +187,9 @@ class MHDSolver:
         self._stage_ohmic_rate = xp.zeros(())
         # radiated energy (split step after each RK step; removed from E, so it is a budget term)
         self._acc_rad = xp.zeros(())
+        # grey FLD radiation energy density on interior cells, and the radiation energy that entered the domain
+        self.Er = xp.zeros((config.nx, config.ny)) if config.fld else None
+        self.fld_inflow = 0.0
         self._inflow_U = None
         self._inflow_superfast = None
         self._dt_limiter = "hyperbolic"
@@ -495,6 +499,10 @@ class MHDSolver:
         """Energy radiated away so far (optically thin bremsstrahlung)."""
         return float(self._acc_rad)
 
+    def radiation_energy(self):
+        """FLD radiation energy on the grid (integral of E_r; per radian in r-z)"""
+        return float(xp.sum(self.Er * self.dV)) if self.Er is not None else 0.0
+
     @property
     def cumulative_ohmic_heating(self):
         """Integral of eta |J|^2 over the domain and time so far."""
@@ -579,6 +587,18 @@ class MHDSolver:
     def _periodic(self):
         return (self.cfg.get_bc_x() == "periodic", self.cfg.bc_y_type == "periodic")
 
+    # hooks a domain-decomposed subclass (sieve/parallel.py) overrides: ghost faces, edge EMFs, extra arrays
+    def _ghost_faces(self, Bf, U):
+        ct.ghost_faces(Bf, U, self.ng, (self.cfg.nx, self.cfg.ny), self._periodic())
+        if self.cyl:
+            self._axis_faces(Bf)
+
+    def _emf_hook(self, E):
+        return E
+
+    def _halo(self, A):
+        pass
+
     def div_b_max(self):
         """max |div B| h / max |B| on interior cells: face divergence with CT, central differences with GLM"""
         cfg, ng = self.cfg, self.ng
@@ -608,13 +628,12 @@ class MHDSolver:
             ct.cells_from_faces(U, Bf, inner)
         U = self.apply_bc(U)
         if self.ct:
-            ct.ghost_faces(Bf, U, ng, (nx, ny), self._periodic())
-            if self.cyl:
-                self._axis_faces(Bf)
+            self._ghost_faces(Bf, U)
         eos = self.eos
         W = cons_to_prim(U, eos)
         if self.strength:
             stren.bc(S, ng, nx, ny, self._periodic(), self.cyl)
+            self._halo(S)
             spalled = (S[stren.DMG] > 0.5) & (W[iCLR] > 0.5)       # spalled liner carries no tension
             W[iPR] = xp.where(spalled, xp.maximum(W[iPR], 0.0), W[iPR])
         WLx, WRx = muscl_x(W, eos); s = WLx.shape
@@ -719,6 +738,7 @@ class MHDSolver:
             if eta is not None:
                 J = ct.edge_current([f[..., None] for f in Bf], 0, 1, cfg.dx, cfg.dy, nx, ny)[..., 0]
                 E = E + ct.edge_eta(eta, nx, ny) * J
+            E = self._emf_hook(E)
             dBf[0][...] = 0.0
             dBf[1][...] = 0.0
             if self.cyl:
@@ -776,7 +796,7 @@ class MHDSolver:
         dt = self.dt; self._glm_ch_frozen = self.cfg.glm_ch
         self._ct_sync()
         self._te_sync()
-        if self.ct and self.cfg.use_cuda_graphs and xp.__name__ == "cupy":
+        if self.ct and self.cfg.use_cuda_graphs and xp.__name__ == "cupy" and not getattr(self.eos, "no_graph", False):
             self._rk_graph(dt)
         else:
             self._rk_core(dt)
@@ -873,6 +893,13 @@ class MHDSolver:
                          electron_Z=cfg.z_ion if cfg.two_temp else None)
             self.U[inner] = Ui
             self._acc_rad += xp.sum(dE * self.dV)
+        if self.cfg.fld:
+            ng, cfg = self.ng, self.cfg
+            Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
+            radial = (self.rf[ng:ng + cfg.nx + 1], self.rc[ng:ng + cfg.nx]) if self.cyl else None
+            _, din, self.fld_iters = fld.step(self.Er, Ui, self.eos, cfg, (cfg.dx, cfg.dy), self._periodic(), dt,
+                                             radial=radial, advect=cfg.fld_advect)
+            self.fld_inflow += din
         if self.cfg.cond_kappa0 > 0:
             ng, cfg = self.ng, self.cfg
             Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
@@ -899,9 +926,7 @@ class MHDSolver:
             self.visc_stages = viscous_step(Ui, eta, (cfg.dx, cfg.dy), self._periodic(), fuel, dt)
         self.apply_bc(self.U)
         if self.ct:
-            ct.ghost_faces(self.Bf, self.U, self.ng, (self.cfg.nx, self.cfg.ny), self._periodic())
-            if self.cyl:
-                self._axis_faces(self.Bf)
+            self._ghost_faces(self.Bf, self.U)
         if self._glm_ch_frozen > 0 and not self.ct:
             decay = np.exp(-self.cfg.glm_alpha * self._glm_ch_frozen * dt / min(self.cfg.dx, self.cfg.dy))
             self.U[PSI] *= decay

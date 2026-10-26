@@ -1,5 +1,5 @@
-# solver3d.py - 3D extension of MHDSolver: unsplit MUSCL-HLLD in x, y, z with GLM + Powell,
-# conservative resistive terms (constant eta),
+# solver3d.py - 3D extension of MHDSolver: unsplit MUSCL-HLLD in x, y, z with CT or GLM + Powell,
+# conservative resistive terms, Nernst/Ettingshausen transport (CT) and liner strength,
 # the same driven-shock boundaries (z periodic) and the pressure-balanced stripe set-up.
 import io
 import time
@@ -18,6 +18,9 @@ from .physics import (xp, cons_to_prim, prim_to_cons, hlld_flux_x, parallel_stri
 from .eos import make_eos
 from . import ct
 from . import twotemp
+from . import transport
+from . import strength as stren
+from . import fld
 from .viscosity import viscous_step
 from .solver import MHDSolver, to_numpy
 
@@ -137,11 +140,8 @@ class MHDSolver3D:
             raise ValueError("solver3d needs nz >= 4")
         if cfg.geometry != "cartesian":
             raise NotImplementedError("cylindrical geometry is implemented in the 2D solver")
-        if cfg.nernst_coeff > 0:
-            raise NotImplementedError("Nernst/Ettingshausen are implemented in the 2D solver")
-        if cfg.strength:
-            raise NotImplementedError("liner strength is implemented in the 2D solver")
         self.cfg = cfg
+        self.strength = cfg.strength
         # float gamma for one ideal gas, eos.EOS for two materials (volume-fraction tracer)
         self.eos = make_eos(cfg)
         self._vf = not isinstance(self.eos, (int, float)) and self.eos.volume_fraction
@@ -159,6 +159,10 @@ class MHDSolver3D:
         self.U_temp = xp.empty(shape)
         self.U_stage = xp.empty(shape)
         self.dU = xp.empty(shape)
+        if cfg.strength:                             # S_xx, S_yy, S_xy, damage, S_xz, S_yz
+            self.S = xp.zeros((6,) + shape[1:])
+            self._S1 = xp.zeros_like(self.S)
+            self._dS = xp.zeros_like(self.S)
         self.t = 0.0
         self.step = 0
         self.dt = 0.0
@@ -169,6 +173,8 @@ class MHDSolver3D:
         self._acc_boundary = xp.zeros(())
         self._acc_powell = xp.zeros(())
         self._acc_rad = xp.zeros(())
+        self.Er = xp.zeros((cfg.nx, cfg.ny, cfg.nz)) if cfg.fld else None
+        self.fld_inflow = 0.0
         self._rate_boundary = xp.zeros(())
         self._rate_powell = xp.zeros(())
         self.diag = {}
@@ -332,17 +338,44 @@ class MHDSolver3D:
     def compute_dt(self, W):
         cfg = self.cfg
         rho = xp.maximum(W[iRHO], FLOOR_RHO)
-        cf = xp.sqrt(sound_speed2(W, self.eos) + (W[iBX]**2 + W[iBY]**2 + W[iBZ]**2) / rho)
+        c2 = sound_speed2(W, self.eos)
+        if self.strength:                            # longitudinal elastic waves: c^2 + 4 G / (3 rho)
+            c2 = c2 + 4.0 * self._shear(W) / (3.0 * rho)
+        cf = xp.sqrt(c2 + (W[iBX]**2 + W[iBY]**2 + W[iBZ]**2) / rho)
         sx, sy, sz = xp.abs(W[iVX]) + cf, xp.abs(W[iVY]) + cf, xp.abs(W[iVZ]) + cf
         self._ch = max(float(xp.max(xp.maximum(xp.maximum(sx, sy), sz))), 1e-12)
-        h = min(cfg.dx, cfg.dy, cfg.dz)
+        h3 = (cfg.dx, cfg.dy, cfg.dz)
+        h = min(h3)
         inv = max(float(xp.max(xp.maximum(xp.maximum(sx / cfg.dx, sy / cfg.dy), sz / cfg.dz))), self._ch / h)
         dt = cfg.cfl / inv
         if cfg.is_resistive():
             # explicit diffusion: dt <= 1 / (2 eta_max (1/dx^2 + 1/dy^2 + 1/dz^2))
             eta_max = max(eta_max_of(resistivity_field(W, cfg)), 1e-300)
             dt = min(dt, 0.5 / (eta_max * (cfg.dx**-2 + cfg.dy**-2 + cfg.dz**-2)))
+        if cfg.nernst_coeff > 0:                     # Nernst advection of B
+            v, _, _, _ = transport.nernst_velocity_3d(W, cfg.nernst_coeff, cfg.cond_x0, cfg.cond_tracer_max, h3)
+            vN = float(xp.max(xp.maximum(xp.maximum(xp.abs(v[0]) / cfg.dx, xp.abs(v[1]) / cfg.dy),
+                                         xp.abs(v[2]) / cfg.dz)))
+            if vN > 0:
+                dt = min(dt, cfg.cfl / vN)
         return dt
+
+    def _shear(self, W, S=None):
+        S = self.S if S is None else S
+        return self.cfg.shear_modulus * xp.clip(W[iCLR], 0, 1) * (1 - S[stren.DMG])
+
+    def _periodic(self):
+        return (self.cfg.get_bc_x() == "periodic", True, True)
+
+    # hooks a domain-decomposed subclass (sieve/parallel.py) overrides: ghost faces, edge EMFs, extra arrays
+    def _ghost_faces(self, Bf, U):
+        ct.ghost_faces(Bf, U, self.ng, (self.cfg.nx, self.cfg.ny, self.cfg.nz), self._periodic())
+
+    def _emf_hook(self, E):
+        return E
+
+    def _halo(self, A):
+        pass
 
     # ------------------------------------------------------------ right-hand side
 
@@ -390,8 +423,8 @@ class MHDSolver3D:
         Bm = float(xp.max(xp.sqrt(self.U[BX]**2 + self.U[BY]**2 + self.U[BZ]**2)))
         return float(xp.max(xp.abs(d))) * min(h) / max(Bm, 1e-300)
 
-    def _ct_face_rates(self, Fs, W, Bf, dBf, eta):
-        """dB/dt = -curl E on the faces, E on the edges from edge_emf (plus eta J)"""
+    def _ct_face_rates(self, Fs, W, Bf, dBf, eta, vN=None):
+        """dB/dt = -curl E on the faces, E on the edges from edge_emf (plus eta J, plus the Nernst EMF)"""
         cfg, ng = self.cfg, self.ng
         n, h = (cfg.nx, cfg.ny, cfg.nz), (cfg.dx, cfg.dy, cfg.dz)
         E = []
@@ -406,7 +439,11 @@ class MHDSolver3D:
                 J = ct.edge_current(Bp, a, b, h[a], h[b], n[a], n[b])
                 e = eta if isinstance(eta, (int, float)) else eta.transpose(order)
                 Ec = Ec + ct.edge_eta(e, n[a], n[b]) * J
+            if vN is not None:
+                Ec = Ec + transport.nernst_edge(vN[a].transpose(order), vN[b].transpose(order),
+                                                Bf[a].transpose(order), Bf[b].transpose(order), n[a], n[b])
             E.append(Ec.transpose(tuple(int(k) for k in np.argsort(order))))   # back to (x, y, z)
+        E = self._emf_hook(E)
         for f in range(3):
             p, q = (f + 1) % 3, (f + 2) % 3
             # dB_f = -(d_p E_q - d_q E_p); E_q: faces on f and p, cells on q; E_p: faces on q and f, cells on p
@@ -426,7 +463,7 @@ class MHDSolver3D:
             tgt[f] = slice(ng, ng + n[f] + 1)
             dBf[f][tuple(tgt)] = -(dEq - dEp)
 
-    def compute_rhs(self, U, out, Bf=None, dBf=None):
+    def compute_rhs(self, U, out, Bf=None, dBf=None, S=None, dS=None):
         cfg = self.cfg
         ng, g, ch = self.ng, self.eos, self._ch
         n = (cfg.nx, cfg.ny, cfg.nz)
@@ -436,9 +473,15 @@ class MHDSolver3D:
             ct.cells_from_faces(U, Bf, tuple(slice(ng, ng + m) for m in n))
         U = self.apply_bc(U)
         if self.ct:
-            ct.ghost_faces(Bf, U, ng, n, (cfg.get_bc_x() == "periodic", True, True))
+            self._ghost_faces(Bf, U)
         W = cons_to_prim(U, g)
+        if self.strength:
+            stren.bc3d(S, ng, n, self._periodic())
+            self._halo(S)
+            spalled = (S[stren.DMG] > 0.5) & (W[iCLR] > 0.5)       # spalled liner carries no tension
+            W[iPR] = xp.where(spalled, xp.maximum(W[iPR], 0.0), W[iPR])
         Fs = [None] * 3
+        WLs, WRs = [None] * 3, [None] * 3
         out[...] = 0.0
         inner = (slice(None),) + tuple(slice(ng, ng + m) for m in n)
         rate = xp.zeros(())
@@ -453,6 +496,7 @@ class MHDSolver3D:
                 WL[iBX + ax - 1] = WR[iBX + ax - 1] = Bf[ax - 1][tuple(sel)]
             F = hlld_flux(WL, WR, ax, g, ch)
             Fs[ax - 1] = F
+            WLs[ax - 1], WRs[ax - 1] = WL, WR
             m = n[ax - 1]
             if self._vf:
                 # volume fraction: da/dt + u.grad(a) = 0 from the same face values as the energy flux
@@ -491,10 +535,42 @@ class MHDSolver3D:
             Rr, rate_r = resistive_terms_3d(U, eta, h, ng, n, cfg.eta_face_mean)
             out[inner] += Rr[inner]
             self._rate_boundary = self._rate_boundary + rate_r
+        dV = cfg.dx * cfg.dy * cfg.dz
+
+        def face_flux(var, G):                       # subtract div G (face arrays per axis), book the domain faces
+            for ax in range(3):
+                hi, lo = list(inner[1:]), list(inner[1:])
+                hi[ax], lo[ax] = slice(1, n[ax] + 1), slice(0, n[ax])
+                out[(var,) + inner[1:]] -= (G[ax][tuple(hi)] - G[ax][tuple(lo)]) / h[ax]
+                if var == EN:
+                    f0, f1 = list(inner[1:]), list(inner[1:])
+                    f0[ax], f1[ax] = 0, n[ax]
+                    self._rate_boundary = self._rate_boundary + xp.sum(G[ax][tuple(f0)] - G[ax][tuple(f1)]) * dV / h[ax]
+        vN = None
+        if cfg.nernst_coeff > 0:
+            if not self.ct:
+                raise NotImplementedError("Nernst transport in 3D needs div_b='ct'")
+            vN, fac, theta, fuel = transport.nernst_velocity_3d(W, cfg.nernst_coeff, cfg.cond_x0,
+                                                                cfg.cond_tracer_max, h)
+            G, divqE = transport.nernst_energy_3d(W, vN, fac, theta, fuel, cfg.nernst_coeff, h, n)
+            face_flux(EN, G)
+            if cfg.two_temp:                         # the Ettingshausen heat flux is carried by the electrons
+                rho_i = W[(iRHO,) + inner[1:]]
+                out[(RHOSE,) + inner[1:]] -= (cfg.gamma - 1) * divqE * rho_i**(1 - cfg.gamma)
+        if self.strength:
+            dSi, sf = stren.rates3d(S, W, Fs, WLs, WRs, self._shear(W, S), h, ng, n)
+            dS[...] = 0.0
+            dS[(slice(None),) + inner[1:]] = dSi
+            for k, var in enumerate((MX, MY, MZ, EN)):
+                face_flux(var, [sf[ax][k] for ax in range(3)])
         if self.ct:
             out[BX:BZ + 1] = 0.0                     # B lives on the faces
-            self._ct_face_rates(Fs, W, Bf, dBf, eta)
+            self._ct_face_rates(Fs, W, Bf, dBf, eta, vN)
         return out
+
+    def radiation_energy(self):
+        """FLD radiation energy on the grid"""
+        return float(xp.sum(self.Er)) * self.cfg.dx * self.cfg.dy * self.cfg.dz if self.Er is not None else 0.0
 
     @property
     def cumulative_radiated_energy(self):
@@ -514,20 +590,27 @@ class MHDSolver3D:
                 twotemp.init_equal(self.U, self.cfg.gamma, self.cfg.z_ion)
             self._te_owner = self.U
         F0, F1, dF = (self.Bf, self._Bf1, self._dBf) if self.ct else (None, None, None)
-        self.compute_rhs(U0, self.dU, F0, dF); self._acc(dt / 6)
+        S0, S1, dS = (self.S, self._S1, self._dS) if self.strength else (None, None, None)
+        self.compute_rhs(U0, self.dU, F0, dF, S0, dS); self._acc(dt / 6)
         if self.ct:
             for f0, f1, d in zip(F0, F1, dF):
                 xp.add(f0, dt * d, out=f1)
+        if self.strength:
+            xp.add(S0, dt * dS, out=S1)
         xp.add(U0, dt * self.dU, out=self.U_temp)
-        self.compute_rhs(self.U_temp, self.dU, F1, dF); self._acc(dt / 6)
+        self.compute_rhs(self.U_temp, self.dU, F1, dF, S1, dS); self._acc(dt / 6)
         if self.ct:
             for f0, f1, d in zip(F0, F1, dF):
                 f1[...] = 0.75 * f0 + 0.25 * (f1 + dt * d)
+        if self.strength:
+            S1[...] = 0.75 * S0 + 0.25 * (S1 + dt * dS)
         self.U_stage[...] = 0.75 * U0 + 0.25 * (self.U_temp + dt * self.dU)
-        self.compute_rhs(self.U_stage, self.dU, F1, dF); self._acc(2 * dt / 3)
+        self.compute_rhs(self.U_stage, self.dU, F1, dF, S1, dS); self._acc(2 * dt / 3)
         if self.ct:
             for f0, f1, d in zip(F0, F1, dF):
                 f0[...] = f0 / 3.0 + 2.0 / 3.0 * (f1 + dt * d)
+        if self.strength:
+            S0[...] = S0 / 3.0 + 2.0 / 3.0 * (S1 + dt * dS)
         self.U[...] = U0 / 3 + 2.0 / 3.0 * (self.U_stage + dt * self.dU)
         if self.ct:
             n3 = (self.cfg.nx, self.cfg.ny, self.cfg.nz)
@@ -539,10 +622,17 @@ class MHDSolver3D:
             self.U[RHOC] = rho * xp.clip(self.U[RHOC] / rho, 0.0, 1.0)
         cfg, ng = self.cfg, self.ng
         inner = (slice(None),) + tuple(slice(ng, ng + m) for m in (cfg.nx, cfg.ny, cfg.nz))
+        if self.strength:                            # radial return to the yield surface, spall damage
+            Wn = cons_to_prim(self.U, self.eos)
+            stren.plastic(self.S, xp.clip(Wn[iCLR], 0, 1), Wn[iPR], cfg.yield_strength, cfg.spall_strength, ng)
         if cfg.rad_coeff > 0:
             dE = radiate(self.U[inner], self.eos, cfg.rad_coeff, cfg.rad_T_min, cfg.rad_tracer_max, dt,
                          electron_Z=cfg.z_ion if cfg.two_temp else None)
             self._acc_rad += xp.sum(dE) * cfg.dx * cfg.dy * cfg.dz
+        if cfg.fld:
+            _, din, self.fld_iters = fld.step(self.Er, self.U[inner], self.eos, cfg, (cfg.dx, cfg.dy, cfg.dz),
+                                             self._periodic(), dt, advect=cfg.fld_advect)
+            self.fld_inflow += din
         if cfg.cond_kappa0 > 0:
             per = (cfg.get_bc_x() == "periodic", True, True)
             wall = cfg.cond_wall_T if cfg.cond_wall == "isothermal" else None
@@ -567,8 +657,7 @@ class MHDSolver3D:
         self._update_plateau()
         self.apply_bc(self.U)
         if self.ct:
-            ct.ghost_faces(self.Bf, self.U, self.ng, (self.cfg.nx, self.cfg.ny, self.cfg.nz),
-                           (self.cfg.get_bc_x() == "periodic", True, True))
+            self._ghost_faces(self.Bf, self.U)
         if self._ch > 0 and not self.ct:
             h = min(self.cfg.dx, self.cfg.dy, self.cfg.dz)
             self.U[PSI] *= np.exp(-self.cfg.glm_alpha * self._ch * dt / h)

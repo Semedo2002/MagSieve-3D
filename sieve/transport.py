@@ -102,3 +102,61 @@ def nernst_2d(W, Bf, cN, x0, tracer_max, dx, dy, nx, ny):
     divqE = (qEx[1:, 2:ny + 2] - qEx[:-1, 2:ny + 2]) / dx + (qEy[2:nx + 2, 1:] - qEy[2:nx + 2, :-1]) / dy
     vmax = xp.max(xp.sqrt(vx**2 + vy**2))                    # device scalar (no host sync)
     return E, dBw, Gx, Gy, vmax, divqE
+
+
+# ------------------------------------------------------------------ 3D (CT on all three face fields)
+
+def nernst_velocity_3d(W, cN, x0, tracer_max, h):
+    """v_N on 3D cells (zero outside the fuel and on the outer ring of each axis)"""
+    fac, theta = _bw_over_B(W, x0)
+    fuel = W[iCLR] < tracer_max
+    v = []
+    for ax in range(3):
+        g = xp.zeros_like(theta)
+        c, up, dn = [slice(None)] * 3, [slice(None)] * 3, [slice(None)] * 3
+        c[ax], up[ax], dn[ax] = slice(1, -1), slice(2, None), slice(None, -2)
+        g[tuple(c)] = (theta[tuple(up)] - theta[tuple(dn)]) / (2 * h[ax])
+        v.append(xp.where(fuel, -cN * fac * g, 0.0))
+    return v, fac, theta, fuel
+
+
+def nernst_edge(va, vb, Ba, Bb, na, nb):
+    """Nernst EMF E_c = -(v_a B_b - v_b B_a) on the edges along c, arrays ordered (a, b, c): the 2D corner
+    formula, v averaged from the four cells around the edge and each face field upwinded by the velocity
+    across it. Same edges as ct.edge_emf: a-faces 2..na+2 x b-faces 2..nb+2 x all c."""
+    c = lambda f: 0.25 * (f[1:na + 2, 1:nb + 2] + f[2:na + 3, 1:nb + 2] + f[1:na + 2, 2:nb + 3] + f[2:na + 3, 2:nb + 3])
+    vac, vbc = c(va), c(vb)
+    Bb_up = xp.where(vac > 0, Bb[1:na + 2, 2:nb + 3], Bb[2:na + 3, 2:nb + 3])
+    Ba_up = xp.where(vbc > 0, Ba[2:na + 3, 1:nb + 2], Ba[2:na + 3, 2:nb + 3])
+    return -(vac * Bb_up - vbc * Ba_up)
+
+
+def nernst_energy_3d(W, v, fac, theta, fuel, cN, h, n):
+    """Poynting flux of E_N = -v_N x B plus the Ettingshausen heat flux qe (B x J), cell values averaged to the
+    faces: returns per axis the face fluxes (faces 2..n+2 along it, all cells across), and div q_E on interior
+    cells (the electron part, for two-temperature runs)"""
+    B = [W[iBX], W[iBY], W[iBZ]]
+    E = [-(v[1] * B[2] - v[2] * B[1]), -(v[2] * B[0] - v[0] * B[2]), -(v[0] * B[1] - v[1] * B[0])]
+
+    def d(f, ax):
+        g = xp.zeros_like(f)
+        c, up, dn = [slice(None)] * 3, [slice(None)] * 3, [slice(None)] * 3
+        c[ax], up[ax], dn[ax] = slice(1, -1), slice(2, None), slice(None, -2)
+        g[tuple(c)] = (f[tuple(up)] - f[tuple(dn)]) / (2 * h[ax])
+        return g
+    J = [d(B[2], 1) - d(B[1], 2), d(B[0], 2) - d(B[2], 0), d(B[1], 0) - d(B[0], 1)]
+    qe = xp.where(fuel, cN * theta * fac, 0.0)
+    G, divq = [], 0.0
+    inner = [slice(2, 2 + m) for m in n]
+    for ax in range(3):
+        p, q = (ax + 1) % 3, (ax + 2) % 3
+        qa = qe * (B[p] * J[q] - B[q] * J[p])
+        ga = (E[p] * B[q] - E[q] * B[p]) + qa
+        lo, hi = [slice(None)] * 3, [slice(None)] * 3
+        lo[ax], hi[ax] = slice(1, n[ax] + 2), slice(2, n[ax] + 3)
+        G.append(0.5 * (ga[tuple(lo)] + ga[tuple(hi)]))
+        qf = 0.5 * (qa[tuple(lo)] + qa[tuple(hi)])
+        a, b = list(inner), list(inner)
+        a[ax], b[ax] = slice(1, n[ax] + 1), slice(0, n[ax])
+        divq = divq + (qf[tuple(a)] - qf[tuple(b)]) / h[ax]
+    return G, divq

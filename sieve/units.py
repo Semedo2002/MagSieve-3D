@@ -77,11 +77,25 @@ def add_eos_args(ap):
                    help="ideal/stiffened liner gamma (stiffened default: fit to the Al Hugoniot at u_p = 1 km/s)")
     g.add_argument("--p-inf-gpa", dest="p_inf_gpa", type=float, default=None,
                    help="stiffened p_inf, GPa (default rho0 c0^2 / gamma for Al)")
+    g.add_argument("--eos-table", dest="eos_table", default=None,
+                   help="tabulated liner EOS (SESAME ASCII with table 301, or .npz in SI); --eos-liner is the fallback "
+                        "beyond the table")
+    g.add_argument("--eos-table-material", dest="eos_table_material", type=int, default=0,
+                   help="SESAME material number (default: the first 301 table in the file)")
 
 
 def eos_from_args(a, rho_unit, v_unit):
     """Config keywords for the liner EOS (code units) and the liner's natural density in code units
-    (None for an ideal-gas liner). Mie-Gruneisen uses the aluminium Hugoniot."""
+    (None for an ideal-gas liner). Mie-Gruneisen uses the aluminium Hugoniot. With --eos-table the table is
+    the liner in pure cells and this analytic law its fallback."""
+    kw, rho_l = _eos_analytic(a, rho_unit, v_unit)
+    if getattr(a, "eos_table", None):
+        kw.update(eos_table=a.eos_table, eos_table_material=a.eos_table_material, tab_rho_unit=rho_unit,
+                  tab_v_unit=v_unit)
+    return kw, rho_l
+
+
+def _eos_analytic(a, rho_unit, v_unit):
     from .eos import stiffened_from_hugoniot
     H = AL_HUGONIOT
     p_unit = rho_unit * v_unit**2
@@ -116,13 +130,22 @@ def add_radiation_args(ap):
     g.add_argument("--z-eff", dest="z_eff", type=float, default=1.0)
     g.add_argument("--t-rad-min-ev", dest="t_rad_min_ev", type=float, default=10.0,
                    help="no cooling below this temperature")
+    g.add_argument("--enable-fld", dest="enable_fld", action="store_true",
+                   help="grey flux-limited diffusion radiation in the fuel (free-free opacities unless --opacity-table)")
+    g.add_argument("--opacity-table", dest="opacity_table", default=None,
+                   help="Rosseland / Planck opacities for FLD (SESAME 502/505 or .npz in SI); implies --enable-fld")
 
 
 def radiation_from_args(a, rho_unit, v_unit, L0):
-    if not a.enable_rad:
-        return {}
     ion = getattr(a, "ion_mass_amu", 2.0)
-    return bremsstrahlung_kwargs(rho_unit, v_unit, L0, a.z_eff, ion, a.t_rad_min_ev)
+    kw = bremsstrahlung_kwargs(rho_unit, v_unit, L0, a.z_eff, ion, a.t_rad_min_ev) if a.enable_rad else {}
+    table = getattr(a, "opacity_table", None)
+    if getattr(a, "enable_fld", False) or table:
+        kw.update(fld_kwargs(rho_unit, v_unit, L0, ion, a.z_eff, preset=None if table else "free-free"))
+        if table:
+            kw.update(fld_opacity_table=table, tab_rho_unit=rho_unit, tab_L_unit=L0,
+                      tab_T_unit=temperature_eV_per_code(v_unit, ion, a.z_eff) * 11604.518)
+    return kw
 
 
 M_E = 9.1093837015e-31
@@ -201,3 +224,23 @@ def viscosity_kwargs(rho_unit, v_unit, L0, z=1.0, ion_mass_amu=2.0, coulomb_log=
     T1 = temperature_eV_per_code(v_unit, A, Z)
     eta_SI_per_T = 0.96 * 2.09e13 * E_CHARGE * np.sqrt(A) / (Z**4 * coulomb_log)     # Pa s / eV^2.5
     return dict(visc_coeff=eta_SI_per_T * T1**2.5 / (rho_unit * v_unit * L0))
+
+
+def fld_kwargs(rho_unit, v_unit, L0, ion_mass_amu=2.0, Z=1.0, kappa_R=(0.0, 0.0, 0.0), kappa_P=(0.0, 0.0, 0.0),
+               preset=None, tracer_max=0.1):
+    """Config keywords for grey FLD radiation (sieve/fld.py) in code units.
+
+    kappa_R, kappa_P: (k0, m, n) for kappa = k0 rho^m T^n in m^2/kg with rho in kg/m^3 and T in kelvin.
+    preset="free-free": hydrogen-like bremsstrahlung (Kramers) opacity, kappa_R = 7.4e18 Z^2/A rho T^-3.5 and
+    kappa_P = 37 kappa_R (the free-free Planck/Rosseland ratio); order of magnitude only, use a table for
+    real materials. The code temperature theta = p/rho maps to T = theta * T1 (fully ionised, T_e = T_i)."""
+    c_light, sigma_sb = 2.99792458e8, 5.670374419e-8
+    T1 = temperature_eV_per_code(v_unit, ion_mass_amu, Z) * 11604.518
+    if preset == "free-free":
+        k = 7.4e18 * Z * Z / ion_mass_amu
+        kappa_R, kappa_P = (k, 1.0, -3.5), (37 * k, 1.0, -3.5)
+    code = lambda k: (k[0] * rho_unit**(k[1] + 1) * T1**k[2] * L0, k[1], k[2])
+    kr, kp = code(kappa_R), code(kappa_P)
+    return dict(fld=True, fld_a=4 * sigma_sb / c_light * T1**4 / (rho_unit * v_unit**2), fld_c=c_light / v_unit,
+                fld_kr0=kr[0], fld_kr_rho=kr[1], fld_kr_T=kr[2], fld_kp0=kp[0], fld_kp_rho=kp[1], fld_kp_T=kp[2],
+                fld_tracer_max=tracer_max)

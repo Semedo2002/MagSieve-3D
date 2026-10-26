@@ -1,4 +1,4 @@
-# strength.py - elastic-perfectly-plastic liner strength (2D, Cartesian or cylindrical r-z).
+# strength.py - elastic-perfectly-plastic liner strength (2D Cartesian or cylindrical r-z, and 3D).
 #
 # Deviatoric stress S (S_xx, S_yy, S_xy; S_zz = -(S_xx + S_yy), in r-z S_zz is the hoop stress S_phiphi) and a
 # damage flag ride along with the material (advected with the HLLD mass flux, upwind). Hypoelastic Jaumann rate:
@@ -7,10 +7,12 @@
 # the liner fraction. Spall: a liner cell whose pressure falls below -spall is damaged for good: no strength,
 # and no tension (its pressure is floored at 0). The stress enters momentum and energy as face fluxes
 # (div S, div(S . v)), plus the hoop term -S_phiphi / r in r-z, so total energy stays conserved exactly.
-from .config import iRHO, iVX, iVY, iCLR, RHO, MX, MY, EN
+# In 3D the stress gains S_xz and S_yz (stored after the damage flag, so a z-invariant 3D run carries the 2D
+# components in the same slots and reduces to the 2D scheme) and the Jaumann rotation uses the full spin.
+from .config import iRHO, iVX, iVY, iVZ, iCLR, RHO, MX, MY, EN
 from .physics import xp
 
-SXX, SYY, SXY, DMG = 0, 1, 2, 3
+SXX, SYY, SXY, DMG, SXZ, SYZ = 0, 1, 2, 3, 4, 5
 
 
 def bc(S, ng, nx, ny, periodic, cyl):
@@ -90,14 +92,109 @@ def rates(S, W, Fx, Fy, WLx, WRx, WLy, WRy, G, h, ng, n, rc=None, rf=None):
 
 
 def plastic(S, a, p, Y, spall, ng):
-    """radial return to sqrt(3 J2) <= Y a (1 - damage); spall damage where p < -spall in the liner"""
+    """radial return to sqrt(3 J2) <= Y a (1 - damage); spall damage where p < -spall (isotropic tension)
+    in the liner. 2D (4 rows) or 3D (6 rows) stress."""
     dmg = S[DMG]
     if spall > 0:
         dmg[...] = xp.where((p < -spall) & (a > 0.5), 1.0, xp.clip(dmg, 0.0, 1.0))
     Sxx, Syy, Sxy = S[SXX], S[SYY], S[SXY]
     Szz = -(Sxx + Syy)
-    seq = xp.sqrt(1.5 * (Sxx**2 + Syy**2 + Szz**2 + 2 * Sxy**2))
+    shear = Sxy**2
+    comps = (SXX, SYY, SXY)
+    if S.shape[0] > 4:
+        shear = shear + S[SXZ]**2 + S[SYZ]**2
+        comps = comps + (SXZ, SYZ)
+    seq = xp.sqrt(1.5 * (Sxx**2 + Syy**2 + Szz**2 + 2 * shear))
     Ye = Y * a * (1 - dmg)
     f = xp.where(seq > Ye, Ye / xp.maximum(seq, 1e-300), 1.0)
-    for c in (SXX, SYY, SXY):
+    for c in comps:
         S[c] *= f
+
+
+def von_mises(S):
+    """sqrt(3 J2) of a 2D or 3D deviatoric stress array"""
+    Szz = -(S[SXX] + S[SYY])
+    shear = S[SXY]**2 + ((S[SXZ]**2 + S[SYZ]**2) if S.shape[0] > 4 else 0.0)
+    return xp.sqrt(1.5 * (S[SXX]**2 + S[SYY]**2 + Szz**2 + 2 * shear))
+
+
+# ------------------------------------------------------------------ 3D
+
+def bc3d(S, ng, n, periodic):
+    """3D ghost cells: periodic wrap or zero gradient per axis"""
+    for ax in range(3):
+        N = n[ax]
+        lo, hi = [slice(None)] * 4, [slice(None)] * 4
+        if periodic[ax]:
+            lo[1 + ax], hi[1 + ax] = slice(0, ng), slice(N, N + ng)
+            S[tuple(lo)] = S[tuple(hi)]
+            lo[1 + ax], hi[1 + ax] = slice(ng + N, N + 2 * ng), slice(ng, 2 * ng)
+            S[tuple(lo)] = S[tuple(hi)]
+        else:
+            for k in range(ng):
+                lo[1 + ax], hi[1 + ax] = k, ng
+                S[tuple(lo)] = S[tuple(hi)]
+                lo[1 + ax], hi[1 + ax] = ng + N + k, ng + N - 1
+                S[tuple(lo)] = S[tuple(hi)]
+
+
+# stored component -> (i, j) of the symmetric tensor
+_IJ = {SXX: (0, 0), SYY: (1, 1), SXY: (0, 1), SXZ: (0, 2), SYZ: (1, 2)}
+
+
+def _tensor(S):
+    """full symmetric deviatoric tensor as a 3 x 3 list of arrays (S_zz = -(S_xx + S_yy))"""
+    T = [[None] * 3 for _ in range(3)]
+    for c, (i, j) in _IJ.items():
+        T[i][j] = T[j][i] = S[c]
+    T[2][2] = -(S[SXX] + S[SYY])
+    return T
+
+
+def rates3d(S, W, Fs, WLs, WRs, G, h, ng, n):
+    """3D dS/dt on interior cells (advection + hypoelastic Jaumann rate) and the stress fluxes:
+    returns (dS, f) with f[ax] = (momentum x, y, z, energy) fluxes on the ax-faces (faces 2..n+2 along ax,
+    all cells across), to be subtracted like the hydro fluxes."""
+    I = tuple(slice(ng, ng + m) for m in n)
+    v = [W[iVX], W[iVY], W[iVZ]]
+
+    def grad(f, ax):                                         # central difference on interior cells
+        up, dn = list(I), list(I)
+        up[ax], dn[ax] = slice(ng + 1, ng + n[ax] + 1), slice(ng - 1, ng + n[ax] - 1)
+        return (f[tuple(up)] - f[tuple(dn)]) / (2 * h[ax])
+    g = [[grad(v[i], j) for j in range(3)] for i in range(3)]   # g[i][j] = dv_i/dx_j
+    D = [[0.5 * (g[i][j] + g[j][i]) for j in range(3)] for i in range(3)]
+    Wsp = [[0.5 * (g[i][j] - g[j][i]) for j in range(3)] for i in range(3)]
+    trD = D[0][0] + D[1][1] + D[2][2]
+    Si = _tensor(S[(slice(None),) + I])
+    Gi = G[I]
+    dS = xp.zeros((S.shape[0],) + tuple(n))
+    for c, (i, j) in _IJ.items():
+        rot = sum(Si[i][k] * Wsp[k][j] - Wsp[i][k] * Si[k][j] for k in range(3))
+        dS[c] = 2 * Gi * (D[i][j] - (trD / 3 if i == j else 0.0)) + rot
+    for ax in range(3):                                      # upwind advection with the mass flux
+        F0, WL, WR = Fs[ax][RHO], WLs[ax], WRs[ax]
+        rho_up = xp.where(F0 >= 0, WL[iRHO], WR[iRHO])
+        u = F0 / rho_up
+        N = n[ax]
+        l, r, cc = [slice(None)] * 3, [slice(None)] * 3, [slice(None)] * 3
+        l[ax], r[ax], cc[ax] = slice(1, N + 2), slice(2, N + 3), slice(ng, ng + N)
+        hi, lo = [slice(None)] * 3, [slice(None)] * 3
+        hi[ax], lo[ax] = slice(1, N + 1), slice(0, N)
+        across = tuple(slice(None) if d == ax else I[d] for d in range(3))
+        for c in range(S.shape[0]):
+            q = S[c]
+            qf = xp.where(F0 >= 0, q[tuple(l)], q[tuple(r)])
+            uq = u * qf
+            a = -((uq[tuple(hi)] - uq[tuple(lo)]) - q[tuple(cc)] * (u[tuple(hi)] - u[tuple(lo)])) / h[ax]
+            dS[c] += a[across]
+    T = _tensor(S)
+    f = []
+    for ax in range(3):
+        N = n[ax]
+        l, r = [slice(None)] * 3, [slice(None)] * 3
+        l[ax], r[ax] = slice(1, N + 2), slice(2, N + 3)
+        avg = lambda q: 0.5 * (q[tuple(l)] + q[tuple(r)])
+        f.append((-avg(T[0][ax]), -avg(T[1][ax]), -avg(T[2][ax]),
+                  -avg(T[ax][0] * v[0] + T[ax][1] * v[1] + T[ax][2] * v[2])))
+    return dS, f

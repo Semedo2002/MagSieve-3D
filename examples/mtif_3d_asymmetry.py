@@ -19,6 +19,7 @@ an illustrative, not a design, value.
     python examples/mtif_3d_asymmetry.py                      # 2D baseline, 3D reference, tilt 1 deg, m = 4
     python examples/mtif_3d_asymmetry.py --tilts 0.5 1 2 --modes 2 4
     python examples/mtif_3d_asymmetry.py --quick --check      # smoke test
+    python examples/mtif_3d_asymmetry.py --tilts 2 --modes --vtk-case "tilt 2 deg"   # + 3D frames and renders
     python examples/mtif_3d_asymmetry.py --plot-only
 
 Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
@@ -172,6 +173,12 @@ def run_case(a, name, dims, tilt=0.0, m=0):
     s, V = build(a, dims, tilt, m)
     state, rows = {}, []
     rows.append(diag(s, a, state))
+    rec = None
+    if dims == 3 and getattr(a, "vtk_case", None) == name:      # 3D snapshots for scripts/render_3d.py
+        from sieve.io3d import Recorder
+        rec = Recorder(os.path.join(a.out, "vtk_" + name.replace(" ", "_").replace("=", "")), fmt=("vti",))
+        rec(s)
+        next_rec = a.t_end / a.vtk_frames
     best = (np.inf, None, None)
     t0 = time.time()
     while s.t < a.t_end - 1e-12:
@@ -186,7 +193,19 @@ def run_case(a, name, dims, tilt=0.0, m=0):
                 raise RuntimeError(f"{name}: non-physical state at t={s.t:.4f} (p_min {row['p_min']:.3g})")
             if row["R"] < best[0]:
                 best = (row["R"], *slices(s))
+        if rec is not None and s.t >= next_rec - 1e-12:
+            rec(s)
+            next_rec += a.t_end / a.vtk_frames
     rows.append(diag(s, a, state))
+    if rec is not None and not getattr(a, "no_render", False):
+        try:                                         # render the series now (PNGs + MP4), if pyvista is there
+            sys.path.insert(0, os.path.join(ROOT, "scripts"))
+            import render_3d
+            pngs, mp4 = render_3d.render(render_3d.frames_from([os.path.join(rec.out, "series.pvd")]),
+                                         os.path.join(rec.out, "renders"))
+            print(f"  rendered {len(pngs)} frames of {name} -> {os.path.relpath(rec.out, ROOT)}/renders", flush=True)
+        except ImportError:
+            print("  (pyvista not installed: render later with scripts/render_3d.py)", flush=True)
     d = {k: np.array([r[k] for r in rows]) for k in rows[0]}
     i = int(np.argmin(d["R"]))
     res = {"case": name, "dims": dims, "tilt_deg": tilt, "mode": m, "steps": s.step, "wall_s": time.time() - t0,
@@ -327,6 +346,10 @@ def main():
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--plot-only", action="store_true")
     ap.add_argument("--no-plot", action="store_true")
+    ap.add_argument("--vtk-case", dest="vtk_case", default=None,
+                    help='write 3D .vti snapshots of one case (e.g. "tilt 2 deg") and render them at the end')
+    ap.add_argument("--vtk-frames", dest="vtk_frames", type=int, default=24)
+    ap.add_argument("--no-render", dest="no_render", action="store_true", help="snapshots only, no PyVista render")
     add_resistivity_args(ap)
     add_eos_args(ap)
     add_radiation_args(ap)

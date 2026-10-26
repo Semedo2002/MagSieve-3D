@@ -21,11 +21,17 @@ sieve/            solver package
   solver3d.py     MHDSolver3D: unsplit HLLD in x, y, z (same kernel, rotated), z-periodic, 3D seeding,
                   current-density and generated-field diagnostics
   diagnostics.py  mixing, enstrophy, interface spectrum, div B, energy
+  circuit.py      RLC drive circuit coupled to an r-z liner (magnetic piston, energy-consistent inductance)
+  fld.py          grey flux-limited diffusion radiation (Levermore-Pomraning, implicit CG on the GPU)
+  parallel.py     MPI slab domain decomposition of the 2D and 3D solvers (halo and CT edge exchange)
+  io3d.py         3D snapshots: VTK ImageData (.vti/.pvd) and HDF5
+  tabular.py      tabulated EOS / opacities (SESAME ASCII, .npz) with GPU inversion and analytic fallback
 main.py           CLI: verification tests, single cases, legacy campaign
 examples/         MTIF liner flux compression; synthetic magnetic probes (SI units); 3D target asymmetries;
                   MagLIF-style r-z implosion; metal-liner flux compression generator (FCG)
 experiments/      sweeps A-H and analysis scripts; data/ holds the saved results
 paper/            figure and .docx generators, figures/, magnetic_sieve.docx
+scripts/          RMI benchmark runner/plots, render_3d.py (PyVista volume renders + MP4), mpi_check.py
 rmi_output_gpu/   figures and GIFs written by the solver
 ```
 
@@ -36,6 +42,7 @@ An NVIDIA GPU with CUDA 12 is required.
 ```
 pip install -e .                  # package + dependencies (pyproject.toml)
 pip install -e .[paper]          # also python-docx, for paper/make_paper.py
+pip install -e .[viz,mpi]        # 3D rendering (PyVista, ffmpeg, h5py) and MPI (needs an MPI runtime too)
 pip install -r requirements.txt  # or the exact tested versions
 ```
 
@@ -102,7 +109,9 @@ Nernst term to Ohm's law, E_N = -v_N x B with v_N = -(beta_wedge/(e|B|)) grad_pe
 beta_wedge): the field is carried down the temperature gradient, toward cold walls. It enters CT as an
 upwinded edge EMF, so div B stays at round-off, and the time step respects |v_N|. Its Onsager partner, the
 Ettingshausen heat flux (beta_wedge kT_e/e) b x J, and the Poynting flux of E_N enter the energy equation as
-face fluxes, so total energy is conserved exactly. 2D solver (Cartesian and r-z).
+face fluxes, so total energy is conserved exactly. 2D solver (Cartesian and r-z) and 3D: there the Nernst EMF
+-v_N x B sits on all three edge orientations with the same upwinding, and a z-invariant 3D run reduces to the
+2D scheme (to 7e-12 over 1240 steps, the two forms summing in a different order).
 
 ### Two-temperature plasma
 
@@ -125,7 +134,9 @@ hypoelastic Jaumann rate with shear modulus `shear_modulus`, returned radially t
 J2) = `yield_strength` after each step. The stress enters the momentum and energy fluxes (and the hoop term in
 r-z), and the time step uses the longitudinal speed c_L = sqrt(c^2 + 4G/(3 rho)). Where the tension exceeds
 `spall_strength` the cell is marked damaged: no tension (p >= 0) and no strength from then on.
-`units.strength_kwargs` converts SI moduli.
+`units.strength_kwargs` converts SI moduli. In 3D the stress gains S_xz and S_yz and the Jaumann rotation the
+full spin tensor; a z-invariant 3D run matches the 2D solver to 1e-13, and a shear wave along z oscillates at
+k sqrt(G/rho) to 0.3%.
 
 ### Radiation
 
@@ -153,6 +164,76 @@ examples take SI conductivities:
 ```
 python examples/mtif_flux_compression.py --sigma-liner 3.5e7          # aluminium liner, S/m
 python examples/nearstar_mtif3_validation.py --eta-model spitzer --sigma-liner 3.5e7
+```
+
+### RLC drive circuit
+
+`sieve/circuit.py` replaces a prescribed liner velocity with a capacitor bank (C, V0, series L0 and R) whose
+current runs up an r-z liner and back through a return can at r_return. The circuit is d(LI)/dt = V - RI with
+L = L0 + (mu0 l / 2 pi) <ln(r_return / r_out)>, i.e. dI/dt = (V - RI - I dL/dt) / L, integrated by the
+trapezoid rule in flux form (exact energy identity for a fixed load). The liner feels the J x B of its surface
+current, f = P_B(r) dC/dr on its outer side with P_B = mu0 I^2 / (8 pi^2 r^2), applied as an exact kinetic
+energy kick each step. The inductance increment of each step is the one whose mechanical work, (L1 - L0) I0 I1
+/ 2 for this scheme, equals the work the grid received, so bank + liner conserve energy to round-off; the
+geometric inductance of the liner's actual outer radius is reported alongside (they agree to 1% at 64-96 cells
+across the liner region). The FCG and MagLIF examples take `--capacitance-uf`, `--voltage-kv`,
+`--inductance-nh`, `--resistance-mohm` and `--r-return-mm`; the liner then starts at rest. Verified against the
+analytic RLC discharge (3e-7) and an incompressible thick-shell liner on the same circuit (outer radius to 1.3%
+of the distance moved, current to 0.1%).
+
+### Grey flux-limited diffusion radiation
+
+`fld=True` (`units.fld_kwargs`) adds a radiation energy density E_r: dE_r/dt + div(v E_r) = div(D grad E_r) +
+c rho kappa_P (a T^4 - E_r), with the Levermore-Pomraning limiter D = c lambda(R) / (rho kappa_R) evaluated on
+each face, and power-law Planck and Rosseland opacities (a free-free preset, or your own). Each step advects E_r
+with the gas, then solves the stiff part by backward Euler with the emission linearised, the gas temperature
+eliminated, and the limiter re-evaluated over a few Picard passes; the symmetric system (volume weighted, so
+also in r-z) goes to a matrix-free Jacobi-preconditioned conjugate-gradient solver on the GPU. The final update
+is written in face-flux form from the solution, so gas + radiation energy is conserved to round-off whatever
+the solver residual. 2D, r-z and 3D. Radiation pressure is left out (fine while E_r/3 << p), and FLD couples to
+a single gas temperature (not with `two_temp`).
+
+### Tabulated EOS and opacities
+
+`sieve/tabular.py` reads SESAME ASCII files (EOS table 301; opacity tables 502 Rosseland and 505 Planck, taken
+as log10 kappa in cm^2/g against log10 rho in g/cc and log10 T in eV, so check your library's convention) or an
+SI `.npz` table (rho, T, p, e, optional cs, kappa_R, kappa_P). Tables are resampled onto a uniform log rho x log
+T grid; positive quantities are interpolated in log space, so power laws are reproduced exactly. One CUDA
+elementwise kernel inverts e(rho, T) or p(rho, T) along T at fixed rho (binary search) and interpolates
+bilinearly; c^2 comes from the table or from its thermodynamic derivatives. Beyond the table the values are
+extrapolated from the edge interval and blended into the analytic liner law (Mie-Gruneisen or stiffened gas)
+over two grid cells, so p(e) stays continuous. In the two-material solver the table is the liner in pure liner
+cells; mixed cells keep the tangent stiffened gas of the volume-fraction closure (blended over a liner fraction of
+0.98 ... 1, with e(p) an exact Newton inverse of p(e) in the blend band). Every example takes `--eos-table` (and
+`--eos-table-material` for a SESAME file with several materials) and `--opacity-table` (which turns on FLD with
+tabulated kappa_R and kappa_P). No SESAME data ship with the code (LANL distributes them under licence):
+`tabular.mie_gruneisen_table` and `tabular.ideal_gas_table` write synthetic tables, which is how this is tested.
+
+### Multi-GPU domain decomposition
+
+`sieve.parallel.distributed(MHDSolver3D, cfg)` (or `MHDSolver`) run under `mpiexec` splits the grid into x
+slabs, one per rank, each keeping the global dx to the last bit. Ghost layers of the cells, the CT face fields
+and the liner stress are swapped with the neighbours, the edge EMFs on a shared x-face are taken from the left
+rank on both sides (so both update the shared face identically and div B stays at round-off), and dt is the
+global minimum. Halos go device to device through NCCL where CuPy has it (Linux), otherwise through MPI staged
+in host memory. `scripts/mpi_check.py` compares 2 and 3 ranks with the single-domain solver: 2D Orszag-Tang
+with resistivity, aluminium with strength and spall, and a 3D field box agree to 1e-15 to 2e-14 with identical
+total energy. Not decomposed yet: r-z geometry, conduction, viscosity and FLD (they raise). Only the MPI path has
+been run here (one GPU, Windows, Intel MPI from `pip install impi-rt`); the NCCL path is written but untested,
+and the 512^3 scale is a memory estimate (about 1 GB per field copy), not a measured run.
+
+### 3D rendering
+
+`sieve.io3d.Recorder` writes 3D snapshots (density, pressure, temperature, liner fraction, v, B, E_r) as VTK
+ImageData with a ParaView `.pvd` series and optionally HDF5. `scripts/render_3d.py` renders them off screen with
+PyVista: a ray-cast density volume, the liner isosurface with the quadrant facing the camera cut away, hot-spot
+temperature contours and field lines, one PNG per frame and an MP4. `examples/mtif_3d_asymmetry.py --vtk-case
+"tilt 2 deg"` records one case and renders it at the end of the run.
+
+```
+mpiexec -n 4 python scripts/mpi_check.py                       # decomposition check
+python examples/mtif_3d_asymmetry.py --tilts 2 --modes --vtk-case "tilt 2 deg"
+python scripts/render_3d.py results/mtif_3d_asymmetry/vtk_tilt_2_deg
 ```
 
 ## Performance
@@ -192,6 +273,12 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | radiation | uniform hydrogen plasma, T0 = 500 eV, n = 1e20 cm^-3: T(t) matches (sqrt(T0) - K t/2)^2 to 1e-14 down to the 10 eV cutoff; E + E_rad conserved to 1e-15; no cooling in liner material or below the cutoff |
 | eos_positivity | stiffened Al pulled apart at 5 and 8 km/s (cavitation) and a gas/Al interface: p + p_inf > 0, c^2 > 0, finite state |
 | fcg | flux compression generator on a 64 x 4 r-z grid (Al liner, Mie-Gruneisen, strength and spall, CT, resistivity): axis field passes 20 B0 with >80% of the flux left in the cavity, no spall, div B at round-off, energy budget below 1e-12, output files written |
+| circuit | RLC discharge vs the exact damped sine (3e-7); an Al liner driven from rest by a 200 uF, 30 kV bank: bank + grid energy to round-off, outer radius and current vs an incompressible thick shell on the same circuit (1.3% of the distance moved, 0.1%) |
+| solid_nernst_3d | 3D vs 2D: plastic flow to 1e-13, Nernst + Ettingshausen to 7e-12 (1240 steps), identical spalled regions; a shear wave along z (S_xz) at k sqrt(G/rho) to 0.3%; a field bump on the exact Nernst path along z |
+| mpi | 2 and 3 MPI ranks vs one domain: 2D Orszag-Tang with resistivity, Al with strength and spall, 3D field box, to 1e-15..2e-14 with identical total energy and div B at round-off (skipped without mpi4py/mpiexec) |
+| fld | equilibration vs the exact ODE (0.7%, energy 5e-15); optically thick Gaussian spreading as 2 D t per direction in 2D, r-z and 3D (0.02%); optically thin front at 0.99 c t; advection with the flow, gas + radiation energy to round-off |
+| render3d | 3D snapshots to .vti/.pvd and .h5 and back exactly; off-screen PyVista renders and an MP4 (skipped without pyvista) |
+| tabular | SESAME ASCII 301/502/505 write and read back (1e-15); an ideal-gas table reproduces the ideal-gas Sod tube to 1e-13; a Mie-Gruneisen Al table reproduces the analytic 2 km/s impact (shocked p 17.998 vs 17.998 GPa, fields to 2e-4) and p(e) stays continuous into the fallback; FLD with tabulated opacities matches the power laws to 2e-11 |
 
 ## Reproducing the study
 
@@ -248,7 +335,8 @@ shock compression, each verified against an analytic solution in `python main.py
   cross-field leakage falls at second order with resolution.
 
 Resistivity, EOS, radiation, conduction, two-temperature and viscosity run in 2D and 3D; z-invariant 3D slabs
-reproduce the 2D solver to round-off. Nernst, strength and r-z geometry are 2D. The example parameters are
+reproduce the 2D solver to round-off. Nernst and strength now also run in 3D; r-z geometry is 2D. The example
+parameters are
 illustrative, not taken from any experiment.
 
 ### Examples
@@ -368,8 +456,17 @@ this resolution. The early spikes in the on-axis field are fast magnetosonic wav
 on the axis (the cavity rings); by peak compression the cavity field is uniform. Energy closes to 1e-12 over
 13 000 to 15 000 steps: the error grows linearly at about 6e-17 per step, so it is accumulated round-off.
 
-Limits: the liner coasts, so the drive (explosive, or a pulsed-power current) and any load circuit are not
-modelled; the field is purely axial (no B_theta), so there is no current-driven instability; the 0.1 kg/m^3,
+**Pulsed-power drive.** With `--capacitance-uf 200 --voltage-kv 80 --inductance-nh 15` (640 kJ) an aluminium liner
+at rest (R 10-11 mm, 10 mm long, 5 T seed, strength on, 192 x 32 cells of 0.073 mm) is driven by the circuit
+instead: the current peaks at 8.0 MA at 2.5 us with 109 GPa of drive pressure, the liner takes 7.2% of the bank
+as kinetic energy (21% of the bank is lost in the 1 mOhm series resistance), and the axis field reaches 2020 T
+at 3.44 us. Bank + grid energy closes to 1e-14; the hydrodynamic energy error is 1.2e-11 after 50 440 steps
+(round-off accumulation, 2.4e-16 per step), and the inductance from the work done and from the liner's radius
+stay within 2.4%. At turnaround the field radius is 0.50 mm, only 7 cells, against a 9.5-cell liner surface,
+so that peak field is resolution-limited (`results/fcg_rlc`).
+
+Limits: the coasting runs prescribe the liner velocity (the circuit option above replaces it with a bank, but
+there is no explosive drive and no load circuit beyond the liner); the field is purely axial (no B_theta), so there is no current-driven instability; the 0.1 kg/m^3,
 0.1 bar fill stands in for an evacuated cavity, whose Alfven speed would make the time step vanish. At
 turnaround the cavity spans about 19 cells while the smeared liner surface is 16 to 17 cells wide, so the field
 radius (where the cavity flux sits at the on-axis field) and the tracer radius differ by about 0.6 mm; both
@@ -419,7 +516,7 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 
 ## Model and numerical limitations
 
-- Ideal gas (γ = 5/3) by default; liner strength is elastic-perfectly plastic (constant G and Y, no work or rate hardening, no thermal softening) with a threshold spall model, and there is no phase change. The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. Viscosity is the Braginskii parallel part only (no gyroviscosity or perpendicular terms); thermal conduction is electron-only (Braginskii k_perp fit, no Righi-Leduc term), the liner is treated as an isothermal heat sink, and at grid-oblique field angles the limited scheme adds numerical cross-field diffusion that falls at second order with resolution. Nernst and Ettingshausen are 2D only. Radiation is optically thin bremsstrahlung only (no line or recombination radiation, no opacity or reabsorption), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
+- Ideal gas (γ = 5/3) by default; liner strength is elastic-perfectly plastic (constant G and Y, no work or rate hardening, no thermal softening) with a threshold spall model, and there is no phase change. The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. Viscosity is the Braginskii parallel part only (no gyroviscosity or perpendicular terms); thermal conduction is electron-only (Braginskii k_perp fit, no Righi-Leduc term), the liner is treated as an isothermal heat sink, and at grid-oblique field angles the limited scheme adds numerical cross-field diffusion that falls at second order with resolution. Radiation is optically thin bremsstrahlung or grey flux-limited diffusion (one group, no radiation pressure, power-law opacities unless a table is supplied, single gas temperature), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
 - Resistivity is scalar (isotropic), with no Hall term. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
 - Constrained transport keeps div B at round-off; the cylindrical geometry is 2D (r, z) only, and the Cartesian 2D MTIF examples are still cross-sections with a four-fold grid imprint (use `examples/maglif_rz.py` for an axisymmetric implosion).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.

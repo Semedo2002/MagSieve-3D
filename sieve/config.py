@@ -35,10 +35,12 @@ class GridConfig:
     nz: int = 1
     z_min: float = 0.0
     z_max: float = 1.0
+    # exact cell width in x, if > 0 (a subdomain of a decomposed grid keeps the global dx to the last bit)
+    x_spacing: float = 0.0
 
     @property
     def dx(self) -> float:
-        return (self.x_max - self.x_min) / self.nx
+        return self.x_spacing if self.x_spacing > 0 else (self.x_max - self.x_min) / self.nx
 
     @property
     def dy(self) -> float:
@@ -162,6 +164,37 @@ class PhysicsConfig:
     rad_coeff: float = 0.0
     rad_T_min: float = 0.0
     rad_tracer_max: float = 0.1
+    # grey flux-limited diffusion radiation (sieve/fld.py; units.fld_kwargs): radiation energy E_r with
+    # a theta^4 emission, speed of light fld_c, power-law opacities k0 rho^m theta^n (Planck kp, Rosseland kr)
+    # per unit mass; fuel only (liner fraction < fld_tracer_max). fld_E_xmin / fld_E_xmax >= 0 hold E_r at
+    # the non-periodic x faces (negative: zero flux there).
+    # tabulated liner EOS (sieve/tabular.py: SESAME ASCII or .npz, SI) in pure liner cells, eos_liner as the
+    # fallback beyond the table and the tangent closure in mixed cells; the table is converted with the code
+    # units tab_rho_unit (kg/m^3) and tab_v_unit (m/s). fld_opacity_table: kappa_R / kappa_P for FLD instead of
+    # the power laws (tab_L_unit m, tab_T_unit kelvin per code temperature).
+    eos_table: str = ""
+    eos_table_material: int = 0
+    tab_rho_unit: float = 1000.0
+    tab_v_unit: float = 1000.0
+    tab_L_unit: float = 1e-3
+    tab_T_unit: float = 1.0
+    fld_opacity_table: str = ""
+    fld: bool = False
+    fld_a: float = 0.0
+    fld_c: float = 0.0
+    fld_kp0: float = 0.0
+    fld_kp_rho: float = 0.0
+    fld_kp_T: float = 0.0
+    fld_kr0: float = 0.0
+    fld_kr_rho: float = 0.0
+    fld_kr_T: float = 0.0
+    fld_tracer_max: float = 0.1
+    fld_E_xmin: float = -1.0
+    fld_E_xmax: float = -1.0
+    fld_advect: bool = True
+    fld_tol: float = 1e-11
+    fld_maxit: int = 5000
+    fld_picard: int = 4
     # magnetized electron conduction (physics.conduction_div), 0 = off: k_par = cond_kappa0 T^5/2,
     # k_perp = k_par/(1 + x^2), x = cond_x0 |B| T^3/2 / rho, T = p/rho; fuel only (tracer < cond_tracer_max).
     # Split step integrated with RKL2 super-time-stepping, so it does not limit the time step.
@@ -240,6 +273,11 @@ class PhysicsConfig:
             raise ValueError("cond_kappa0, cond_x0 must be >= 0 and 0 < cond_tracer_max <= 1")
         if min(self.rad_coeff, self.rad_T_min) < 0 or not 0 < self.rad_tracer_max <= 1:
             raise ValueError("rad_coeff, rad_T_min must be >= 0 and 0 < rad_tracer_max <= 1")
+        if self.fld and (self.fld_c <= 0 or (self.fld_kr0 <= 0 and not self.fld_opacity_table) or self.fld_a < 0
+                         or self.fld_kp0 < 0):
+            raise ValueError("fld needs fld_c > 0, fld_kr0 > 0, fld_a >= 0, fld_kp0 >= 0")
+        if self.fld and self.two_temp:
+            raise ValueError("fld couples to a single gas temperature: not with two_temp")
         if self.eos_liner == "mie_gruneisen" and min(self.mg_rho0, self.mg_c0, self.mg_s, self.mg_gamma0) <= 0:
             raise ValueError("eos_liner='mie_gruneisen' needs mg_rho0, mg_c0, mg_s, mg_gamma0 > 0")
 
@@ -255,7 +293,7 @@ class PhysicsConfig:
 
     def is_multimaterial(self) -> bool:
         gl = self.gamma if self.gamma_liner is None else self.gamma_liner
-        return self.eos_fuel != "ideal" or self.eos_liner != "ideal" or gl != self.gamma
+        return self.eos_fuel != "ideal" or self.eos_liner != "ideal" or gl != self.gamma or bool(self.eos_table)
 
     def is_mhd(self) -> bool:
         return self.B_transverse > 0

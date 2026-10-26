@@ -121,7 +121,12 @@ def make_eos(cfg):
     fuel = Material(cfg.eos_fuel, cfg.gamma, cfg.p_inf)
     gl = cfg.gamma if cfg.gamma_liner is None else cfg.gamma_liner
     liner = Material(cfg.eos_liner, gl, cfg.p_inf_liner, cfg.mg_rho0, cfg.mg_c0, cfg.mg_s, cfg.mg_gamma0)
-    return EOS(fuel, liner, cfg.material_tracer != "mass_fraction")
+    eos = EOS(fuel, liner, cfg.material_tracer != "mass_fraction")
+    if cfg.eos_table:                                # tabulated liner, the analytic liner as its fallback
+        from . import tabular
+        data = tabular.load(cfg.eos_table, cfg.eos_table_material or None)
+        eos = tabular.TabularEOS(eos, tabular.TabularMaterial(data, cfg.tab_rho_unit, cfg.tab_v_unit, liner))
+    return eos
 
 
 def stiffened_from_hugoniot(rho0, c0, s, up_ref):
