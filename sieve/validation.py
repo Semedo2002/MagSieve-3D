@@ -72,17 +72,24 @@ def _peak_time(t, y):
     return t[k]
 
 
-def compare(tr, t_sim, y_sim, n_params=0, fit_shift=False, max_shift=None):
+def compare(tr, t_sim, y_sim, n_params=0, fit_shift=False, max_shift=None, shift_sigma=None):
     """goodness of fit of a simulated signal to a trace (see module notes); with fit_shift the timing shift
-    that minimises chi^2 (golden section within +-max_shift) is applied first and counts as one parameter"""
-    def chi2(shift):
+    that minimises chi^2 (grid then golden section within +-max_shift) is applied first and counts as one
+    parameter; shift_sigma (the timing-fiducial uncertainty) adds the prior (shift / shift_sigma)^2, reported
+    as chi2_prior and included in chi2_total"""
+    def chi2(shift, prior=True):
         f = sample(t_sim, y_sim, tr.t, shift)
         ok = np.isfinite(f)
-        return float(np.sum(((tr.y[ok] - f[ok]) / tr.sigma[ok])**2)), ok
+        c = float(np.sum(((tr.y[ok] - f[ok]) / tr.sigma[ok])**2))
+        if prior and shift_sigma:
+            c += (shift / shift_sigma)**2
+        return c, ok
     shift = 0.0
     if fit_shift:
         L = max_shift if max_shift is not None else 0.1 * (tr.t[-1] - tr.t[0])
-        a, b = -L, L
+        grid = np.linspace(-L, L, 121)               # dense search first: chi^2(shift) can be multimodal
+        k = int(np.argmin([chi2(x)[0] for x in grid]))
+        a, b = grid[max(k - 1, 0)], grid[min(k + 1, 120)]
         g = (np.sqrt(5) - 1) / 2
         x1, x2 = b - g * (b - a), a + g * (b - a)
         f1, f2 = chi2(x1)[0], chi2(x2)[0]
@@ -95,7 +102,8 @@ def compare(tr, t_sim, y_sim, n_params=0, fit_shift=False, max_shift=None):
                 x2 = a + g * (b - a); f2 = chi2(x2)[0]
         shift = 0.5 * (a + b)
         n_params += 1
-    c2, ok = chi2(shift)
+    c2, ok = chi2(shift, prior=False)
+    cp = (shift / shift_sigma)**2 if (fit_shift and shift_sigma) else 0.0
     f = sample(t_sim, y_sim, tr.t, shift)
     r = tr.y[ok] - f[ok]
     n = int(ok.sum())
@@ -103,7 +111,7 @@ def compare(tr, t_sim, y_sim, n_params=0, fit_shift=False, max_shift=None):
     tp_sim = _peak_time(t_sim + shift, y_sim)
     return {"name": tr.name, "n": n, "rms": float(np.sqrt(np.mean(r**2))),
             "nrms": float(np.sqrt(np.mean(r**2)) / max(np.max(np.abs(tr.y)), 1e-300)),
-            "chi2": c2, "dof": dof, "chi2_nu": c2 / dof, "shift": shift,
+            "chi2": c2, "chi2_prior": cp, "chi2_total": c2 + cp, "dof": dof, "chi2_nu": c2 / dof, "shift": shift,
             "peak_offset": xcorr_lag(tr, t_sim, y_sim, max_shift if max_shift is not None else 0.1 * np.ptp(tr.t)),
             "peak_time_offset": float(tp_sim - _peak_time(tr.t, tr.y)), "coverage": n / len(tr.t)}
 
@@ -145,6 +153,27 @@ def calibrate(values, chi2s):
     return float(best), float(1 / np.sqrt(A)), float(C - B * B / (4 * A))
 
 
+def calibrate_valley(values, chi2s, dof, window=None):
+    """least-squares parabola through every point of the chi^2 valley (chi^2 <= chi2_min + window, default
+    max(100, chi2_min)): robust where chi^2 is jagged on small parameter steps (numerical noise of the model).
+    Returns (best, sigma, chi2_min_fit, scale): sigma from Delta chi^2 = 1 on the parabola, multiplied by
+    scale = sqrt(chi2_min_fit / dof) when that exceeds 1 (the fit is worse than the stated errors)."""
+    v, c = np.asarray(values, float), np.asarray(chi2s, float)
+    cmin = c.min()
+    w = window if window is not None else max(100.0, cmin)
+    sel = c <= cmin + w
+    if sel.sum() < 3:
+        sel = np.argsort(c)[:3]
+    A, B, C = np.polyfit(v[sel], c[sel], 2)
+    if A <= 0:
+        k = int(np.argmin(c))
+        return float(v[k]), float("inf"), float(cmin), 1.0
+    best = -B / (2 * A)
+    cfit = C - B * B / (4 * A)
+    scale = max(1.0, np.sqrt(max(cfit, 0.0) / max(dof, 1)))
+    return float(best), float(scale / np.sqrt(A)), float(cfit), float(scale)
+
+
 def band(curves, t):
     """ensemble band on a common time grid: (min, max, mean) over curves = [(t_i, y_i), ...]"""
     Y = np.array([np.interp(t, ti, yi, left=np.nan, right=np.nan) for ti, yi in curves])
@@ -153,11 +182,31 @@ def band(curves, t):
 
 # ------------------------------------------------------------------ pulsed-power liner observables
 
-def observables_from_fcg(d, probe_r_mm=20.0, probe_area_mm2=1.0):
+def instrument(t, y, fwhm):
+    """signal seen through a Gaussian instrument response of the given FWHM (same time units): resampled onto
+    a uniform grid, convolved, returned on that grid"""
+    if fwhm <= 0:
+        return t, y
+    dt = min(np.median(np.diff(t)), fwhm / 10)
+    tu = np.arange(t[0], t[-1], dt)
+    yu = np.interp(tu, t, y)
+    s = fwhm / 2.3548 / dt
+    k = np.arange(-int(4 * s) - 1, int(4 * s) + 2)
+    w = np.exp(-0.5 * (k / s)**2)
+    w /= w.sum()
+    pad = len(k) // 2
+    yp = np.concatenate([np.full(pad, yu[0]), yu, np.full(pad, yu[-1])])
+    return tu, np.convolve(yp, w, mode="valid")
+
+
+def observables_from_fcg(d, probe_r_mm=20.0, probe_area_mm2=1.0, fwhm_us=0.01):
     """simulated diagnostics from an FCG run with the RLC drive (columns of its diagnostics.csv):
-    visar: free-surface velocity of the liner, -d r_out/dt (km/s); bdot: a one-turn probe of area A at radius
+    visar: free-surface velocity of the liner (inward positive), v_r at its outer surface when the run
+    logged v_surface_kms, else -d r_out/dt (km/s); bdot: a one-turn probe of area A at radius
     r_p in the return gap sees B_theta = mu0 I / (2 pi r_p), so V = A mu0 / (2 pi r_p) dI/dt (V);
-    radiography: the cavity radius (mm). Times in us."""
+    radiography: the cavity radius (mm). Times in us. Each goes through a Gaussian instrument response of
+    FWHM fwhm_us (10 ns), the instruments' bandwidth, which also damps the step-to-step noise of the logged
+    signals (differences between runs at that level would otherwise swamp chi^2)."""
     mu0 = 4e-7 * np.pi
     t = np.asarray(d["t_us"], float)
     k = np.unique(t, return_index=True)[1]
@@ -165,9 +214,10 @@ def observables_from_fcg(d, probe_r_mm=20.0, probe_area_mm2=1.0):
     I = np.asarray(d["I_MA"], float)[k] * 1e6
     r_out = np.asarray(d["r_out_mm"], float)[k]
     dIdt = np.gradient(I, t * 1e-6)
-    return {"visar": (t, -np.gradient(r_out, t)),
-            "bdot": (t, probe_area_mm2 * 1e-6 * mu0 / (2 * np.pi * probe_r_mm * 1e-3) * dIdt),
-            "radiography": (t, np.asarray(d["R_cavity_mm"], float)[k])}
+    vis = -np.asarray(d["v_surface_kms"], float)[k] if "v_surface_kms" in d else -np.gradient(r_out, t)
+    raw = {"visar": vis, "bdot": probe_area_mm2 * 1e-6 * mu0 / (2 * np.pi * probe_r_mm * 1e-3) * dIdt,
+           "radiography": np.asarray(d["R_cavity_mm"], float)[k]}
+    return {key: instrument(t, y, fwhm_us) for key, y in raw.items()}
 
 
 UNITS = {"visar": "km/s", "bdot": "V", "radiography": "mm"}
@@ -205,8 +255,13 @@ def report(path, traces, best, ens=None, metrics=None, title=""):
         r.errorbar(tr.t, (tr.y - f) / tr.sigma, yerr=1.0, fmt="o", ms=2, color="#555555", elinewidth=0.6)
         r.set_ylabel("residual / $\\sigma$")
         r.set_xlabel("t ($\\mu$s)")
-        a.set_xlim(tr.t.min() - 0.05 * np.ptp(tr.t), tr.t.max() + 0.05 * np.ptp(tr.t))
-    ax[0, 0].legend(frameon=False, fontsize=7, loc="lower left")
+        x0, x1 = tr.t.min() - 0.05 * np.ptp(tr.t), tr.t.max() + 0.05 * np.ptp(tr.t)
+        a.set_xlim(x0, x1)
+        inwin = (tb + sh >= x0) & (tb + sh <= x1)
+        lo_ = min(float(np.min(tr.y - tr.sigma)), float(np.min(yb[inwin])))
+        hi_ = max(float(np.max(tr.y + tr.sigma)), float(np.max(yb[inwin])))
+        a.set_ylim(lo_ - 0.08 * (hi_ - lo_), hi_ + 0.08 * (hi_ - lo_))
+    ax[0, -1].legend(*ax[0, 0].get_legend_handles_labels(), frameon=False, fontsize=7, loc="lower left")
     if title:
         fig.suptitle(title, x=0.01, ha="left", fontsize=10)
     fig.tight_layout()

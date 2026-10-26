@@ -596,6 +596,9 @@ class MHDSolver:
     def _emf_hook(self, E):
         return E
 
+    def _flux_hook(self, Fx, Fy, WLx, WRx, WLy, WRy):    # AMR records the fluxes on patch boundaries
+        pass
+
     def _halo(self, A):
         pass
 
@@ -648,6 +651,7 @@ class MHDSolver:
         Fy, _ = hlld_flux_y(xp.ascontiguousarray(WLy.reshape(NVAR, -1)),
                              xp.ascontiguousarray(WRy.reshape(NVAR, -1)), eos, ch)
         Fy = Fy.reshape(s2)
+        self._flux_hook(Fx, Fy, WLx, WRx, WLy, WRy)
         if self.cyl:                                 # (1/r) d(r F)/dr with face radii
             rfx = self.rf[2:self.nx_tot - 1][None, :, None]
             rFx = Fx * rfx

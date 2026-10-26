@@ -152,6 +152,11 @@ def diag(s, state):
     seq_ratio, at_yield, n_dmg, m_dmg = stress_state(s, C, P)
     E = float(xp.sum(U[EN] * s.dV))
     v2 = P[iVX]**2 + P[iVY]**2
+    # free-surface velocity (what VISAR sees): v_r of the outermost cell holding over half the row's peak metal
+    # fraction (a coarse grid smears a thin liner below any fixed threshold), mean over z rows
+    metal = C > 0.5 * xp.max(C, axis=0)[None, :]
+    io = (C.shape[0] - 1) - xp.argmax(metal[::-1], axis=0)
+    v_surf = float(xp.mean(xp.take_along_axis(P[iVX], io[None, :], axis=0)))
     KE_lin = float(xp.sum(xp.where(lin, 0.5 * P[iRHO] * v2 * s.dV, 0.0))) * E_J
     drive = state.get("drive")
     W_in = s._cumulative_boundary_energy + (drive.work_grid if drive else 0.0)
@@ -172,7 +177,7 @@ def diag(s, state):
             "PB_over_Y": 0.5 * B_max**2 / Y,
             "seq_over_Y_mean": seq_ratio, "frac_at_yield": at_yield,
             "spall_cells": n_dmg, "spall_mass_frac": m_dmg, "p_liner_min_GPa": p_lin_min,
-            "KE_liner_J": KE_lin, "div_B": s.div_b_max(),
+            "KE_liner_J": KE_lin, "v_surface_kms": v_surf, "div_B": s.div_b_max(),
             "energy_error": (E - state["E0"] - W_in) / state["E0"]}
     if drive:
         c = drive.c

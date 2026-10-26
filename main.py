@@ -1783,6 +1783,140 @@ def validation_test():
     return ok1 and ok2 and ok3 and ok4
 
 
+def amr_test():
+    """Adaptive mesh refinement (sieve/amr.py), refinement ratio 4. (1) Periodic magnetized box (Orszag-Tang
+    vortex plus a dense blob) with regridding every 4 steps: mass, momentum and energy conserved to round-off,
+    div B at round-off on both levels, patches created and moved. (2) A gas / stiffened-gas interface carried at
+    uniform velocity and pressure across fixed coarse-fine boundaries: p and u stay uniform (the volume-fraction
+    equilibrium survives refluxing, prolongation and restriction). (3) A magnetized blast wave: the AMR density
+    error against a uniform run at the fine resolution is under half the coarse run's, with fewer fine cells."""
+    from sieve.amr import AMR, AMRParams
+    print("\n--- Adaptive mesh refinement ---"); sys.stdout.flush()
+    ok = True
+
+    def box(n, L=1.0, **kw):
+        c = dict(nx=n, ny=n, x_max=L, y_max=L, t_end=1.0, cfl=0.3, mach=1.0, gamma=5 / 3, B_transverse=1.0,
+                 bc_x_type="periodic", bc_y_type="periodic", powell_source=False, diag_interval=10**9,
+                 snapshot_times=[])
+        c.update(kw)
+        return Config(**c)
+
+    def state(s, fn):
+        W = xp.zeros((NVAR,) + s.U.shape[1:])
+        fn(W, s.X, s.Y)
+        return prim_to_cons(W, s.eos)
+
+    # (1) conservation and div B with regridding
+    def ot(W, X, Y):
+        W[iRHO] = 25 / (36 * np.pi) * (1 + 3 * xp.exp(-((X - 0.3)**2 + (Y - 0.6)**2) / 0.003))
+        W[iPR] = 5 / (12 * np.pi)
+        W[iVX], W[iVY] = -xp.sin(2 * np.pi * Y), xp.sin(2 * np.pi * X)
+        B0 = 1 / np.sqrt(4 * np.pi)
+        W[iBX], W[iBY] = -B0 * xp.sin(2 * np.pi * Y), B0 * xp.sin(4 * np.pi * X)
+    cfg = box(64)
+    a = AMR(cfg, AMRParams(ratio=4, regrid_every=4, tol_rho=0.15, tol_p=0.3, margin=3))
+    with contextlib.redirect_stdout(io.StringIO()):
+        U = state(MHDSolver(cfg), ot)
+    a.set_state(U)
+    a.regrid()
+    T0 = a.totals()
+    boxes0, moved, div = list(a.boxes), False, 0.0
+    for _ in range(24):
+        a.advance(a.compute_dt())
+        moved = moved or a.boxes != boxes0
+        div = max(div, a.div_b())
+    T1 = a.totals()
+    cons = max(abs(T1[k] - T0[k]) / max(abs(T0[k]), abs(T0["E"])) for k in ("mass", "mx", "my", "E"))
+    good = cons < 1e-12 and div < 1e-12 and len(a.patches) > 0 and moved
+    ok = ok and good
+    print(f"  periodic MHD box, 24 coarse steps, {len(a.patches)} patches (moved: {moved}, fine cells "
+          f"{100 * a.fine_fraction():.0f}% of a uniform fine grid): mass/momentum/energy {cons:.1e}, div B {div:.1e}  "
+          f"[{'PASS' if good else 'FAIL'}]")
+
+    # (1b) touching patches: two share an edge, a third touches one of them at a corner
+    cfg = box(64)
+    a = AMR(cfg, AMRParams(ratio=4, regrid_every=0))
+    with contextlib.redirect_stdout(io.StringIO()):
+        U = state(MHDSolver(cfg), ot)
+    a.set_state(U)
+    a.regrid([(12, 28, 20, 36), (28, 44, 16, 40), (44, 52, 40, 48)])
+    T0 = a.totals()
+    div = 0.0
+    for _ in range(24):
+        a.advance(a.compute_dt())
+        div = max(div, a.div_b())
+    T1 = a.totals()
+    cons = max(abs(T1[k] - T0[k]) / max(abs(T0[k]), abs(T0["E"])) for k in ("mass", "mx", "my", "E"))
+    ng = a.coarse.ng
+    fA, fB = a.patches[0], a.patches[1]                  # shared edge x = 28, y in [20, 36]
+    ea = fA.Bf[0][ng + fA.cfg.nx, ng:ng + fA.cfg.ny]
+    eb = fB.Bf[0][ng, ng + 4 * (20 - 16):ng + 4 * (36 - 16)]
+    seam = float(xp.max(xp.abs(ea - eb))) / float(xp.max(xp.abs(fA.Bf[0])))
+    good = cons < 1e-12 and div < 1e-12 and seam < 1e-12
+    ok = ok and good
+    print(f"  three touching patches (edge and corner), 24 steps: mass/momentum/energy {cons:.1e}, div B {div:.1e}, "
+          f"shared-edge faces agree to {seam:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+    # (2) material interface across coarse-fine boundaries at uniform p, u
+    mm = dict(B_transverse=0.0, material_tracer="volume_fraction", gamma=1.4, eos_liner="stiffened", gamma_liner=4.4,
+              p_inf_liner=6.0)
+    cfg = box(64, **mm)
+
+    def slab(W, X, Y):
+        a_ = 0.5 * (1 + xp.tanh((0.15 - xp.abs(X - 0.3)) / 0.01))
+        W[iRHO], W[iPR], W[iVX], W[iVY], W[iCLR] = 1.0 + 9.0 * a_, 1.0, 1.0, 0.5, a_
+    a = AMR(cfg, AMRParams(ratio=4, regrid_every=0))
+    with contextlib.redirect_stdout(io.StringIO()):
+        U = state(MHDSolver(cfg), slab)
+    a.set_state(U)
+    a.regrid([(20, 44, 16, 40)])                     # fixed patch: the slab sweeps through its edges
+    for _ in range(60):
+        a.advance(a.compute_dt())
+    W = [cons_to_prim(a.coarse.U, a.coarse.eos)] + [cons_to_prim(f.U, f.eos) for f in a.patches]
+    ng = a.coarse.ng
+    dp = max(float(xp.max(xp.abs(w[iPR, ng:-ng, ng:-ng] - 1.0))) for w in W)
+    du = max(float(xp.max(xp.abs(w[iVX, ng:-ng, ng:-ng] - 1.0))) + float(xp.max(xp.abs(w[iVY, ng:-ng, ng:-ng] - 0.5)))
+             for w in W)
+    good = dp < 1e-8 and du < 1e-8
+    ok = ok and good
+    print(f"  gas / stiffened-gas slab through a fixed patch (60 steps): max |p - p0| {dp:.1e}, |u - u0| {du:.1e}  "
+          f"[{'PASS' if good else 'FAIL'}]")
+
+    # (3) magnetized blast wave: AMR vs uniform coarse and uniform fine
+    def blast(W, X, Y):
+        r2 = (X - 0.5)**2 + (Y - 0.5)**2
+        W[iRHO] = 1.0
+        W[iPR] = 0.1 + 9.9 * (r2 < 0.1**2)
+        W[iBX] = W[iBY] = 1.0 / np.sqrt(2.0)
+    t_end, res = 0.06, {}
+    for name, n in (("fine", 256), ("coarse", 64)):
+        cfg = box(n, gamma=1.4)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        s.U = state(s, blast); s.t = 0.0; s.step = 0
+        _march(s, t_end)
+        res[name] = to_numpy(cons_to_prim(s.U, s.eos)[iRHO, s.ng:-s.ng, s.ng:-s.ng])
+    cfg = box(64, gamma=1.4)
+    a = AMR(cfg, AMRParams(ratio=4, regrid_every=2, tol_rho=0.03, tol_p=0.1, margin=3, buffer=2))
+    with contextlib.redirect_stdout(io.StringIO()):
+        U = state(MHDSolver(cfg), blast)
+    a.set_state(U)
+    a.regrid()
+    frac = []
+    while a.t < t_end - 1e-12:
+        a.advance(min(a.compute_dt(), t_end - a.t))
+        frac.append(a.fine_fraction())
+    ref = res["fine"]
+    l1 = lambda f: float(np.mean(np.abs(f - ref)))
+    e_amr, e_c = l1(a.composite(iRHO)), l1(np.repeat(np.repeat(res["coarse"], 4, 0), 4, 1))
+    good = e_amr < 0.5 * e_c and max(frac) < 0.5
+    ok = ok and good
+    print(f"  magnetized blast wave vs a uniform 256^2 run: L1 density error coarse 64^2 {e_c:.4f}, AMR 64^2 + ratio-4 "
+          f"patches {e_amr:.4f} ({e_amr / e_c:.2f}x) with at most {100 * max(frac):.0f}% (mean {100 * np.mean(frac):.0f}%) "
+          f"of the fine cells  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def circuit_test():
     """RLC drive circuit (sieve/circuit.py). (1) Fixed load: the underdamped discharge I = V0/(w L) e^(-a t)
     sin(w t) to 1e-6 of the peak at 4000 steps, bank energy budget to round-off. (2) An Al liner (R 10-11 mm,
@@ -1870,6 +2004,7 @@ VERIFICATION_TESTS = {
     "render3d": render3d_test,
     "tabular": tabular_test,
     "validation": validation_test,
+    "amr": amr_test,
 }
 
 

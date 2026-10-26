@@ -1,0 +1,658 @@
+# amr.py - block-structured adaptive mesh refinement for the 2D Cartesian solver (Berger-Colella style).
+#
+# One coarse MHDSolver covers the domain; fine patches (each an MHDSolver on a sub-rectangle, cell size dx/r)
+# cover the flagged regions and take r sub-steps per coarse step. Per coarse step:
+#   1. the coarse level steps, recording (time-weighted over its SSP-RK3 stages) the fluxes, the
+#      volume-fraction face terms and the corner EMFs on every patch boundary;
+#   2. each patch sub-steps, its ghost cells filled from the coarse level at the stage time (limited linear in
+#      space, linear in time between the coarse states before and after the step), recording the same
+#      boundary quantities;
+#   3. synchronisation: the coarse cells next to a patch are refluxed with the fine fluxes (mass, momentum and
+#      energy then conserved exactly across the coarse-fine boundary), the coarse faces next to a patch get the
+#      fine edge EMFs instead of the coarse ones (Balsara 2001), and the coarse cells and faces under a patch
+#      become the fine averages. The coarse face divergence stays at round-off, and so does the fine one.
+# The volume fraction (non-conservative, Shyue) is refluxed with both of its face terms, u a and u, and the
+# prolongation uses one slope limiter for all conserved variables of a cell, so a material interface at
+# uniform pressure and velocity stays in equilibrium across the coarse-fine boundary.
+#
+# Patches may touch: on a shared edge the lower-index patch owns the faces and corners, and the other is
+# refluxed and EMF-corrected with its values, so conservation and div B hold across fine-fine seams too
+# (ghost cells there still come from the coarse level).
+#
+# Every `regrid_every` coarse steps the level is re-flagged: |grad rho| dx / rho > tol_rho, relative pressure
+# jumps between neighbours > tol_p, interface curvature |div n| dx > tol_curv (n = grad a / |grad a|, in mixed
+# cells) and field-line curvature |b . grad b| dx > tol_bcurv (where |B| is above 5% of its maximum). Flags are
+# buffered, grouped into rectangles (connected components, merged when close), and kept away from the domain
+# edges, and split where they are poorly filled; an optional region mask limits refinement to where it
+# matters (e.g. the fuel core). New patches take the old fine data where they overlap an old patch and are prolonged elsewhere; their
+# face fields come from a vector potential A_z (old fine A_z in the overlap, coarse A_z interpolated
+# elsewhere), so they are divergence-free by construction and consistent with the coarse faces.
+#
+# Scope: 2D Cartesian, ideal MHD with the two-material EOS and the volume-fraction tracer, constrained
+# transport. The split-step operators (conduction, viscosity, FLD) and the resistive / strength / Nernst face
+# fluxes are not coupled across levels and raise.
+import dataclasses
+
+import numpy as np
+
+from .config import Config, NVAR, RHO, MX, MY, MZ, BX, BY, BZ, EN, RHOC, iRHO, iVX, iVY, iBX, iBY, iBZ, iPR, iCLR
+from .physics import xp, cons_to_prim
+from .solver import MHDSolver, to_numpy
+from . import ct
+
+
+def _check(cfg):
+    if cfg.geometry != "cartesian" or cfg.div_b != "ct":
+        raise NotImplementedError("AMR: 2D Cartesian with constrained transport")
+    if cfg.cond_kappa0 > 0 or cfg.visc_coeff > 0 or cfg.fld or cfg.strength or cfg.nernst_coeff > 0 \
+            or cfg.is_resistive() or cfg.rad_coeff > 0 or cfg.two_temp:
+        raise NotImplementedError("AMR: ideal MHD + two-material EOS only (no resistive, strength, transport or "
+                                  "radiation terms across levels yet)")
+
+
+# ------------------------------------------------------------------ recording levels
+
+class _Recorder:
+    """mixin: accumulate, weighted by the RK stage weights, the fluxes / vf terms / EMFs on the boundaries of
+    the boxes in self._rec_boxes (coarse cell indices (i0, i1, j0, j1), interior numbering, faces k = 0..n)"""
+
+    def _rec_reset(self, boxes, ratio):
+        self._rec_boxes, self._rec_r = boxes, ratio
+        self._rec = [None] * len(boxes)
+        self._stage = None
+
+    def _flux_hook(self, Fx, Fy, WLx, WRx, WLy, WRy):
+        if not getattr(self, "_rec_boxes", None):
+            return
+        ng = self.ng
+
+        def vf(F, WL, WR):                           # u_f and u_f a_f, as vf_advection_rate builds them
+            F0 = F[RHO]
+            u = F0 / xp.where(F0 >= 0, WL[iRHO], WR[iRHO])
+            a = xp.where(xp.abs(F0) > 1e-300, F[RHOC] / xp.where(F0 == 0, 1.0, F0), 0.5 * (WL[iCLR] + WR[iCLR]))
+            return u, u * a
+        ux, uax = vf(Fx, WLx, WRx)
+        uy, uay = vf(Fy, WLy, WRy)
+        self._stage = []
+        for (i0, i1, j0, j1) in self._rec_boxes:
+            r = self._rec_r
+            # this level's own box boundary in its index space (fine: the whole patch, coarse: the box)
+            ri0, ri1, rj0, rj1 = (i0, i1, j0, j1) if r == 0 else (0, self.cfg.nx, 0, self.cfg.ny)
+            rows = slice(ng + rj0, ng + rj1)
+            cols = slice(ng + ri0, ng + ri1)
+            rec = {"F": [Fx[:, ri0, rows], Fx[:, ri1, rows], Fy[:, cols, rj0], Fy[:, cols, rj1]],
+                   "u": [ux[ri0, rows], ux[ri1, rows], uy[cols, rj0], uy[cols, rj1]],
+                   "ua": [uax[ri0, rows], uax[ri1, rows], uay[cols, rj0], uay[cols, rj1]]}
+            self._stage.append(rec)
+
+    def _emf_hook(self, E):
+        if getattr(self, "_rec_boxes", None) and self._stage is not None:
+            for k, (i0, i1, j0, j1) in enumerate(self._rec_boxes):
+                ri0, ri1, rj0, rj1 = (i0, i1, j0, j1) if self._rec_r == 0 else (0, self.cfg.nx, 0, self.cfg.ny)
+                self._stage[k]["E"] = [E[ri0, rj0:rj1 + 1], E[ri1, rj0:rj1 + 1], E[ri0:ri1 + 1, rj0], E[ri0:ri1 + 1, rj1]]
+        return E
+
+    def _accumulate_energy_budget(self, weight):
+        super()._accumulate_energy_budget(weight)
+        if not getattr(self, "_rec_boxes", None) or self._stage is None:
+            return
+        for k, st in enumerate(self._stage):
+            acc = self._rec[k]
+            if acc is None:
+                self._rec[k] = {key: [weight * a for a in st[key]] for key in st}
+            else:
+                for key in st:
+                    for m, a in enumerate(st[key]):
+                        acc[key][m] = acc[key][m] + weight * a
+        self._stage = None
+
+
+class CoarseLevel(_Recorder, MHDSolver):
+    pass
+
+
+class FinePatch(_Recorder, MHDSolver):
+    """an MHDSolver on a sub-rectangle. Ghost cells and faces come from neighbouring patches where they overlap
+    one (same stage, the patches advance in lockstep) and from the coarse level elsewhere (space-time
+    interpolated). gx0, gy0: global fine index of the first interior cell."""
+
+    neighbours = ()
+
+    def _set_ghost_source(self, P_old, P_new, t0, dtc):
+        self._P_old, self._P_new, self._t0, self._dtc = P_old, P_new, t0, dtc
+        self._k = 0
+
+    def compute_rhs(self, U, out=None, Bf=None, dBf=None, S=None, dS=None):
+        ts = (0.0, self.dt, 0.5 * self.dt)[self._k % 3]
+        self._k += 1
+        self._theta = (self.t + ts - self._t0) / self._dtc
+        return super().compute_rhs(U, out, Bf, dBf, S, dS)
+
+    def _overlaps(self, o, sx, sy):
+        """(my index slices, o's index slices) where o's interior (shifted by sx, sy in its index space, 0 for
+        cells, 1 to include the upper boundary face) covers my ghost-inclusive array"""
+        ng = self.ng
+        N = (self.U.shape[1] + sx, self.U.shape[2] + sy)
+        lo = (max(0, o.gx0 - self.gx0 + ng), max(0, o.gy0 - self.gy0 + ng))
+        hi = (min(N[0], o.gx0 + o.cfg.nx + sx - self.gx0 + ng), min(N[1], o.gy0 + o.cfg.ny + sy - self.gy0 + ng))
+        if lo[0] >= hi[0] or lo[1] >= hi[1]:
+            return None
+        mine = (slice(lo[0], hi[0]), slice(lo[1], hi[1]))
+        theirs = tuple(slice(l + s - o_ + ng, h + s - o_ + ng) for l, h, s, o_ in
+                       ((lo[0], hi[0], self.gx0 - ng, o.gx0), (lo[1], hi[1], self.gy0 - ng, o.gy0)))
+        return mine, theirs
+
+    def apply_bc(self, U):
+        th = getattr(self, "_theta", 1.0)
+        G = (1.0 - th) * self._P_old + th * self._P_new
+        ng = self.ng
+        U[:, :ng, :] = G[:, :ng, :]
+        U[:, -ng:, :] = G[:, -ng:, :]
+        U[:, :, :ng] = G[:, :, :ng]
+        U[:, :, -ng:] = G[:, :, -ng:]
+        keep = U[:, ng:-ng, ng:-ng].copy()
+        for o in self.neighbours:                    # fine data from touching patches, same stage
+            ov = self._overlaps(o, 0, 0)
+            if ov is not None:
+                U[(slice(None),) + ov[0]] = o._cur_U[(slice(None),) + ov[1]]
+        U[:, ng:-ng, ng:-ng] = keep
+        return U
+
+    def _ghost_faces(self, Bf, U):
+        super()._ghost_faces(Bf, U)
+        ng, nx, ny = self.ng, self.cfg.nx, self.cfg.ny
+        keep = [Bf[0][ng:ng + nx + 1, ng:ng + ny].copy(), Bf[1][ng:ng + nx, ng:ng + ny + 1].copy()]
+        for o in self.neighbours:
+            for a, (sx, sy) in enumerate(((1, 0), (0, 1))):
+                ov = self._overlaps(o, sx, sy)
+                if ov is not None:
+                    Bf[a][ov[0]] = o._cur_F[a][ov[1]]
+        Bf[0][ng:ng + nx + 1, ng:ng + ny] = keep[0]
+        Bf[1][ng:ng + nx, ng:ng + ny + 1] = keep[1]
+
+    # SSP-RK3 split into stages so that all patches can take each stage together (_rk_core, stage by stage)
+    def rk_begin(self, dt):
+        self.dt = dt
+        self._glm_ch_frozen = self.cfg.glm_ch
+        self._ct_sync()
+        self._cur_U, self._cur_F = self.U, self.Bf
+        self._U0 = self.U
+
+    def stage_rhs(self, k):
+        w = (1 / 6, 1 / 6, 2 / 3)[k] * self.dt
+        U = self.U if k == 0 else self.U_temp
+        F = self.Bf if k == 0 else self._Bf1
+        self.compute_rhs(U, out=self.dU, Bf=F, dBf=self._dBf)
+        self._accumulate_energy_budget(w)
+
+    def stage_update(self, k):
+        dt, U0, F0, F1, dF = self.dt, self.U, self.Bf, self._Bf1, self._dBf
+        if k == 0:
+            for f0, f1, d in zip(F0, F1, dF):
+                xp.add(f0, dt * d, out=f1)
+            xp.add(U0, dt * self.dU, out=self.U_temp)
+        elif k == 1:
+            for f0, f1, d in zip(F0, F1, dF):
+                f1[...] = 0.75 * f0 + 0.25 * (f1 + dt * d)
+            self.U_temp[...] = 0.75 * U0 + 0.25 * (self.U_temp + dt * self.dU)
+        else:
+            for f0, f1, d in zip(F0, F1, dF):
+                f0[...] = f0 / 3.0 + 2.0 / 3.0 * (f1 + dt * d)
+            self.U[...] = U0 / 3.0 + 2.0 / 3.0 * (self.U_temp + dt * self.dU)
+        target = self.U if k == 2 else self.U_temp
+        self.enforce_scalar_bounds(target)
+        if k == 2:
+            ct.cells_from_faces(self.U, self.Bf, (slice(self.ng, self.ng + self.cfg.nx),
+                                                  slice(self.ng, self.ng + self.cfg.ny)))
+        self._cur_U, self._cur_F = target, (self.Bf if k == 2 else F1)
+
+
+# ------------------------------------------------------------------ prolongation, vector potential
+
+def prolong(Uc, i0, j0, nxf, nyf, r, ng):
+    """conservative limited-linear prolongation of the coarse conserved array (with ghosts) onto a fine array of
+    nxf x nyf interior cells (+ ng ghosts) starting at coarse interior cell (i0, j0); one limiter factor per
+    coarse cell for all variables, so linear relations between them survive"""
+    nfx, nfy = nxf + 2 * ng, nyf + 2 * ng
+    xf = (np.arange(nfx) - ng + 0.5) / r                    # fine centres in coarse-cell units from the box origin
+    yf = (np.arange(nfy) - ng + 0.5) / r
+    ic = np.floor(xf).astype(int) + i0 + ng                 # coarse array index (ghost-inclusive)
+    jc = np.floor(yf).astype(int) + j0 + ng
+    ox = xp.asarray(xf - np.floor(xf) - 0.5)[:, None]
+    oy = xp.asarray(yf - np.floor(yf) - 0.5)[None, :]
+    lo_i, hi_i, lo_j, hi_j = ic.min() - 1, ic.max() + 2, jc.min() - 1, jc.max() + 2
+    C = Uc[:, lo_i:hi_i, lo_j:hi_j]
+    ii, jj = ic - lo_i, jc - lo_j
+
+    def slopes(C, ax):
+        f = C.shape[1 + ax]
+        lo, mid, hi = [slice(None)] * 3, [slice(None)] * 3, [slice(None)] * 3
+        lo[1 + ax], mid[1 + ax], hi[1 + ax] = slice(0, f - 2), slice(1, f - 1), slice(2, f)
+        dm, dp = C[tuple(mid)] - C[tuple(lo)], C[tuple(hi)] - C[tuple(mid)]
+        c = 0.5 * (dm + dp)
+        mm = xp.where(dm * dp > 0, xp.sign(dm) * xp.minimum(xp.abs(dm), xp.abs(dp)), 0.0)
+        ratio = xp.where(xp.abs(c) > 1e-300, mm / xp.where(c == 0, 1.0, c), 1.0)
+        phi = xp.clip(xp.min(ratio, axis=0), 0.0, 1.0)      # one factor for all variables
+        out = xp.zeros_like(C)
+        out[tuple(mid)] = phi[None] * c
+        return out
+    Sx, Sy = slopes(C, 0), slopes(C, 1)
+    I, J = xp.asarray(ii)[:, None], xp.asarray(jj)[None, :]
+    return C[:, I, J] + Sx[:, I, J] * ox + Sy[:, I, J] * oy
+
+
+def potential(Bxf, Byf, k0, k1, l0, l1, h):
+    """A_z on the corners (k0..k1) x (l0..l1) (face indices) from face fields: dA/dy = B_x, dA/dx = -B_y,
+    A = 0 at (k0, l0); exact for a divergence-free field (path independent)"""
+    dx, dy = h
+    col = xp.concatenate([xp.zeros(1), xp.cumsum(Bxf[k0, l0:l1]) * dy])           # up the left edge
+    row = -xp.cumsum(Byf[k0:k1, l0:l1 + 1], axis=0) * dx                            # then along x
+    A = xp.concatenate([col[None, :], col[None, :] + row], axis=0)
+    return A
+
+
+# ------------------------------------------------------------------ driver
+
+@dataclasses.dataclass
+class AMRParams:
+    ratio: int = 4
+    regrid_every: int = 8
+    tol_rho: float = 0.05
+    tol_p: float = 0.1
+    tol_curv: float = 0.0                            # 0: off
+    tol_bcurv: float = 0.0
+    buffer: int = 3
+    margin: int = 3
+    min_size: int = 4
+    max_patches: int = 64
+    efficiency: float = 0.7                          # split boxes filled less than this
+    region: object = None                            # optional callable(coarse solver) -> host bool mask (interior)
+
+
+class AMR:
+    """two-level AMR driver over a 2D Cartesian Config (the coarse grid)"""
+
+    def __init__(self, cfg, params=None):
+        _check(cfg)
+        self.p = params or AMRParams()
+        self.cfg = cfg
+        phys = dataclasses.replace(cfg.physics, use_cuda_graphs=False)
+        c = Config.__new__(Config)
+        c.grid, c.physics, c.io = cfg.grid, phys, cfg.io
+        self.coarse = CoarseLevel(c)
+        self.coarse._rec_reset([], 0)
+        self.patches, self.boxes = [], []
+        self.t, self.step = 0.0, 0
+        self.fine_cell_steps = 0
+
+    # -- setup
+    def set_state(self, U):
+        """coarse conserved state (with ghosts); call regrid() afterwards"""
+        self.coarse.U = U
+        self.coarse.t, self.coarse.step = 0.0, 0
+        self.coarse.apply_bc(self.coarse.U)
+        self.coarse._ct_sync()
+
+    def _fine_cfg(self, box):
+        i0, i1, j0, j1 = box
+        c, r = self.cfg, self.p.ratio
+        grid = dataclasses.replace(c.grid, nx=r * (i1 - i0), ny=r * (j1 - j0), x_min=c.x_min + i0 * c.dx,
+                                   x_max=c.x_min + i1 * c.dx, y_min=c.y_min + j0 * c.dy, y_max=c.y_min + j1 * c.dy,
+                                   x_spacing=c.dx / r)
+        phys = dataclasses.replace(c.physics, use_cuda_graphs=False, bc_x_type="extrapolation",
+                                   bc_y_type="extrapolation")
+        out = Config.__new__(Config)
+        out.grid, out.physics, out.io = grid, phys, c.io
+        return out
+
+    # -- flagging and clustering
+    def flags(self):
+        s, p = self.coarse, self.p
+        ng = s.ng
+        W = cons_to_prim(s.U, s.eos)
+        rho, pr = W[iRHO], W[iPR]
+        I = (slice(ng, -ng), slice(ng, -ng))
+        gx = 0.5 * (rho[2:, 1:-1] - rho[:-2, 1:-1])
+        gy = 0.5 * (rho[1:-1, 2:] - rho[1:-1, :-2])
+        f = xp.sqrt(gx**2 + gy**2)[1:-1, 1:-1] / rho[I] > p.tol_rho
+        jump = lambda a, b: xp.abs(a - b) / xp.minimum(xp.abs(a), xp.abs(b))
+        jp = xp.maximum(xp.maximum(jump(pr[I], pr[ng + 1:-ng + 1, ng:-ng]), jump(pr[I], pr[ng - 1:-ng - 1, ng:-ng])),
+                        xp.maximum(jump(pr[I], pr[ng:-ng, ng + 1:-ng + 1]), jump(pr[I], pr[ng:-ng, ng - 1:-ng - 1])))
+        f = f | (jp > p.tol_p)
+        if p.tol_curv > 0:                           # interface curvature, mixed cells
+            a = xp.clip(W[iCLR], 0, 1)
+            ax, ay = xp.gradient(a, axis=0), xp.gradient(a, axis=1)
+            m = xp.sqrt(ax**2 + ay**2) + 1e-12
+            k = xp.gradient(ax / m, axis=0) + xp.gradient(ay / m, axis=1)
+            f = f | ((xp.abs(k[I]) > p.tol_curv) & (a[I] > 0.05) & (a[I] < 0.95))
+        if p.tol_bcurv > 0:                          # field-line curvature where the field matters
+            bx, by = W[iBX], W[iBY]
+            bm = xp.sqrt(bx**2 + by**2 + W[iBZ]**2) + 1e-30
+            ux, uy = bx / bm, by / bm
+            kx = ux * xp.gradient(ux, axis=0) + uy * xp.gradient(ux, axis=1)
+            ky = ux * xp.gradient(uy, axis=0) + uy * xp.gradient(uy, axis=1)
+            strong = bm[I] > 0.05 * float(xp.max(bm[I]))
+            f = f | ((xp.sqrt(kx**2 + ky**2)[I] > p.tol_bcurv) & strong)
+        f = to_numpy(f)
+        if p.region is not None:                     # refine only where the caller says (e.g. the fuel core)
+            f &= np.asarray(p.region(s), bool)
+        return f
+
+    def cluster(self, f):
+        """flagged cells -> rectangles: buffered flags, connected components, overlapping boxes merged, then
+        boxes filled less than `efficiency` split (at a hole in the flag signature, else at the middle of the
+        longer side) and shrunk to their flags, recursively. Boxes may touch, never overlap."""
+        p = self.p
+        nx, ny = f.shape
+        b, m = p.buffer, p.margin
+        g = np.zeros_like(f)
+        for i, j in np.argwhere(f):
+            g[max(i - b, 0):i + b + 1, max(j - b, 0):j + b + 1] = True
+        g[:m, :] = g[nx - m:, :] = False
+        g[:, :m] = g[:, ny - m:] = False
+        lab = np.zeros(f.shape, int)
+        boxes, n = [], 0
+        for i, j in np.argwhere(g):                  # connected components (host flood fill, small grid)
+            if lab[i, j]:
+                continue
+            n += 1
+            stack, lab[i, j] = [(i, j)], n
+            lo_i = hi_i = i; lo_j = hi_j = j
+            while stack:
+                a, c = stack.pop()
+                lo_i, hi_i, lo_j, hi_j = min(lo_i, a), max(hi_i, a), min(lo_j, c), max(hi_j, c)
+                for da, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    x, y = a + da, c + dc
+                    if 0 <= x < nx and 0 <= y < ny and g[x, y] and not lab[x, y]:
+                        lab[x, y] = n
+                        stack.append((x, y))
+            boxes.append([lo_i, hi_i + 1, lo_j, hi_j + 1])
+        merged = True                                # bounding boxes of different components may overlap
+        while merged:
+            merged = False
+            for a_ in range(len(boxes)):
+                for c_ in range(a_ + 1, len(boxes)):
+                    A, B = boxes[a_], boxes[c_]
+                    if A[0] < B[1] and B[0] < A[1] and A[2] < B[3] and B[2] < A[3]:
+                        boxes[a_] = [min(A[0], B[0]), max(A[1], B[1]), min(A[2], B[2]), max(A[3], B[3])]
+                        boxes.pop(c_)
+                        merged = True
+                        break
+                if merged:
+                    break
+
+        def shrink(bx):
+            i0, i1, j0, j1 = bx
+            sub = g[i0:i1, j0:j1]
+            if not sub.any():
+                return None
+            ii, jj = np.nonzero(sub.any(axis=1))[0], np.nonzero(sub.any(axis=0))[0]
+            return [i0 + ii[0], i0 + ii[-1] + 1, j0 + jj[0], j0 + jj[-1] + 1]
+
+        def split(bx):
+            bx = shrink(bx)
+            if bx is None:
+                return []
+            i0, i1, j0, j1 = bx
+            sub = g[i0:i1, j0:j1]
+            ax = 0 if i1 - i0 >= j1 - j0 else 1
+            L = sub.shape[ax]
+            if sub.mean() >= p.efficiency or L < 2 * p.min_size:
+                return [bx]
+            sig = sub.sum(axis=1 - ax)
+            holes = [k for k in range(p.min_size, L - p.min_size + 1) if sig[k - 1] == 0 or (k < L and sig[k] == 0)]
+            cut = min(holes, key=lambda k: abs(k - L / 2)) if holes else L // 2
+            if ax == 0:
+                return split([i0, i0 + cut, j0, j1]) + split([i0 + cut, i1, j0, j1])
+            return split([i0, i1, j0, j0 + cut]) + split([i0, i1, j0 + cut, j1])
+        out = []
+        for bx in boxes:
+            out += split(bx)
+        return [tuple(int(v) for v in bx) for bx in out if bx[1] - bx[0] >= 2 and bx[3] - bx[2] >= 2][:p.max_patches]
+
+    # -- (re)gridding
+    def regrid(self, boxes=None):
+        """new patches on boxes (default: from the flags). Data: the old fine data where an old patch covers the
+        cells, prolonged coarse data elsewhere. Faces: one composite fine-resolution A_z over the domain (coarse
+        A_z interpolated, old fine A_z offset-matched into the old patches), so every new patch, and two that
+        touch, gets divergence-free faces that agree on shared edges and sum to the coarse face fluxes."""
+        boxes = self.cluster(self.flags()) if boxes is None else boxes
+        old = list(zip(self.boxes, self.patches))
+        s, r, ng = self.coarse, self.p.ratio, self.coarse.ng
+        nx, ny = s.cfg.nx, s.cfg.ny
+        s._ct_sync()
+        Ac = potential(s.Bf[0], s.Bf[1], ng, ng + nx, ng, ng + ny, (s.cfg.dx, s.cfg.dy))
+        xs, ys = np.arange(r * nx + 1) / r, np.arange(r * ny + 1) / r
+        ii = np.minimum(np.floor(xs).astype(int), nx - 1); wx = xp.asarray(xs - ii)[:, None]
+        jj = np.minimum(np.floor(ys).astype(int), ny - 1); wy = xp.asarray(ys - jj)[None, :]
+        I, J = xp.asarray(ii)[:, None], xp.asarray(jj)[None, :]
+        Af = ((1 - wx) * (1 - wy) * Ac[I, J] + wx * (1 - wy) * Ac[I + 1, J] + (1 - wx) * wy * Ac[I, J + 1]
+              + wx * wy * Ac[I + 1, J + 1])
+        for (ob, op) in old:
+            Ao = potential(op.Bf[0], op.Bf[1], ng, ng + op.cfg.nx, ng, ng + op.cfg.ny, (op.cfg.dx, op.cfg.dy))
+            ci, cj = r * ob[0], r * ob[2]
+            Af[ci:ci + Ao.shape[0], cj:cj + Ao.shape[1]] = Ao + (Af[ci, cj] - Ao[0, 0])
+        new = []
+        for box in boxes:
+            i0, i1, j0, j1 = box
+            fc = self._fine_cfg(box)
+            f = FinePatch(fc)
+            f._rec_reset([box], r)
+            nxf, nyf = fc.nx, fc.ny
+            U = prolong(s.U, i0, j0, nxf, nyf, r, ng)
+            for (ob, op) in old:                     # overlap with an old patch: take its fine data
+                a0, a1, b0, b1 = max(i0, ob[0]), min(i1, ob[1]), max(j0, ob[2]), min(j1, ob[3])
+                if a0 >= a1 or b0 >= b1:
+                    continue
+                fi = slice(ng + r * (a0 - i0), ng + r * (a1 - i0)); fj = slice(ng + r * (b0 - j0), ng + r * (b1 - j0))
+                oi = slice(ng + r * (a0 - ob[0]), ng + r * (a1 - ob[0])); oj = slice(ng + r * (b0 - ob[2]), ng + r * (b1 - ob[2]))
+                U[:, fi, fj] = op.U[:, oi, oj]
+            f.U = U
+            A = Af[r * i0:r * i1 + 1, r * j0:r * j1 + 1]
+            Bx = xp.zeros((nxf + 2 * ng + 1, nyf + 2 * ng)); By = xp.zeros((nxf + 2 * ng, nyf + 2 * ng + 1))
+            Bx[ng:ng + nxf + 1, ng:ng + nyf] = (A[:, 1:] - A[:, :-1]) / fc.dy
+            By[ng:ng + nxf, ng:ng + nyf + 1] = -(A[1:, :] - A[:-1, :]) / fc.dx
+            f.Bf = [Bx, By]
+            f._faces_owner = f.U
+            f._Bf1 = [xp.empty_like(a) for a in f.Bf]
+            f._dBf = [xp.empty_like(a) for a in f.Bf]
+            inner = (slice(ng, ng + nxf), slice(ng, ng + nyf))
+            ct.cells_from_faces(f.U, f.Bf, inner)          # total energy kept as prolonged (conservative)
+            f.t, f.step = self.t, 0
+            f.gx0, f.gy0 = r * i0, r * j0
+            f._cur_U, f._cur_F = f.U, f.Bf
+            new.append(f)
+        for f, bf in zip(new, boxes):                # touching or close: within a ghost layer of each other
+            f.neighbours = [o for o, bo in zip(new, boxes) if o is not f and bo[0] <= bf[1] and bf[0] <= bo[1]
+                            and bo[2] <= bf[3] and bf[2] <= bo[3]]
+        self.boxes, self.patches = [tuple(b_) for b_ in boxes], new
+        s._rec_reset(self.boxes, 0)
+
+    # -- time stepping
+    def compute_dt(self):
+        s = self.coarse
+        dt = s.compute_dt(cons_to_prim(s.U, s.eos))
+        for f in self.patches:
+            f._set_ghost_source(*self._ghost_frames(f), self.t, 1.0)
+            f._theta = 0.0
+            f.apply_bc(f.U)
+            dt = min(dt, self.p.ratio * f.compute_dt(cons_to_prim(f.U, f.eos)))
+        return dt
+
+    def _ghost_frames(self, f, U_old=None):
+        s, ng, r = self.coarse, self.coarse.ng, self.p.ratio
+        i0, i1, j0, j1 = self.boxes[self.patches.index(f)]
+        Pn = prolong(s.U, i0, j0, f.cfg.nx, f.cfg.ny, r, ng)
+        Po = Pn if U_old is None else prolong(U_old, i0, j0, f.cfg.nx, f.cfg.ny, r, ng)
+        return Po, Pn
+
+    def advance(self, dt):
+        s, r, ng = self.coarse, self.p.ratio, self.coarse.ng
+        U_old = s.U.copy()
+        s._rec_reset(self.boxes, 0)
+        s.dt = dt
+        s.step_ssprk3()
+        s.t += dt
+        s.step += 1
+        P = self.patches
+        for k, f in enumerate(P):
+            Po, Pn = self._ghost_frames(f, U_old)
+            f._set_ghost_source(Po, Pn, self.t, dt)
+            f._rec_reset([self.boxes[k]], r)
+        for m in range(r):                           # all patches take each RK stage together
+            for f in P:
+                f.rk_begin(dt / r)
+            for k in range(3):
+                for f in P:
+                    f.stage_rhs(k)
+                for f in P:
+                    f.stage_update(k)
+            for f in P:
+                f._post_step(dt / r)
+                f.t += dt / r
+                f.step += 1
+        for f in P:
+            f._theta = 1.0
+            f.apply_bc(f.U)
+            self.fine_cell_steps += r * f.cfg.nx * f.cfg.ny
+        self._sync()
+        self.t += dt
+        self.step += 1
+        if self.p.regrid_every and self.step % self.p.regrid_every == 0:
+            self.regrid()
+
+    def _sync(self):
+        s, r, ng = self.coarse, self.p.ratio, self.coarse.ng
+        dx, dy = s.cfg.dx, s.cfg.dy
+        nx, ny = s.cfg.nx, s.cfg.ny
+        dU = xp.zeros_like(s.U)
+        dEc = xp.zeros((nx + 1, ny + 1))
+        setc = np.zeros((nx + 1, ny + 1), bool)    # corners already corrected by a lower-index patch (owner)
+        for k, (box, f) in enumerate(zip(self.boxes, self.patches)):
+            i0, i1, j0, j1 = box
+            C, Fr = s._rec[k], f._rec[0]
+            agg = lambda a: a.reshape(a.shape[:-1] + (-1, r)).mean(axis=-1)          # r fine faces -> one coarse
+            dF = [agg(Fr["F"][m]) - C["F"][m] for m in range(4)]
+            for d in dF:                             # the tracer is refluxed with its own two terms below
+                d[RHOC] = 0.0
+            du = [agg(Fr["u"][m]) - C["u"][m] for m in range(4)]
+            dua = [agg(Fr["ua"][m]) - C["ua"][m] for m in range(4)]
+            rows, cols = slice(ng + j0, ng + j1), slice(ng + i0, ng + i1)
+            a_c = cons_to_prim(s.U, s.eos)[iCLR]
+            # reflux: left (outside cell's high face), right (low face), bottom, top
+            for m, (ci, cj, sign, h) in enumerate(((ng + i0 - 1, rows, -1, dx), (ng + i1, rows, +1, dx),
+                                                   (cols, ng + j0 - 1, -1, dy), (cols, ng + j1, +1, dy))):
+                dU[:, ci, cj] += sign * dF[m] / h
+                dU[RHOC, ci, cj] += sign * (dua[m] - a_c[ci, cj] * du[m]) / h
+            # EMF correction on the boundary corners (fine corners every r-th, time-weighted)
+            for m, (ksl, lsl) in enumerate(((i0, slice(j0, j1 + 1)), (i1, slice(j0, j1 + 1)),
+                                            (slice(i0, i1 + 1), j0), (slice(i0, i1 + 1), j1))):
+                free = xp.asarray(~setc[ksl, lsl])
+                dEc[ksl, lsl] = xp.where(free, Fr["E"][m][::r] - C["E"][m], dEc[ksl, lsl])
+                setc[ksl, lsl] = True
+        dU[BX:BZ] = 0.0                              # in-plane B lives on the faces (B_z is a cell variable: refluxed)
+        s.U += dU
+        # faces next to the patches: dBx = -(dE(k, l+1) - dE(k, l)) / dy, dBy = (dE(k+1, l) - dE(k, l)) / dx
+        s.Bf[0][ng:ng + nx + 1, ng:ng + ny] += -(dEc[:, 1:] - dEc[:, :-1]) / dy
+        s.Bf[1][ng:ng + nx, ng:ng + ny + 1] += (dEc[1:, :] - dEc[:-1, :]) / dx
+        self._fine_fine()
+        # restriction: cells and faces under each patch become the fine averages
+        for box, f in zip(self.boxes, self.patches):
+            i0, i1, j0, j1 = box
+            nxf, nyf = f.cfg.nx, f.cfg.ny
+            Uf = f.U[:, ng:ng + nxf, ng:ng + nyf]
+            Uc = Uf.reshape(NVAR, i1 - i0, r, j1 - j0, r).mean(axis=(2, 4))
+            s.U[:, ng + i0:ng + i1, ng + j0:ng + j1] = Uc
+            fx = f.Bf[0][ng:ng + nxf + 1:r, ng:ng + nyf]
+            s.Bf[0][ng + i0:ng + i1 + 1, ng + j0:ng + j1] = fx.reshape(i1 - i0 + 1, j1 - j0, r).mean(axis=2)
+            fy = f.Bf[1][ng:ng + nxf, ng:ng + nyf + 1:r]
+            s.Bf[1][ng + i0:ng + i1, ng + j0:ng + j1 + 1] = fy.reshape(i1 - i0, r, j1 - j0 + 1).mean(axis=1)
+        # cell B from the faces; the total energy keeps the conserved (averaged) value
+        ct.cells_from_faces(s.U, s.Bf, (slice(ng, ng + nx), slice(ng, ng + ny)))
+        s.apply_bc(s.U)
+        s._ghost_faces(s.Bf, s.U)
+
+    def _fine_fine(self):
+        """patches that touch: the lower-index one owns the shared faces and corners. The other one's cells next
+        to the shared faces are refluxed with the owner's fluxes (and both tracer terms), and its faces get the
+        owner's corner EMFs, so the two agree on the shared edge and both stay conservative and divergence-free.
+        Patches touching at a single corner share only that corner's EMF."""
+        r, ng = self.p.ratio, self.coarse.ng
+        bx = self.boxes
+        for a in range(len(bx)):
+            for b in range(a + 1, len(bx)):
+                A, B = bx[a], bx[b]
+                fA, fB = self.patches[a], self.patches[b]
+                RA, RB = fA._rec[0], fB._rec[0]
+                dE = None
+                # (owner side, other side, other's cell index along the normal, sign, h, axis of the edge)
+                for sa, sb, ax in ((1, 0, 0), (0, 1, 0), (3, 2, 1), (2, 3, 1)):
+                    line_a = (A[1] if sa == 1 else A[0]) if ax == 0 else (A[3] if sa == 3 else A[2])
+                    line_b = (B[0] if sb == 0 else B[1]) if ax == 0 else (B[2] if sb == 2 else B[3])
+                    if line_a != line_b:
+                        continue
+                    lo_a, lo_b = (A[2], B[2]) if ax == 0 else (A[0], B[0])
+                    o0 = max(A[2], B[2]) if ax == 0 else max(A[0], B[0])
+                    o1 = min(A[3], B[3]) if ax == 0 else min(A[1], B[1])
+                    if o0 > o1:
+                        continue
+                    fa0, fb0, nf = r * (o0 - lo_a), r * (o0 - lo_b), r * (o1 - o0)
+                    nxB, nyB = fB.cfg.nx, fB.cfg.ny
+                    if nf > 0:                       # shared faces: reflux B's adjacent cells
+                        dF = RA["F"][sa][:, fa0:fa0 + nf] - RB["F"][sb][:, fb0:fb0 + nf]
+                        du = RA["u"][sa][fa0:fa0 + nf] - RB["u"][sb][fb0:fb0 + nf]
+                        dua = RA["ua"][sa][fa0:fa0 + nf] - RB["ua"][sb][fb0:fb0 + nf]
+                        dF[RHOC] = 0.0
+                        dF[BX:BZ] = 0.0
+                        h = fB.cfg.dx if ax == 0 else fB.cfg.dy
+                        sign = +1 if sb in (0, 2) else -1        # B's low side: the face is its cells' low face
+                        if ax == 0:
+                            ci = ng if sb == 0 else ng + nxB - 1
+                            cj = slice(ng + fb0, ng + fb0 + nf)
+                        else:
+                            ci = slice(ng + fb0, ng + fb0 + nf)
+                            cj = ng if sb == 2 else ng + nyB - 1
+                        a_c = cons_to_prim(fB.U, fB.eos)[iCLR][ci, cj]
+                        fB.U[:, ci, cj] += sign * dF / h
+                        fB.U[RHOC, ci, cj] += sign * (dua - a_c * du) / h
+                    # shared corners: B's faces get the owner's EMFs
+                    if dE is None:
+                        dE = xp.zeros((nxB + 1, nyB + 1))
+                    eA = RA["E"][sa][fa0:fa0 + nf + 1]
+                    eB = RB["E"][sb][fb0:fb0 + nf + 1]
+                    if ax == 0:
+                        dE[0 if sb == 0 else nxB, fb0:fb0 + nf + 1] = eA - eB
+                    else:
+                        dE[fb0:fb0 + nf + 1, 0 if sb == 2 else nyB] = eA - eB
+                if dE is not None:
+                    nxB, nyB = fB.cfg.nx, fB.cfg.ny
+                    fB.Bf[0][ng:ng + nxB + 1, ng:ng + nyB] += -(dE[:, 1:] - dE[:, :-1]) / fB.cfg.dy
+                    fB.Bf[1][ng:ng + nxB, ng:ng + nyB + 1] += (dE[1:, :] - dE[:-1, :]) / fB.cfg.dx
+                    ct.cells_from_faces(fB.U, fB.Bf, (slice(ng, ng + nxB), slice(ng, ng + nyB)))
+
+    # -- diagnostics
+    def totals(self):
+        """mass, momentum, total energy on the (synchronised) coarse level, and the boundary energy inflow"""
+        s, ng = self.coarse, self.coarse.ng
+        I = (slice(ng, -ng), slice(ng, -ng))
+        dV = s.cfg.dx * s.cfg.dy
+        return {k: float(xp.sum(s.U[(v,) + I])) * dV for k, v in (("mass", RHO), ("mx", MX), ("my", MY), ("E", EN))} | \
+            {"boundary": s._cumulative_boundary_energy}
+
+    def div_b(self):
+        return max([self.coarse.div_b_max()] + [f.div_b_max() for f in self.patches])
+
+    def fine_fraction(self):
+        """fine cells / cells of a uniform grid at the fine resolution"""
+        r = self.p.ratio
+        return sum(f.cfg.nx * f.cfg.ny for f in self.patches) / (r * r * self.cfg.nx * self.cfg.ny)
+
+    def composite(self, var=iRHO):
+        """primitive variable on a uniform grid at the fine resolution: patches where they exist, the coarse
+        level repeated elsewhere (host array)"""
+        s, r, ng = self.coarse, self.p.ratio, self.coarse.ng
+        Wc = to_numpy(cons_to_prim(s.U, s.eos)[var, ng:-ng, ng:-ng])
+        out = np.repeat(np.repeat(Wc, r, axis=0), r, axis=1)
+        for (i0, i1, j0, j1), f in zip(self.boxes, self.patches):
+            out[r * i0:r * i1, r * j0:r * j1] = to_numpy(cons_to_prim(f.U, f.eos)[var, ng:-ng, ng:-ng])
+        return out

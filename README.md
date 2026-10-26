@@ -26,6 +26,8 @@ sieve/            solver package
   parallel.py     MPI slab domain decomposition of the 2D and 3D solvers (halo and CT edge exchange)
   io3d.py         3D snapshots: VTK ImageData (.vti/.pvd) and HDF5
   tabular.py      tabulated EOS / opacities (SESAME ASCII, .npz) with GPU inversion and analytic fallback
+  validation.py   shot data vs simulation: chi^2, RMS, peak offset, timing shifts, calibration, report plot
+  amr.py          block-structured adaptive mesh refinement (2D, CT, refluxing, touching patches)
 main.py           CLI: verification tests, single cases, legacy campaign
 examples/         MTIF liner flux compression; synthetic magnetic probes (SI units); 3D target asymmetries;
                   MagLIF-style r-z implosion; metal-liner flux compression generator (FCG)
@@ -209,6 +211,61 @@ cells; mixed cells keep the tangent stiffened gas of the volume-fraction closure
 tabulated kappa_R and kappa_P). No SESAME data ship with the code (LANL distributes them under licence):
 `tabular.mie_gruneisen_table` and `tabular.ideal_gas_table` write synthetic tables, which is how this is tested.
 
+### Shot calibration against diagnostics
+
+`sieve/validation.py` compares simulated observables with measured traces (VISAR free-surface velocity, B-dot
+probe voltage, radiography radii; CSV with time, value, sigma): RMS error, reduced chi^2, and the peak alignment
+offset (the delay maximising the cross-correlation of simulation and data). Timing shifts can be fitted as
+nuisance parameters with a Gaussian prior from the fiducial uncertainty, and simulated signals pass through the
+instruments' response (10 ns FWHM by default). A scan of one model parameter gives the calibrated value: a coarse
+scan, a golden-section search inside its best bracket (chi^2 is sharply peaked and not quadratic far from the
+minimum), and a least-squares parabola over the whole chi^2 valley, with sigma from Delta chi^2 = 1 inflated by
+sqrt(chi^2_min / dof) when the fit is worse than the errors. For a pulsed-power liner the observables come from an
+FCG run with the RLC drive: VISAR is the velocity of the liner's outer surface, a B-dot probe in the return gap
+sees B_theta = mu0 I / (2 pi r_p) and so measures dI/dt, radiography is the cavity radius.
+
+`examples/experimental_shot_fitting.py` runs the whole chain. Without data files it first makes a synthetic shot
+(clearly labelled as such in every output): an FCG run at a hidden series inductance of 16.2 nH sampled like the
+instruments, with Gaussian noise and timing offsets drawn from a 5 ns fiducial uncertainty. Scanning 12-22 nH
+(5 points, then golden section: 23 runs plus the hidden one) it recovers 16.24 +- 0.03 nH, within 1.1 sigma of the hidden value, with
+chi^2_nu 0.81 (VISAR), 0.90 (B-dot) and 2.6 (six radiography frames), 0.89 overall. With real traces:
+`--visar v.csv --bdot b.csv --radiography r.csv --param inductance_nh --range 10 25`. Two lessons from building it:
+implosion timing makes chi^2 so steep in the circuit inductance (about 0.1 us per nH) that a free timing shift per
+diagnostic is nearly degenerate with it, so the shifts need a fiducial prior; and an observable taken from the
+tracer-based radius rings at the cell-crossing frequency differently in every run, so VISAR must be the material
+velocity at the surface.
+
+![Shot calibration](results/shot_fitting/shot_calibration_fit.png)
+
+### Adaptive mesh refinement
+
+`sieve/amr.py` is a two-level, block-structured AMR for the 2D Cartesian solver (Berger-Colella style):
+ratio-r patches (each an `MHDSolver` on a sub-rectangle) take r sub-steps per coarse step, all patches
+advancing stage by stage together. Ghost cells and faces come from touching patches (same stage) or from the
+coarse level (limited linear in space, linear in time). At each synchronisation the coarse cells next to a
+patch are refluxed with the fine fluxes, coarse faces next to a patch get the fine edge EMFs, coarse cells and
+faces under a patch become fine averages, and on an edge shared by two patches the lower-index one owns the
+faces and corners. Mass, momentum and energy are then conserved exactly and the face divergence stays at
+round-off on both levels. The volume fraction is refluxed with both of its terms and prolongation uses one
+limiter per cell for all variables, so a material interface at uniform pressure and velocity crosses
+coarse-fine boundaries undisturbed (to 1e-13). Patches are regridded from |grad rho| dx / rho, pressure jumps,
+interface curvature and field-line curvature flags (optionally inside a region mask), clustered into
+rectangles that are split where poorly filled; new patches take the old fine data where they overlap old
+ones, and their face fields come from one composite vector potential, so they are divergence-free and agree
+on shared edges by construction. Scope: ideal MHD with the two-material EOS and constrained transport; the
+resistive, strength, transport and radiation terms are not coupled across levels yet (they raise).
+
+`examples/amr_implosion_demo.py` implodes the 2D magnetized liner (1% mode-6 ripple, 1 mm per code unit) to
+t = 0.2 three ways: uniform 128^2 (15.6 um cells), uniform 512^2 (3.9 um) and AMR 128^2 + ratio-4 patches.
+The AMR run resolves the instability fingers and spikes that the coarse run washes out (density error against
+the 512^2 run 0.40 vs 0.62 for the coarse run; core radius 0.326 between coarse 0.272 and fine 0.365), using
+44% of the fine cells on average with up to about 20 patches, energy to 7e-14 and div B at round-off. It is not
+faster here: 3270 s against 635 s for the uniform 512^2 run, because the patches step stage by stage from
+Python and on a Quadro P1000 that launch overhead outweighs the saved cells. On this hardware AMR buys
+resolution a uniform grid cannot hold in memory, not speed.
+
+![AMR implosion](results/amr_implosion/amr_implosion.png)
+
 ### Multi-GPU domain decomposition
 
 `sieve.parallel.distributed(MHDSolver3D, cfg)` (or `MHDSolver`) run under `mpiexec` splits the grid into x
@@ -234,6 +291,8 @@ temperature contours and field lines, one PNG per frame and an MP4. `examples/mt
 mpiexec -n 4 python scripts/mpi_check.py                       # decomposition check
 python examples/mtif_3d_asymmetry.py --tilts 2 --modes --vtk-case "tilt 2 deg"
 python scripts/render_3d.py results/mtif_3d_asymmetry/vtk_tilt_2_deg
+python examples/experimental_shot_fitting.py                   # synthetic shot -> calibration report
+python examples/amr_implosion_demo.py                          # uniform coarse / fine vs AMR
 ```
 
 ## Performance
@@ -279,6 +338,8 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | fld | equilibration vs the exact ODE (0.7%, energy 5e-15); optically thick Gaussian spreading as 2 D t per direction in 2D, r-z and 3D (0.02%); optically thin front at 0.99 c t; advection with the flow, gas + radiation energy to round-off |
 | render3d | 3D snapshots to .vti/.pvd and .h5 and back exactly; off-screen PyVista renders and an MP4 (skipped without pyvista) |
 | tabular | SESAME ASCII 301/502/505 write and read back (1e-15); an ideal-gas table reproduces the ideal-gas Sod tube to 1e-13; a Mie-Gruneisen Al table reproduces the analytic 2 km/s impact (shocked p 17.998 vs 17.998 GPa, fields to 2e-4) and p(e) stays continuous into the fallback; FLD with tabulated opacities matches the power laws to 2e-11 |
+| validation | analytic signals with known noise: chi^2_nu of the true model 1.001, RMS 1.000 sigma; a 37 ns delay recovered by the cross-correlation offset and the fitted shift to 0.5 ns; a 1-parameter scan recovers the amplitude with the Fisher sigma; CSV round trip |
+| amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
 
 ## Reproducing the study
 
