@@ -58,8 +58,15 @@ class Material:
         return f"Mie-Gruneisen rho0={self.rho0:g} c0={self.c0:g} s={self.s:g} Gamma0={self.gamma0:g}"
 
 
+def _dev(eos, mode, rho, y, a):
+    """the same quantity from the device EOS (eos_fused.cu) in one kernel launch, or None"""
+    from .eos_fused import evaluate
+    return evaluate(eos, mode, rho, y, a)
+
+
 class EOS:
-    """Two-material EOS. Arguments a are the tracer (liner fraction) on the same grid as rho."""
+    """Two-material EOS. Arguments a are the tracer (liner fraction) on the same grid as rho. On device
+    arrays the methods below run as one fused kernel each (eos_fused.cu) with the same arithmetic."""
 
     def __init__(self, fuel, liner, volume_fraction=True):
         self.fuel, self.liner = fuel, liner
@@ -88,23 +95,38 @@ class EOS:
         return ((1 - a) * f1 + a * l1, (1 - a) * f2 + a * l2, (1 - a) * fd1 + w * md1, (1 - a) * fd2 + w * md2)
 
     def eps(self, rho, p, a):
+        r = _dev(self, "eps", rho, p, a)
+        if r is not None:
+            return r
         p1, p2, _, _ = self.coeffs(rho, a)
         return p1 * p + p2
 
     def pressure(self, rho, eps, a):
+        r = _dev(self, "pressure", rho, eps, a)
+        if r is not None:
+            return r
         p1, p2, _, _ = self.coeffs(rho, a)
         return (eps - p2) / p1
 
     def c2(self, rho, p, a):
+        r = _dev(self, "c2", rho, p, a)
+        if r is not None:
+            return r
         p1, p2, d1, d2 = self.coeffs(rho, a)
         return ((p1 * p + p2 + p) / rho - d2 - p * d1) / p1
 
     def p_min(self, rho, a):
         """pressure at which c^2 = 0 (cavitation): -p_inf for a stiffened gas, 0 for an ideal gas"""
+        r = _dev(self, "p_min", rho, None, a)
+        if r is not None:
+            return r
         p1, p2, d1, d2 = self.coeffs(rho, a)
         return -(p2 - rho * d2) / (1 + p1 - rho * d1)
 
     def p_floor(self, rho, a):
+        r = _dev(self, "p_floor", rho, None, a)
+        if r is not None:
+            return r
         pm = self.p_min(rho, a)
         from .physics import xp
         return pm + FLOOR_PR + 1e-12 * xp.abs(pm)
@@ -126,6 +148,8 @@ def make_eos(cfg):
         from . import tabular
         data = tabular.load(cfg.eos_table, cfg.eos_table_material or None)
         eos = tabular.TabularEOS(eos, tabular.TabularMaterial(data, cfg.tab_rho_unit, cfg.tab_v_unit, liner))
+    from .eos_fused import device
+    device(eos)                                      # pack the device EOS now, not inside a CUDA-graph capture
     return eos
 
 

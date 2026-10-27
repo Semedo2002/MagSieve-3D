@@ -1715,6 +1715,35 @@ def tabular_test():
           f"{d:.1e}; p(e) across the table edge: largest step {jump:.1e} of the range (4000 samples)  "
           f"[{'PASS' if good else 'FAIL'}]")
 
+    # (3b) device EOS (eos_fused.cu, used inline by the conversions and the HLLD kernel) vs the array EOS:
+    # random states over pure liner, the 0.98-1 blend band, mixed cells, off-table states; then the impact again
+    rng = np.random.default_rng(1)
+    m4 = 40000
+    a_ = xp.asarray(np.concatenate([np.ones(m4), rng.uniform(0.97, 1.0, m4), rng.uniform(0, 1, m4), np.zeros(m4)]))
+    r_ = xp.asarray(rng.uniform(1.0, 6.0, 4 * m4)) * xp.maximum(a_, 0.01)
+    p_ = xp.asarray(10**rng.uniform(-4, 2.5, 4 * m4))
+    eos = s.eos
+    dv = [eos.eps(r_, p_, a_), eos.c2(r_, p_, a_), eos.p_floor(r_, a_)]
+    dv.append(eos.pressure(r_, dv[0], a_))
+    eos._device_eos = None
+    rf = [eos.eps(r_, p_, a_), eos.c2(r_, p_, a_), eos.p_floor(r_, a_)]
+    rf.append(eos.pressure(r_, rf[0], a_))
+    dpar = max(float(xp.max(xp.abs(u - v) / (xp.abs(v) + 1e-12 * float(xp.max(xp.abs(v)))))) for u, v in zip(dv, rf))
+    with contextlib.redirect_stdout(io.StringIO()):
+        s2 = MHDSolver(cfg)
+    s2.eos._device_eos = None                        # the same impact with the array EOS
+    W = xp.zeros((NVAR,) + s2.U.shape[1:])
+    W[iRHO], W[iPR], W[iCLR] = 2.7, 1e-4, 1.0
+    W[iVX] = xp.where(s2.X < 0.5, 2.0, 0.0)
+    s2.U = prim_to_cons(W, s2.eos); s2.t = 0.0; s2.step = 0
+    _march(s2, 0.06)
+    Wr = to_numpy(cons_to_prim(s2.U, s2.eos)[:, s2.ng:-s2.ng, s2.ng])
+    drun = max(float(np.max(np.abs(Wt[k] - Wr[k]))) / float(np.max(np.abs(Wr[k]))) for k in (iRHO, iPR, iVX))
+    good = dpar < 1e-9 and drun < 1e-9
+    ok = ok and good
+    print(f"  device EOS (fused kernels) vs array EOS: 160k random states {dpar:.1e}, impact run {drun:.1e}  "
+          f"[{'PASS' if good else 'FAIL'}]")
+
     # (4) opacity table vs the same power laws in FLD (code = SI; kappa = k0 rho theta^-1.5)
     op = os.path.join(tmp, "kap.npz")
     rho_k, T_k = np.geomspace(0.1, 10, 30), np.geomspace(0.1, 10, 30)

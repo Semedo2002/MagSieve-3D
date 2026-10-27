@@ -303,7 +303,10 @@ class TabularEOS:
     """two-material EOS (same interface as eos.EOS) whose liner is a TabularMaterial in pure liner cells; mixed
     cells use the mixture of the fuel and the fallback's tangent stiffened gas, blended in over a = 0.98 ... 1"""
 
-    no_graph = True                                  # eps() branches on the host: no CUDA-graph capture
+    @property
+    def no_graph(self):                              # the array eps() branches on the host: no CUDA-graph
+        from .eos_fused import device                # capture unless the device EOS (eos_fused.cu) covers it
+        return device(self) is None
 
     def __init__(self, base, liner_table):
         self.base, self.tab = base, liner_table
@@ -322,12 +325,20 @@ class TabularEOS:
         return self._mix.coeffs(rho, a)
 
     def pressure(self, rho, eps, a):
+        from .eos import _dev
+        r = _dev(self, "pressure", rho, eps, a)
+        if r is not None:
+            return r
         w = self._w(a)
         p_mix = self._mix.pressure(rho, eps, a)
         p_tab = self.tab.pressure(rho, eps / xp.maximum(rho, 1e-300))
         return (1 - w) * p_mix + w * p_tab
 
     def eps(self, rho, p, a):
+        from .eos import _dev
+        r = _dev(self, "eps", rho, p, a)
+        if r is not None:
+            return r
         w = self._w(a)
         e_mix = self._mix.eps(rho, p, a)
         e_tab = rho * self.tab.energy(rho, p)
@@ -349,6 +360,10 @@ class TabularEOS:
         return e
 
     def c2(self, rho, p, a):
+        from .eos import _dev
+        r = _dev(self, "c2", rho, p, a)
+        if r is not None:
+            return r
         w = self._w(a)
         return (1 - w) * self._mix.c2(rho, p, a) + w * self.tab.c2(rho, p)
 

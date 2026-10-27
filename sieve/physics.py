@@ -72,11 +72,10 @@ from .config import (
 # CUDA Raw Kernels
 # ============================================================
 
-# CUDA source is compiled by CuPy at module import time.
-_kernel_path = Path(__file__).with_name("hlld_kernel.cu")
-_kernel_source = _kernel_path.read_text(encoding="utf-8-sig")
-_hlld_module = cp.RawModule(code=_kernel_source)
-_hlld_kernel = _hlld_module.get_function("hlld_flux_x_kernel")
+# CUDA source is compiled by CuPy at module import time: the HLLD kernel together with the device EOS
+# (eos_fused.cu), which it calls inline for the multi-material and tabulated equations of state.
+from . import eos_fused as _ef
+_hlld_kernel = _ef.hlld_kernel
 
 
 # ============================================================
@@ -103,6 +102,10 @@ def cons_to_prim(U, gamma):
     with a volume-fraction tracer U[RHOC] holds the fraction itself, not rho times it."""
     if _FUSED and _ideal(gamma):
         return _fz.cons_to_prim_ideal(U, gamma)
+    if not _ideal(gamma):
+        W = _ef.cons_to_prim(U, gamma)
+        if W is not None:
+            return W
     W = xp.empty_like(U)
     rho = xp.maximum(U[RHO], FLOOR_RHO)
     ri = 1.0 / rho
@@ -130,6 +133,10 @@ def prim_to_cons(W, gamma):
     """Primitive to conservative -- fully on GPU."""
     if _FUSED and _ideal(gamma):
         return _fz.prim_to_cons_ideal(W, gamma)
+    if not _ideal(gamma):
+        U = _ef.prim_to_cons(W, gamma)
+        if U is not None:
+            return U
     U = xp.empty_like(W)
     rho = xp.maximum(W[iRHO], FLOOR_RHO)
     U[RHO] = rho
@@ -414,6 +421,8 @@ def sound_speed2(W, gamma):
 
 
 def _floor_faces(WL, WR, eos):
+    if not _ideal(eos) and _ef.floor_faces(WL, eos) and _ef.floor_faces(WR, eos):
+        return
     for Wf in (WL, WR):
         Wf[iRHO] = xp.maximum(Wf[iRHO], FLOOR_RHO)
         if _ideal(eos):
@@ -472,11 +481,16 @@ def hlld_flux_x(WL, WR, gamma, ch, axn=0):
 
     block = 256
     grid = (n_faces + block - 1) // block
+    if _NO_EOS is None:
+        _NO_EOS = xp.zeros(1, dtype=xp.float64)
+    eP = eT = _NO_EOS
+    dev = None if _ideal(gamma) else _ef.device(gamma)
     if _ideal(gamma):
-        if _NO_EOS is None or _NO_EOS.size < 1:
-            _NO_EOS = xp.zeros(1, dtype=xp.float64)
         eL = eR = c2L = c2R = _NO_EOS
         use_eos, g0 = 0, gamma
+    elif dev is not None:                    # the kernel evaluates the EOS at each face state itself
+        eL = eR = c2L = c2R = _NO_EOS
+        (eP, eT), use_eos, g0 = dev, 2, 0.0
     else:
         eL, eR = (xp.ascontiguousarray(gamma.eps(Wf[iRHO], Wf[iPR], Wf[iCLR])) for Wf in (WL, WR))
         c2L, c2R = (xp.ascontiguousarray(xp.maximum(gamma.c2(Wf[iRHO], Wf[iPR], Wf[iCLR]), 0.0)) for Wf in (WL, WR))
@@ -487,7 +501,7 @@ def hlld_flux_x(WL, WR, gamma, ch, axn=0):
         (WL, WR, F, smax_arr,
          np.int32(n_faces), np.float64(g0), np.float64(ch),
          np.float64(FLOOR_RHO), np.float64(FLOOR_PR),
-         eL, eR, c2L, c2R, np.int32(use_eos), np.int32(axn))
+         eL, eR, c2L, c2R, np.int32(use_eos), np.int32(axn), eP, eT)
     )
 
     return F, smax_arr                       # per-face max signal speed, left on the device (no sync)

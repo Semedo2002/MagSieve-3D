@@ -26,6 +26,8 @@ sieve/            solver package
   parallel.py     MPI slab domain decomposition of the 2D and 3D solvers (halo and CT edge exchange)
   io3d.py         3D snapshots: VTK ImageData (.vti/.pvd) and HDF5
   tabular.py      tabulated EOS / opacities (SESAME ASCII, .npz) with GPU inversion and analytic fallback
+  eos_fused.cu    device two-material / tabulated EOS, called inline by the HLLD kernel and the conversions
+  eos_fused.py    its host side: packing, launches
   validation.py   shot data vs simulation: chi^2, RMS, peak offset, timing shifts, calibration, report plot
   amr.py          block-structured adaptive mesh refinement (2D, CT, refluxing, touching patches)
 main.py           CLI: verification tests, single cases, legacy campaign
@@ -200,9 +202,9 @@ a single gas temperature (not with `two_temp`).
 `sieve/tabular.py` reads SESAME ASCII files (EOS table 301; opacity tables 502 Rosseland and 505 Planck, taken
 as log10 kappa in cm^2/g against log10 rho in g/cc and log10 T in eV, so check your library's convention) or an
 SI `.npz` table (rho, T, p, e, optional cs, kappa_R, kappa_P). Tables are resampled onto a uniform log rho x log
-T grid; positive quantities are interpolated in log space, so power laws are reproduced exactly. One CUDA
-elementwise kernel inverts e(rho, T) or p(rho, T) along T at fixed rho (binary search) and interpolates
-bilinearly; c^2 comes from the table or from its thermodynamic derivatives. Beyond the table the values are
+T grid; positive quantities are interpolated in log space, so power laws are reproduced exactly. The lookup
+inverts e(rho, T) or p(rho, T) along T at fixed rho (binary search) and interpolates bilinearly; c^2 comes from
+the table or from its thermodynamic derivatives. Beyond the table the values are
 extrapolated from the edge interval and blended into the analytic liner law (Mie-Gruneisen or stiffened gas)
 over two grid cells, so p(e) stays continuous. In the two-material solver the table is the liner in pure liner
 cells; mixed cells keep the tangent stiffened gas of the volume-fraction closure (blended over a liner fraction of
@@ -210,6 +212,20 @@ cells; mixed cells keep the tangent stiffened gas of the volume-fraction closure
 `--eos-table-material` for a SESAME file with several materials) and `--opacity-table` (which turns on FLD with
 tabulated kappa_R and kappa_P). No SESAME data ship with the code (LANL distributes them under licence):
 `tabular.mie_gruneisen_table` and `tabular.ideal_gas_table` write synthetic tables, which is how this is tested.
+
+The two-material EOS, analytic or tabulated, runs as device functions (`sieve/eos_fused.cu`): the conversions,
+the face floors and the HLLD kernel evaluate p(rho, eps), eps(rho, p) and c^2 per cell or face inline (table
+search, bilinear interpolation, fallback blend and the blend-band secant all in the thread), and every
+`EOS` / `TabularEOS` method on device arrays is one launch. They reproduce the array implementation to
+round-off (1e-14 over a run; `SIEVE_ARRAY_EOS=1` switches back to it). `scripts/bench_tabular.py`, a 2D Al
+impact on a Quadro P1000:
+
+| grid | analytic MG, array EOS | table, array EOS | analytic MG, device EOS | table, device EOS | table / analytic |
+|---|---|---|---|---|---|
+| 64^2 | 70.7 ms/step | 873 ms/step (12x) | 15.7 ms/step | 15.4 ms/step | 0.98 |
+| 256^2 | 286 ms/step | 759 ms/step (2.7x) | 70.7 ms/step | 68.8 ms/step | 0.97 |
+
+Interpolation is bilinear (bicubic is not implemented).
 
 ### Shot calibration against diagnostics
 
@@ -337,7 +353,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | mpi | 2 and 3 MPI ranks vs one domain: 2D Orszag-Tang with resistivity, Al with strength and spall, 3D field box, to 1e-15..2e-14 with identical total energy and div B at round-off (skipped without mpi4py/mpiexec) |
 | fld | equilibration vs the exact ODE (0.7%, energy 5e-15); optically thick Gaussian spreading as 2 D t per direction in 2D, r-z and 3D (0.02%); optically thin front at 0.99 c t; advection with the flow, gas + radiation energy to round-off |
 | render3d | 3D snapshots to .vti/.pvd and .h5 and back exactly; off-screen PyVista renders and an MP4 (skipped without pyvista) |
-| tabular | SESAME ASCII 301/502/505 write and read back (1e-15); an ideal-gas table reproduces the ideal-gas Sod tube to 1e-13; a Mie-Gruneisen Al table reproduces the analytic 2 km/s impact (shocked p 17.998 vs 17.998 GPa, fields to 2e-4) and p(e) stays continuous into the fallback; FLD with tabulated opacities matches the power laws to 2e-11 |
+| tabular | SESAME ASCII 301/502/505 write and read back (1e-15); an ideal-gas table reproduces the ideal-gas Sod tube to 1e-13; a Mie-Gruneisen Al table reproduces the analytic 2 km/s impact (shocked p 17.998 vs 17.998 GPa, fields to 2e-4) and p(e) stays continuous into the fallback; the device EOS matches the array EOS on 160k random states (blend band, mixed, off-table) to 3e-10 and over the impact run to 1e-14; FLD with tabulated opacities matches the power laws to 2e-11 |
 | validation | analytic signals with known noise: chi^2_nu of the true model 1.001, RMS 1.000 sigma; a 37 ns delay recovered by the cross-correlation offset and the fitted shift to 0.5 ns; a 1-parameter scan recovers the amplitude with the Fisher sigma; CSV round trip |
 | amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
 
