@@ -268,8 +268,22 @@ coarse-fine boundaries undisturbed (to 1e-13). Patches are regridded from |grad 
 interface curvature and field-line curvature flags (optionally inside a region mask), clustered into
 rectangles that are split where poorly filled; new patches take the old fine data where they overlap old
 ones, and their face fields come from one composite vector potential, so they are divergence-free and agree
-on shared edges by construction. Scope: ideal MHD with the two-material EOS and constrained transport; the
-resistive, strength, transport and radiation terms are not coupled across levels yet (they raise).
+on shared edges by construction.
+
+Non-ideal terms are coupled across the levels with the same flux registers:
+- resistive MHD: the eta J part of the corner EMF is in the EMF correction, and the resistive Poynting flux
+  and the B_z diffusion flux are refluxed;
+- liner strength: the 2D deviatoric stress (S_xx, S_yy, S_xy and damage) is prolonged, restricted and
+  time-interpolated into patch ghosts, and the stress fluxes of momentum and energy are refluxed;
+- Braginskii conduction (RKL2) and grey FLD (backward Euler) are split steps: on a patch they conduct to ghost
+  cells from the coarse level at the end of the sub-step, and return their time-integrated face fluxes. The
+  RKL2 fluxes go through the same linear recursion as the energy, so the energy change is exactly their
+  divergence. These are refluxed into the coarse energy, or into the coarse E_r, which is prolonged and
+  restricted like U.
+
+With patches that touch and move, mass, momentum and gas + radiation energy stay conserved to round-off. With
+these registers switched off the error is 1e-7 to 3e-4. Viscosity, Nernst, two-temperature and optically thin
+radiation are not coupled across levels yet (they raise).
 
 `examples/amr_implosion_demo.py` implodes the 2D magnetized liner (1% mode-6 ripple, 1 mm per code unit) to
 t = 0.2 three ways: uniform 128^2 (15.6 um cells), uniform 512^2 (3.9 um) and AMR 128^2 + ratio-4 patches.
@@ -356,6 +370,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | tabular | SESAME ASCII 301/502/505 write and read back (1e-15); an ideal-gas table reproduces the ideal-gas Sod tube to 1e-13; a Mie-Gruneisen Al table reproduces the analytic 2 km/s impact (shocked p 17.998 vs 17.998 GPa, fields to 2e-4) and p(e) stays continuous into the fallback; the device EOS matches the array EOS on 160k random states (blend band, mixed, off-table) to 3e-10 and over the impact run to 1e-14; FLD with tabulated opacities matches the power laws to 2e-11 |
 | validation | analytic signals with known noise: chi^2_nu of the true model 1.001, RMS 1.000 sigma; a 37 ns delay recovered by the cross-correlation offset and the fitted shift to 0.5 ns; a 1-parameter scan recovers the amplitude with the Fisher sigma; CSV round trip |
 | amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
+| amr_physics | resistive, conduction, FLD and strength each with three touching patches moving every 4 steps: conservation 5e-16 to 8e-16 (1e-7 to 3e-4 with the new registers off), div B at round-off; a feature inside one patch matches a uniform fine run to 1e-3 to 1e-4 of the coarse run's L1 error |
 
 ## Reproducing the study
 

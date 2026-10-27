@@ -252,7 +252,7 @@ def _pad1(f, periodic):
 
 
 def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=2.5, radial=None, wall_T=None,
-                   perp="braginskii"):
+                   perp="braginskii", ghost=None, return_flux=False):
     """-div q for magnetized (Braginskii-type) conduction on interior cells, 2D or 3D:
         q = -[k_perp I + (k_par - k_perp) b b] . grad(theta),  k_par = kappa0 theta^T_exp,
         k_perp = k_par / (1 + x^2),  x = omega_ce tau_e = x0 |B| theta^1.5 / rho.
@@ -264,10 +264,19 @@ def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=
     radial = (r_faces, r_cells) along axis 0 for cylindrical geometry: div q = (1/r) d(r q_r)/dr + ...
     wall_T: if given, a face between fuel and liner conducts from the fuel cell to a wall at temperature wall_T
     on the face (half a cell away, i.e. a Dirichlet condition with the fuel's anisotropic k); the heat goes into
-    the liner cell, so energy stays conserved. Otherwise such faces are insulating."""
+    the liner cell, so energy stays conserved. Otherwise such faces are insulating.
+    ghost = (theta, rho, a, (Bx, By, Bz)) arrays padded by one cell: the outer ring is used as neighbour data and
+    the domain faces conduct (an AMR patch, ghost data from the coarse level). return_flux: also return the face
+    fluxes q (toward +ax, per axis; times r on radial faces)."""
     nd = theta.ndim
-    tp, rp, ap = (_pad1(f, periodic) for f in (theta, rho, a))
-    Bp = [_pad1(f, periodic) for f in B]
+    if ghost is None:
+        tp, rp, ap = (_pad1(f, periodic) for f in (theta, rho, a))
+        Bp = [_pad1(f, periodic) for f in B]
+    else:
+        tp = ghost[0].copy()
+        tp[(slice(1, -1),) * nd] = theta
+        rp, ap, Bp = ghost[1], ghost[2], ghost[3]
+    qs = []
     div = xp.zeros_like(theta)
     core = slice(1, -1)
     for ax in range(nd):
@@ -313,7 +322,7 @@ def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=
             q = xp.where(fuelL & fuelR, q, xp.where(fuelL ^ fuelR, qw, 0.0))
         else:
             q = xp.where(fuelL & fuelR, q, 0.0)
-        if not periodic[ax]:
+        if not periodic[ax] and ghost is None:
             n = q.shape[ax]
             q[_along(nd, ax, 0)] = 0.0
             q[_along(nd, ax, n - 1)] = 0.0
@@ -321,15 +330,19 @@ def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=
             q = q * radial[0].reshape((-1,) + (1,) * (nd - 1))
             div -= ((q[_along(nd, ax, slice(1, None))] - q[_along(nd, ax, slice(0, -1))])
                     / (h[ax] * radial[1].reshape((-1,) + (1,) * (nd - 1))))
+            qs.append(q)
             continue
         div -= (q[_along(nd, ax, slice(1, None))] - q[_along(nd, ax, slice(0, -1))]) / h[ax]
-    return div
+        qs.append(q)
+    return (div, qs) if return_flux else div
 
 
 def rkl2(y0, L, dt, dt_expl, s_max=60):
     """Second-order Runge-Kutta-Legendre super-time-step (Meyer, Balsara & Aslam 2014) of dy/dt = L(y) over
     dt, given the forward-Euler stable step dt_expl. Stable for dt <= dt_expl (s^2 + s - 2)/4 with s stages;
-    longer steps are split into sub-steps of at most s_max stages. Returns (y, total stages)."""
+    longer steps are split into sub-steps of at most s_max stages. Returns (y, total stages).
+    If L returns (L(y), fluxes) with L(y) = -div(fluxes), the fluxes go through the same linear recursion, so
+    y_end = y0 - div(Q) exactly with Q the time-integrated face flux; then returns (y, stages, Q)."""
     ratio = dt / dt_expl
     stages = lambda r: max(2, int(np.ceil(0.5 * (np.sqrt(9.0 + 16.0 * r) - 1.0))))
     s, nsub = stages(ratio), 1
@@ -340,24 +353,39 @@ def rkl2(y0, L, dt, dt_expl, s_max=60):
     b = [1.0 / 3.0] * 3 + [(j * j + j - 2.0) / (2.0 * j * (j + 1.0)) for j in range(3, s + 1)]
     w1 = 4.0 / (s * s + s - 2.0)
     y = y0
+    Q = None
     for _ in range(nsub):
         L0 = L(y)
+        track = isinstance(L0, tuple)
+        if track:
+            L0, q0 = L0
+            Qm2, Qm1 = [0.0 * q for q in q0], [b[1] * w1 * h * q for q in q0]
         ym2, ym1 = y, y + b[1] * w1 * h * L0
         for j in range(2, s + 1):
             mu = (2.0 * j - 1.0) / j * b[j] / b[j - 1]
             nu = -(j - 1.0) / j * b[j] / b[j - 2]
             mut = mu * w1
             gt = -(1.0 - b[j - 1]) * mut
-            yj = mu * ym1 + nu * ym2 + (1.0 - mu - nu) * y + mut * h * L(ym1) + gt * h * L0
+            Lj = L(ym1)
+            if track:
+                Lj, qj = Lj
+                Qj = [mu * a1 + nu * a2 + mut * h * c1 + gt * h * c0 for a1, a2, c1, c0 in zip(Qm1, Qm2, qj, q0)]
+                Qm2, Qm1 = Qm1, Qj
+            yj = mu * ym1 + nu * ym2 + (1.0 - mu - nu) * y + mut * h * Lj + gt * h * L0
             ym2, ym1 = ym1, yj
         y = ym1
-    return y, s * nsub
+        if track:
+            Q = Qm1 if Q is None else [a + c for a, c in zip(Q, Qm1)]
+    return (y, s * nsub) if Q is None else (y, s * nsub, Q)
 
 
 def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5, radial=None, wall_T=None,
-            perp="braginskii", electron_Z=None):
+            perp="braginskii", electron_Z=None, ghost_U=None, flux_out=None):
     """Split step: anisotropic conduction over dt on the interior conservative array U (in place on U[EN]),
-    with density, momentum and B frozen, by RKL2. Returns the number of stages used (0 if nothing to do)."""
+    with density, momentum and B frozen, by RKL2. Returns the number of stages used (0 if nothing to do).
+    ghost_U: the ghost-inclusive array U is the interior of; its first ghost ring is the neighbour data of the
+    edge cells (held fixed over the step) and the domain faces conduct. flux_out: a list that receives the
+    time-integrated face fluxes (one array per axis, energy per area)."""
     rho = xp.maximum(U[RHO], FLOOR_RHO)
     vf = not _ideal(gamma) and gamma.volume_fraction
     a = xp.clip(U[RHOC] if vf else U[RHOC] / rho, 0.0, 1.0)
@@ -380,9 +408,18 @@ def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5, radial=N
         def theta_of(E):
             return xp.maximum(p_of(E), 0.0) / rho
 
+    ghost = None
+    if ghost_U is not None:                          # one ring of neighbour cells, held fixed over the step
+        ng = (ghost_U.shape[1] - U.shape[1]) // 2
+        ring = ghost_U[(slice(None),) + tuple(slice(ng - 1, ng + n + 1) for n in U.shape[1:])]
+        Wg = cons_to_prim(ring, gamma)
+        ghost = (xp.maximum(Wg[iPR], 0.0) / Wg[iRHO], Wg[iRHO], xp.clip(Wg[iCLR], 0.0, 1.0),
+                 (Wg[iBX], Wg[iBY], Wg[iBZ]))
+    track = flux_out is not None
+
     def rate(E):
         return conduction_div(theta_of(E), B, rho, a, kappa0, x0, tracer_max, h, periodic, radial=radial,
-                              wall_T=wall_T, perp=perp)
+                              wall_T=wall_T, perp=perp, ghost=ghost, return_flux=track)
 
     # forward-Euler limit from the largest diffusivity k_par / (rho phi1), phi1 = d eps / d p
     phi1 = 1.0 / (gamma - 1) if _ideal(gamma) else gamma.coeffs(rho, a)[0]
@@ -395,7 +432,10 @@ def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5, radial=N
     dt_expl = cfl / (2.0 * D_max * sum(1.0 / hh**2 for hh in h))
     if wall_T is not None:
         dt_expl *= 0.5                           # a wall face sits half a cell away: twice the stiffness
-    U[EN], stages = rkl2(U[EN], rate, dt, dt_expl)
+    out = rkl2(U[EN], rate, dt, dt_expl)
+    U[EN], stages = out[0], out[1]
+    if track:
+        flux_out.extend(out[2])
     if electron_Z is not None:
         twotemp.set_pe(U, xp.maximum(p_of(U[EN]) - p_ion, 0.0), gamma)
     return stages
@@ -829,7 +869,7 @@ def face_eta(eta, axis, mean="harmonic"):
     return 2.0 * a * b / xp.maximum(a + b, 1e-300)
 
 
-def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic", rc=None, rf=None):
+def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic", rc=None, rf=None, bz_flux=False):
     """Resistive induction and energy terms in conservative form.
 
     Induction: dB/dt = -curl(eta J), J = curl(B), with all three current
@@ -849,13 +889,14 @@ def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic", rc=None, rf=No
     loss exactly (summation by parts).
     rc, rf: cell and face radii along x for cylindrical geometry (x = r, y = z, z = -phi): then the axial
     current on r-faces is -(1/r) d(r B_w)/dr and the energy flux divergence is r-weighted.
+    bz_flux: also return the B_z fluxes (E_y on x-faces, -E_x on y-faces), shaped like Gx, Gy.
     """
     R = xp.zeros_like(U)
     Gx = xp.zeros((U.shape[1] - 1, U.shape[2]), dtype=U.dtype)
     Gy = xp.zeros((U.shape[1], U.shape[2] - 1), dtype=U.dtype)
     q = xp.zeros(U.shape[1:], dtype=U.dtype)
     if isinstance(eta, (int, float)) and eta <= 0:
-        return R, Gx, Gy, q
+        return (R, Gx, Gy, q, (xp.zeros_like(Gx), xp.zeros_like(Gy))) if bz_flux else (R, Gx, Gy, q)
     ex = face_eta(eta, 0, face_mean)
     ey = face_eta(eta, 1, face_mean)
 
@@ -911,4 +952,6 @@ def compute_resistive_terms(U, eta, dx, dy, face_mean="harmonic", rc=None, rf=No
     qy = Ex_yf * Jx_yf + 0.5 * Ez_yf * Jz_yf
     q[1:-1, 1:-1] = (0.5 * (qx[1:, 1:-1] + qx[:-1, 1:-1])
                      + 0.5 * (qy[1:-1, 1:] + qy[1:-1, :-1]))
+    if bz_flux:
+        return R, Gx, Gy, q, (Ey_xf, -Ex_yf)
     return R, Gx, Gy, q

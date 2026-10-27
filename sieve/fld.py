@@ -17,6 +17,10 @@
 # gas + radiation energy is conserved to round-off whatever the CG residual. D is frozen at the old E_r.
 # Radiation pressure and its work are left out (fine while E_r / 3 << p). Radiation lives in the fuel only
 # (liner fraction below fld_tracer_max): faces touching the liner carry no radiation flux.
+#
+# An AMR patch (sieve/amr.py) passes `ghost`: E_r and the normal velocity in the cells just outside each of its
+# edges, taken from the coarse level. Those faces then conduct to the ghost cell (a full cell away) and advect
+# across it; `faces` receives the time-integrated face fluxes for refluxing.
 import numpy as np
 
 from .config import EN, iRHO, iPR, iVX, iCLR
@@ -76,12 +80,23 @@ class Geometry:
         return net, inflow
 
 
-def face_conductance(geo, E, chiR, c, open_, dirichlet):
+def _ends(geo, ax, lo, hi, vals, end_key, value=None):
+    """put the ghost (or Dirichlet) values of axis ax into the end entries of the (left, right) face pairs"""
+    n = geo.shape[ax]
+    for end, idx, arr in (("lo", 0, lo), ("hi", n, hi)):
+        if (ax, end) in vals:
+            v = vals[(ax, end)] if value is None else value
+            arr[_sl(geo.nd, ax, slice(idx, idx + 1))] = v if end_key is None else v[end_key]
+
+
+def face_conductance(geo, E, chiR, c, open_, dirichlet, ghost=None):
     """D A / h on every face with the limiter evaluated on the face: R = |grad E| / (chi E) from the normal
     difference across the face (to the boundary value, half a cell out, on a Dirichlet face) plus the
     transverse cell gradients averaged onto it, E and chi the face means. Zero where either side is closed
-    (liner) and on non-periodic end faces without a Dirichlet value (zero flux)."""
+    (liner) and on non-periodic end faces without a Dirichlet value (zero flux). ghost: E in the cells beyond
+    the ends ({(ax, "lo"/"hi"): {"E": ...}}), a full cell away."""
     nd = geo.nd
+    ghost = ghost or {}
     gc = []                                          # cell-centred gradients, for the transverse parts
     for ax in range(nd):
         lo, hi = geo.pairs(E, ax)
@@ -97,6 +112,7 @@ def face_conductance(geo, E, chiR, c, open_, dirichlet):
                 if (ax, end) in dirichlet:
                     arr[_sl(nd, ax, slice(idx, idx + 1))] = dirichlet[(ax, end)]
                     hn[_sl(nd, ax, slice(idx, idx + 1))] = 0.5 * geo.h[ax]
+            _ends(geo, ax, elo, ehi, ghost, "E")
         g2 = ((ehi - elo) / hn)**2
         for t in range(nd):
             if t != ax:
@@ -109,16 +125,17 @@ def face_conductance(geo, E, chiR, c, open_, dirichlet):
         Df = xp.where(olo & ohi, c * _limiter(R) / xp.maximum(chif, 1e-300), 0.0)
         if not geo.per[ax]:
             for end, idx in (("lo", 0), ("hi", n)):
-                if (ax, end) not in dirichlet:
+                if (ax, end) not in dirichlet and (ax, end) not in ghost:
                     Df[_sl(nd, ax, slice(idx, idx + 1))] = 0.0
         K.append(Df * geo.A[ax] / hn)
     return K
 
 
-def diffusive(geo, E, K, dirichlet, boundary=True):
-    """energy per time through each face, K (E_left - E_right) (toward +ax); Dirichlet faces use the boundary
-    value (or 0 with boundary=False: the homogeneous operator)"""
+def diffusive(geo, E, K, dirichlet, boundary=True, ghost=None):
+    """energy per time through each face, K (E_left - E_right) (toward +ax); Dirichlet and ghost faces use the
+    boundary value (or 0 with boundary=False: the homogeneous operator)"""
     nd, G = geo.nd, []
+    ghost = ghost or {}
     for ax in range(nd):
         lo, hi = geo.pairs(E, ax)
         n = geo.shape[ax]
@@ -127,23 +144,29 @@ def diffusive(geo, E, K, dirichlet, boundary=True):
                 lo[_sl(nd, ax, slice(0, 1))] = dirichlet[(ax, "lo")] if boundary else 0.0
             if (ax, "hi") in dirichlet:
                 hi[_sl(nd, ax, slice(n, n + 1))] = dirichlet[(ax, "hi")] if boundary else 0.0
+            _ends(geo, ax, lo, hi, ghost, "E", None if boundary else {"E": 0.0})
         G.append(K[ax] * (lo - hi))
     return G
 
 
-def advective(geo, Er, W, h):
+def advective(geo, Er, W, h, ghost=None):
     """upwind energy per time v E_r through each face (cell velocities averaged onto the face; end faces of a
-    non-periodic axis carry the edge cell outward, nothing inward)"""
+    non-periodic axis carry the edge cell outward, nothing inward, unless a ghost cell is given)"""
     G = []
+    ghost = ghost or {}
     for ax in range(geo.nd):
         vlo, vhi = geo.pairs(W[iVX + ax], ax)
         elo, ehi = geo.pairs(Er, ax)
+        _ends(geo, ax, vlo, vhi, ghost, "v")
+        _ends(geo, ax, elo, ehi, ghost, "E")
         vf = 0.5 * (vlo + vhi)
         F = vf * xp.where(vf > 0, elo, ehi)
         if not geo.per[ax]:
             n = geo.shape[ax]
-            F[_sl(geo.nd, ax, slice(0, 1))] = xp.minimum(F[_sl(geo.nd, ax, slice(0, 1))], 0.0)
-            F[_sl(geo.nd, ax, slice(n, n + 1))] = xp.maximum(F[_sl(geo.nd, ax, slice(n, n + 1))], 0.0)
+            if (ax, "lo") not in ghost:
+                F[_sl(geo.nd, ax, slice(0, 1))] = xp.minimum(F[_sl(geo.nd, ax, slice(0, 1))], 0.0)
+            if (ax, "hi") not in ghost:
+                F[_sl(geo.nd, ax, slice(n, n + 1))] = xp.maximum(F[_sl(geo.nd, ax, slice(n, n + 1))], 0.0)
         G.append(F * geo.A[ax])
     return G
 
@@ -181,9 +204,11 @@ def _cg(op, b, x0, Minv, tol, maxit):
     return x, maxit
 
 
-def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True):
+def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True, ghost=None, faces=None):
     """one FLD step on interior arrays, in place on Er and U[EN]. Returns (energy the gas gained, energy that
-    entered through the domain faces, CG iterations): cell integrals (per radian in r-z)."""
+    entered through the domain faces, CG iterations): cell integrals (per radian in r-z).
+    ghost: {(axis, "lo"/"hi"): {"E": E_r, "v": normal velocity}} in the cells beyond those ends (AMR patches);
+    faces: a list that receives the time-integrated E_r face fluxes per axis (energy per area, Cartesian)."""
     geo = Geometry(Er.shape, h, periodic, radial)
     W = cons_to_prim(U, eos)
     rho = W[iRHO]
@@ -191,8 +216,11 @@ def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True):
     open_ = xp.clip(W[iCLR], 0.0, 1.0) < cfg.fld_tracer_max
     V = geo.V
     inflow = 0.0
+    ghost = ghost or {}
+    Gadv = None
     if advect:
-        net, inflow = geo.divergence(advective(geo, Er, W, h))
+        Gadv = advective(geo, Er, W, h, ghost)
+        net, inflow = geo.divergence(Gadv)
         Er += dt * net / V
         inflow = dt * inflow
     dirichlet = {}
@@ -201,6 +229,8 @@ def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True):
             dirichlet[(0, "lo")] = cfg.fld_E_xmin
         if cfg.fld_E_xmax >= 0:
             dirichlet[(0, "hi")] = cfg.fld_E_xmax
+    for key in ghost:
+        dirichlet.pop(key, None)
     if cfg.fld_opacity_table:                        # tabulated kappa_R, kappa_P (sieve/tabular.py)
         kR, kP = _opacity_table(cfg)(rho, theta)
         kP = xp.where(open_, kP, 0.0)
@@ -219,19 +249,24 @@ def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True):
     # Picard passes: the limiter from the latest iterate (frozen at the old E_r, the flat region ahead of a
     # front would see the unlimited D = c / (3 chi) and flood within one step)
     for _ in range(max(cfg.fld_picard, 1)):
-        K = [dt * k for k in face_conductance(geo, xp.maximum(E1, 1e-300), chiR, c, open_, dirichlet)]
+        K = [dt * k for k in face_conductance(geo, xp.maximum(E1, 1e-300), chiR, c, open_, dirichlet, ghost)]
 
         def op(x):                                   # V (1 + dt s) x + sum over faces of K (x_i - x_j)
-            net, _ = geo.divergence(diffusive(geo, x, K, dirichlet, boundary=False))
+            net, _ = geo.divergence(diffusive(geo, x, K, dirichlet, boundary=False, ghost=ghost))
             return diag_ * x - net
-        bnet, _ = geo.divergence(diffusive(geo, zero, K, dirichlet))    # Dirichlet values -> right-hand side
+        bnet, _ = geo.divergence(diffusive(geo, zero, K, dirichlet, ghost=ghost))  # boundary values -> rhs
         rhs = V * (Er + dt * s * B) + bnet
         kd = sum(k[_sl(nd, ax, slice(0, geo.shape[ax]))] + k[_sl(nd, ax, slice(1, geo.shape[ax] + 1))]
                  for ax, k in enumerate(K))
         E1, it = _cg(op, rhs, E1, 1.0 / (diag_ + kd), cfg.fld_tol, cfg.fld_maxit)
         its += it
     # conservative update from the solution: face fluxes telescope, the gas gets the exchange back
-    net, din = geo.divergence(diffusive(geo, E1, K, dirichlet))
+    Gd = diffusive(geo, E1, K, dirichlet, ghost=ghost)
+    net, din = geo.divergence(Gd)
+    if faces is not None:
+        for ax in range(nd):
+            G = Gd[ax] if Gadv is None else Gd[ax] + dt * Gadv[ax]
+            faces.append(G / geo.A[ax])
     exch = dt * s * (B - E1) * V                     # energy the radiation takes from the gas, per cell
     Er += (net + exch) / V
     U[EN] -= exch / V

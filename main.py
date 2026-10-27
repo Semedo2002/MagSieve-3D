@@ -1999,6 +1999,112 @@ def circuit_test():
     return ok1 and ok2
 
 
+def amr_physics_test():
+    """Non-ideal terms across AMR levels (sieve/amr.py), 32^2 coarse, ratio 2, for each of resistive MHD,
+    conduction, grey FLD and liner strength: (1) three touching patches (an edge and a corner shared) that move
+    every 4 coarse steps: mass, momentum and total energy (gas + radiation) conserved to round-off and div B at
+    round-off; with the new flux registers switched off the energy (or momentum) error is 1e-7 or more, so the
+    refluxing of the resistive, conductive, radiative and stress fluxes is what closes the budget; (2) a feature
+    inside one patch (initialised at the fine resolution): the AMR solution in the patch matches a uniform fine run
+    to under 2% of the coarse run's error."""
+    from sieve.amr import AMR, AMRParams, _Recorder
+    from sieve.eos import stiffened_from_hugoniot
+    from sieve import ct as _ct
+    print("\n--- AMR with resistive, conduction, FLD and strength terms ---"); sys.stdout.flush()
+    gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 1.0)
+    g2 = lambda X, Y, w: xp.exp(-((X - 0.5)**2 + (Y - 0.5)**2) / w)
+
+    def init_resist(W, X, Y):
+        W[iRHO], W[iPR], W[iBZ], W[iBX] = 1.0, 20.0, g2(X, Y, 0.01), 0.2
+
+    def init_cond(W, X, Y):
+        W[iRHO], W[iPR] = 1.0, 1.0 + 2.0 * g2(X, Y, 0.01)
+
+    def init_fld(W, X, Y):
+        W[iRHO], W[iPR], W[iVX] = 1.0, 1.0 + g2(X, Y, 0.01), 0.3
+
+    def init_strength(W, X, Y):
+        W[iRHO], W[iPR], W[iCLR], W[iVY] = AL["rho0"], 1e-3, 1.0, 0.05 * g2(X, Y, 0.004)
+    cases = [("resistive", dict(eta_resistivity=2e-3, B_transverse=1.0), init_resist, 0.05, iBZ),
+             ("conduction", dict(cond_kappa0=2e-3, cond_x0=0.0), init_cond, 0.03, iPR),
+             ("FLD", dict(fld=True, fld_c=10.0, fld_a=1.0, fld_kr0=30.0, fld_kp0=1.0, fld_advect=True), init_fld, 0.05,
+              iPR),
+             ("strength", dict(eos_liner="stiffened", gamma_liner=gA, p_inf_liner=piA, material_tracer="volume_fraction",
+                               strength=True, shear_modulus=26.0, yield_strength=100.0), init_strength, 0.03, iVY)]
+
+    def cfg_of(n, kw):
+        c = dict(nx=n, ny=n, x_max=1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=5 / 3, B_transverse=0.0,
+                 bc_x_type="periodic", bc_y_type="periodic", powell_source=False, diag_interval=10**9, snapshot_times=[])
+        c.update(kw)
+        return Config(**c)
+
+    def fill(s, fn):
+        W = xp.zeros((NVAR,) + s.U.shape[1:])
+        fn(W, s.X, s.Y)
+        if s.Er is not None:
+            s.Er[...] = 1.0 + g2(s.X[s.ng:-s.ng, s.ng:-s.ng], s.Y[s.ng:-s.ng, s.ng:-s.ng], 0.005)
+        return prim_to_cons(W, s.eos)
+
+    def amr_run(kw, fn, steps=None, t_end=None, boxes=None, move=False, exact=False):
+        n, r = 32, 2
+        cfg = cfg_of(n, kw)
+        a = AMR(cfg, AMRParams(ratio=r, regrid_every=0))
+        with contextlib.redirect_stdout(io.StringIO()):
+            s0 = MHDSolver(cfg)
+        a.set_state(fill(s0, fn))
+        if s0.Er is not None:
+            a.coarse.Er[...] = s0.Er
+        a.regrid(boxes)
+        if exact:                                    # patch data at the fine resolution, not prolonged
+            for f in a.patches:
+                ng = f.ng
+                f.U[:, ng:-ng, ng:-ng] = fill(f, fn)[:, ng:-ng, ng:-ng]
+                _ct.cells_from_faces(f.U, f.Bf, (slice(ng, -ng), slice(ng, -ng)))
+        T0, div, k = a.totals(), 0.0, 0
+        shift = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+        while (steps is not None and k < steps) or (t_end is not None and a.t < t_end - 1e-12):
+            a.advance(a.compute_dt() if t_end is None else min(a.compute_dt(), t_end - a.t))
+            k += 1
+            div = max(div, a.div_b())
+            if move and k % 4 == 0:
+                dx_, dy_ = shift[(k // 4 - 1) % 4]
+                a.regrid([(b[0] + dx_, b[1] + dx_, b[2] + dy_, b[3] + dy_) for b in a.boxes])
+        T1 = a.totals()
+        cons = max(abs(T1[q] - T0[q] - (T1["boundary"] - T0["boundary"] if q == "E" else 0.0)) / abs(T0["E"])
+                   for q in ("mass", "mx", "my", "E"))
+        return a, cons, div
+
+    def uniform(n, kw, fn, t_end, var):
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg_of(n, kw))
+        s.U = fill(s, fn); s.t = 0.0; s.step = 0
+        _march(s, t_end)
+        return to_numpy(cons_to_prim(s.U, s.eos)[var, s.ng:-s.ng, s.ng:-s.ng])
+
+    touching = [(9, 17, 11, 19), (17, 23, 9, 21), (23, 27, 21, 25)]
+    ok = True
+    for name, kw, fn, t_end, var in cases:
+        _, cons, div = amr_run(kw, fn, steps=12, boxes=touching, move=True)
+        saved = (_Recorder._add_flux, _Recorder._add_split_flux)
+        _Recorder._add_flux = _Recorder._add_split_flux = lambda *a_: None
+        try:
+            _, cons_off, _ = amr_run(kw, fn, steps=8, boxes=touching, move=True)
+        finally:
+            _Recorder._add_flux, _Recorder._add_split_flux = saved
+        a, _, _ = amr_run(kw, fn, t_end=t_end, boxes=[(6, 26, 6, 26)], exact=True)
+        fine, coarse = uniform(64, kw, fn, t_end, var), uniform(32, kw, fn, t_end, var)
+        up = lambda q: np.repeat(np.repeat(q, 2, 0), 2, 1)
+        sl = (slice(12, 52), slice(12, 52))
+        e_amr = float(np.mean(np.abs(a.composite(var)[sl] - fine[sl])))
+        e_c = float(np.mean(np.abs(up(coarse)[sl] - fine[sl])))
+        good = cons < 1e-13 and div < 1e-12 and cons_off > 1e-8 and e_amr < 0.02 * e_c
+        ok = ok and good
+        print(f"  {name:10s}: moving touching patches, 12 steps: conservation {cons:.1e} (registers off: "
+              f"{cons_off:.1e}), div B {div:.1e}; feature in a patch: L1 error vs uniform 64^2 {e_amr:.1e} "
+              f"(coarse {e_c:.1e})  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 VERIFICATION_TESTS = {
     "brio_wu": brio_wu_test,
     "alfven": alfven_convergence_test,
@@ -2034,6 +2140,7 @@ VERIFICATION_TESTS = {
     "tabular": tabular_test,
     "validation": validation_test,
     "amr": amr_test,
+    "amr_physics": amr_physics_test,
 }
 
 

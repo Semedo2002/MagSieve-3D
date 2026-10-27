@@ -602,6 +602,24 @@ class MHDSolver:
     def _halo(self, A):
         pass
 
+    # AMR (sieve/amr.py): non-ideal face fluxes on patch boundaries, ghost data for the split diffusion steps
+    _records_fluxes = False
+
+    def _add_flux(self, var, Gx, Gy):
+        """more face fluxes of variable var in this RK stage, laid out like the hydro Fx, Fy"""
+
+    def _add_split_flux(self, key, var, Gx, Gy):
+        """time-integrated face fluxes of a split step on interior faces ((nx+1, ny), (nx, ny+1)); key "F" (U
+        variable var) or "Er" (radiation energy)"""
+
+    def _split_ghosts(self):
+        """ghost-inclusive U whose first ghost ring the split conduction step conducts to (None: domain walls)"""
+        return None
+
+    def _fld_ghosts(self):
+        """FLD ghost cells beyond the edges (see fld.step), None: domain boundaries"""
+        return None
+
     def div_b_max(self):
         """max |div B| h / max |B| on interior cells: face divergence with CT, central differences with GLM"""
         cfg, ng = self.cfg, self.ng
@@ -699,8 +717,12 @@ class MHDSolver:
         if cfg.is_resistive():
             eta = resistivity_field(W, cfg)
             rc_, rf_ = (self.rc, self.rf) if self.cyl else (None, None)
-            R_resist, Gx, Gy, q = compute_resistive_terms(U, eta, cfg.dx, cfg.dy, cfg.eta_face_mean, rc_, rf_)
+            R_resist, Gx, Gy, q, (Gbx, Gby) = compute_resistive_terms(U, eta, cfg.dx, cfg.dy, cfg.eta_face_mean,
+                                                                      rc_, rf_, bz_flux=True)
             R[:, ng:ng+nx, ng:ng+ny] += R_resist[:, ng:ng+nx, ng:ng+ny]
+            if self._records_fluxes:                 # face k of Fx is face ng - 1 + k of the full arrays
+                self._add_flux(EN, Gx[ng-1:ng+nx], Gy[:, ng-1:ng+ny])
+                self._add_flux(BZ, Gbx[ng-1:ng+nx], Gby[:, ng-1:ng+ny])
             ohmic_rate = xp.sum(q[ng:ng+nx, ng:ng+ny] * self.dV)
             if cfg.two_temp:                         # Ohmic heat goes to the electrons
                 rho_i = W[iRHO, ng:ng+nx, ng:ng+ny]
@@ -761,6 +783,8 @@ class MHDSolver:
             dS[...] = 0.0
             dS[:, ng:ng+nx, ng:ng+ny] = dSi
             for var, gx, gy in ((MX, fx[0], fy[0]), (MY, fx[1], fy[1]), (EN, fx[2], fy[2])):
+                if self._records_fluxes:
+                    self._add_flux(var, gx, gy)
                 if self.cyl:
                     rg = gx * self.rf[2:nx + 3][:, None]
                     R[var, ng:ng+nx, ng:ng+ny] -= (rg[1:, ng:ng+ny] - rg[:-1, ng:ng+ny]) / (cfg.dx * self.rc[ng:ng+nx][:, None])
@@ -901,18 +925,26 @@ class MHDSolver:
             ng, cfg = self.ng, self.cfg
             Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
             radial = (self.rf[ng:ng + cfg.nx + 1], self.rc[ng:ng + cfg.nx]) if self.cyl else None
+            faces = [] if self._records_fluxes else None
             _, din, self.fld_iters = fld.step(self.Er, Ui, self.eos, cfg, (cfg.dx, cfg.dy), self._periodic(), dt,
-                                             radial=radial, advect=cfg.fld_advect)
+                                             radial=radial, advect=cfg.fld_advect, ghost=self._fld_ghosts(),
+                                             faces=faces)
             self.fld_inflow += din
+            if faces:
+                self._add_split_flux("Er", None, *faces)
         if self.cfg.cond_kappa0 > 0:
             ng, cfg = self.ng, self.cfg
             Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
             per = (cfg.get_bc_x() == "periodic", cfg.bc_y_type == "periodic")
             radial = (self.rf[ng:ng + cfg.nx + 1], self.rc[ng:ng + cfg.nx]) if self.cyl else None
             wall = cfg.cond_wall_T if cfg.cond_wall == "isothermal" else None
+            faces = [] if self._records_fluxes else None
             self.cond_stages = conduct(Ui, self.eos, cfg.cond_kappa0, cfg.cond_x0, cfg.cond_tracer_max,
                                        (cfg.dx, cfg.dy), per, dt, radial=radial, wall_T=wall, perp=cfg.cond_perp,
-                                       electron_Z=cfg.z_ion if cfg.two_temp else None)
+                                       electron_Z=cfg.z_ion if cfg.two_temp else None,
+                                       ghost_U=self._split_ghosts(), flux_out=faces)
+            if faces:
+                self._add_split_flux("F", EN, *faces)
         cfg, ng = self.cfg, self.ng
         if cfg.two_temp and cfg.te_eq_coeff > 0:
             Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]

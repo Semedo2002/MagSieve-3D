@@ -28,9 +28,17 @@
 # face fields come from a vector potential A_z (old fine A_z in the overlap, coarse A_z interpolated
 # elsewhere), so they are divergence-free by construction and consistent with the coarse faces.
 #
-# Scope: 2D Cartesian, ideal MHD with the two-material EOS and the volume-fraction tracer, constrained
-# transport. The split-step operators (conduction, viscosity, FLD) and the resistive / strength / Nernst face
-# fluxes are not coupled across levels and raise.
+# Non-ideal terms couple across the levels the same way:
+#   - resistive MHD: the eta J part of the corner EMF is in the EMF correction; the resistive Poynting flux and
+#     the B_z diffusion flux are added to the recorded face fluxes and refluxed with them;
+#   - strength: the deviatoric stress S is prolonged, restricted and time-interpolated into patch ghosts like
+#     U, and the stress fluxes of momentum and energy are refluxed;
+#   - conduction (RKL2) and grey FLD (backward Euler) are split steps: on a patch they conduct to ghost cells
+#     taken from the coarse level at the end of the sub-step (and from touching patches), and each returns its
+#     time-integrated face fluxes, which are refluxed into the coarse energy (conduction) or the coarse E_r
+#     (FLD; E_r is prolonged and restricted too). Gas + radiation energy stays conserved to round-off.
+# Scope: 2D Cartesian, constrained transport; viscosity, Nernst, two-temperature and optically thin radiation
+# are not coupled across levels yet and raise.
 import dataclasses
 
 import numpy as np
@@ -44,10 +52,9 @@ from . import ct
 def _check(cfg):
     if cfg.geometry != "cartesian" or cfg.div_b != "ct":
         raise NotImplementedError("AMR: 2D Cartesian with constrained transport")
-    if cfg.cond_kappa0 > 0 or cfg.visc_coeff > 0 or cfg.fld or cfg.strength or cfg.nernst_coeff > 0 \
-            or cfg.is_resistive() or cfg.rad_coeff > 0 or cfg.two_temp:
-        raise NotImplementedError("AMR: ideal MHD + two-material EOS only (no resistive, strength, transport or "
-                                  "radiation terms across levels yet)")
+    if cfg.visc_coeff > 0 or cfg.nernst_coeff > 0 or cfg.rad_coeff > 0 or cfg.two_temp:
+        raise NotImplementedError("AMR: viscosity, Nernst, two-temperature and optically thin radiation are not "
+                                  "coupled across levels yet")
 
 
 # ------------------------------------------------------------------ recording levels
@@ -74,6 +81,7 @@ class _Recorder:
         ux, uax = vf(Fx, WLx, WRx)
         uy, uay = vf(Fy, WLy, WRy)
         self._stage = []
+        self._stage_own = False
         for (i0, i1, j0, j1) in self._rec_boxes:
             r = self._rec_r
             # this level's own box boundary in its index space (fine: the whole patch, coarse: the box)
@@ -84,6 +92,41 @@ class _Recorder:
                    "u": [ux[ri0, rows], ux[ri1, rows], uy[cols, rj0], uy[cols, rj1]],
                    "ua": [uax[ri0, rows], uax[ri1, rows], uay[cols, rj0], uay[cols, rj1]]}
             self._stage.append(rec)
+
+    @property
+    def _records_fluxes(self):
+        return bool(getattr(self, "_rec_boxes", None))
+
+    def _sides(self, k, Gx, Gy, interior):
+        """the four boundary pieces (left, right, bottom, top) of box k from x- and y-face arrays: Fx / Fy
+        layout (rows / columns with ghosts) or interior faces only"""
+        i0, i1, j0, j1 = self._rec_boxes[k]
+        ri0, ri1, rj0, rj1 = (i0, i1, j0, j1) if self._rec_r == 0 else (0, self.cfg.nx, 0, self.cfg.ny)
+        o = 0 if interior else self.ng
+        rows, cols = slice(o + rj0, o + rj1), slice(o + ri0, o + ri1)
+        return [Gx[..., ri0, rows], Gx[..., ri1, rows], Gy[..., cols, rj0], Gy[..., cols, rj1]]
+
+    def _add_flux(self, var, Gx, Gy):
+        if self._stage is None:
+            return
+        if not self._stage_own:                      # the recorded pieces are views of Fx, Fy: copy before adding
+            for st in self._stage:
+                st["F"] = [a.copy() for a in st["F"]]
+            self._stage_own = True
+        for k, st in enumerate(self._stage):
+            for m, g in enumerate(self._sides(k, Gx, Gy, False)):
+                st["F"][m][var] += g
+
+    def _add_split_flux(self, key, var, Gx, Gy):
+        for k, acc in enumerate(self._rec):
+            if acc is None:
+                continue
+            for m, g in enumerate(self._sides(k, Gx, Gy, True)):
+                if key == "F":
+                    acc["F"][m][var] += g
+                else:
+                    acc.setdefault(key, [None] * 4)
+                    acc[key][m] = g.copy() if acc[key][m] is None else acc[key][m] + g
 
     def _emf_hook(self, E):
         if getattr(self, "_rec_boxes", None) and self._stage is not None:
@@ -118,9 +161,56 @@ class FinePatch(_Recorder, MHDSolver):
 
     neighbours = ()
 
-    def _set_ghost_source(self, P_old, P_new, t0, dtc):
+    def _set_ghost_source(self, P_old, P_new, t0, dtc, S=None, E=None):
+        """coarse data prolonged onto this patch (with ghosts) before and after the coarse step: U, and the
+        stress S and radiation energy E_r frames when those are on"""
         self._P_old, self._P_new, self._t0, self._dtc = P_old, P_new, t0, dtc
+        self._S_frames, self._E_frames = S, E
         self._k = 0
+
+    def _ghost_fill(self, A, frames, cur, interior_only=False):
+        """ghost-inclusive array of a field from the coarse frames at the current theta, with touching patches'
+        current values (attribute `cur`) where they overlap; A (if given) keeps its interior"""
+        th = getattr(self, "_theta", 1.0)
+        G = (1.0 - th) * frames[0] + th * frames[1]
+        ng = self.ng
+        for o in self.neighbours:
+            ov = self._overlaps(o, 0, 0)
+            if ov is not None:
+                src = getattr(o, cur)
+                if interior_only:                    # E_r has no ghost cells
+                    G[(slice(None),) + ov[0]] = src[None][(slice(None),) + tuple(slice(t.start - ng, t.stop - ng) for t in ov[1])]
+                else:
+                    G[(slice(None),) + ov[0]] = src[(slice(None),) + ov[1]]
+        if A is not None:
+            G[:, ng:-ng, ng:-ng] = A[:, ng:-ng, ng:-ng]
+        return G
+
+    def _halo(self, A):
+        """ghost cells of the stress array (compute_rhs calls this after the domain boundary fill)"""
+        if getattr(self, "_S_frames", None) is not None and A is not None and A.shape == self.S.shape:
+            A[...] = self._ghost_fill(A, self._S_frames, "_cur_S")
+
+    def _post_step(self, dt):
+        self._theta = (self.t + dt - self._t0) / self._dtc     # end of this sub-step: the split steps' ghosts
+        self.apply_bc(self.U)
+        super()._post_step(dt)
+
+    def _split_ghosts(self):
+        return self.U
+
+    def _fld_ghosts(self):
+        if getattr(self, "_E_frames", None) is None:
+            return None
+        ng, nx, ny = self.ng, self.cfg.nx, self.cfg.ny
+        G = self._ghost_fill(None, self._E_frames, "Er", interior_only=True)[0]
+        rho = xp.maximum(self.U[RHO], 1e-300)
+        vx, vy = self.U[MX] / rho, self.U[MY] / rho
+        J, I = slice(ng, ng + ny), slice(ng, ng + nx)
+        return {(0, "lo"): {"E": G[ng - 1, J][None], "v": vx[ng - 1, J][None]},
+                (0, "hi"): {"E": G[ng + nx, J][None], "v": vx[ng + nx, J][None]},
+                (1, "lo"): {"E": G[I, ng - 1][:, None], "v": vy[I, ng - 1][:, None]},
+                (1, "hi"): {"E": G[I, ng + ny][:, None], "v": vy[I, ng + ny][:, None]}}
 
     def compute_rhs(self, U, out=None, Bf=None, dBf=None, S=None, dS=None):
         ts = (0.0, self.dt, 0.5 * self.dt)[self._k % 3]
@@ -176,17 +266,28 @@ class FinePatch(_Recorder, MHDSolver):
         self._glm_ch_frozen = self.cfg.glm_ch
         self._ct_sync()
         self._cur_U, self._cur_F = self.U, self.Bf
+        self._cur_S = self.S if self.strength else None
         self._U0 = self.U
 
     def stage_rhs(self, k):
         w = (1 / 6, 1 / 6, 2 / 3)[k] * self.dt
         U = self.U if k == 0 else self.U_temp
         F = self.Bf if k == 0 else self._Bf1
-        self.compute_rhs(U, out=self.dU, Bf=F, dBf=self._dBf)
+        S, dS = ((self.S if k == 0 else self._S1), self._dS) if self.strength else (None, None)
+        self.compute_rhs(U, out=self.dU, Bf=F, dBf=self._dBf, S=S, dS=dS)
         self._accumulate_energy_budget(w)
 
     def stage_update(self, k):
         dt, U0, F0, F1, dF = self.dt, self.U, self.Bf, self._Bf1, self._dBf
+        if self.strength:
+            S0, S1, dS = self.S, self._S1, self._dS
+            if k == 0:
+                xp.add(S0, dt * dS, out=S1)
+            elif k == 1:
+                S1[...] = 0.75 * S0 + 0.25 * (S1 + dt * dS)
+            else:
+                S0[...] = S0 / 3.0 + 2.0 / 3.0 * (S1 + dt * dS)
+            self._cur_S = S0 if k == 2 else S1
         if k == 0:
             for f0, f1, d in zip(F0, F1, dF):
                 xp.add(f0, dt * d, out=f1)
@@ -428,6 +529,7 @@ class AMR:
         I, J = xp.asarray(ii)[:, None], xp.asarray(jj)[None, :]
         Af = ((1 - wx) * (1 - wy) * Ac[I, J] + wx * (1 - wy) * Ac[I + 1, J] + (1 - wx) * wy * Ac[I, J + 1]
               + wx * wy * Ac[I + 1, J + 1])
+        Erc = self._padded_Er()
         for (ob, op) in old:
             Ao = potential(op.Bf[0], op.Bf[1], ng, ng + op.cfg.nx, ng, ng + op.cfg.ny, (op.cfg.dx, op.cfg.dy))
             ci, cj = r * ob[0], r * ob[2]
@@ -440,6 +542,8 @@ class AMR:
             f._rec_reset([box], r)
             nxf, nyf = fc.nx, fc.ny
             U = prolong(s.U, i0, j0, nxf, nyf, r, ng)
+            S = prolong(s.S, i0, j0, nxf, nyf, r, ng) if s.strength else None
+            Er = prolong(Erc, i0, j0, nxf, nyf, r, ng)[0, ng:-ng, ng:-ng] if Erc is not None else None
             for (ob, op) in old:                     # overlap with an old patch: take its fine data
                 a0, a1, b0, b1 = max(i0, ob[0]), min(i1, ob[1]), max(j0, ob[2]), min(j1, ob[3])
                 if a0 >= a1 or b0 >= b1:
@@ -447,7 +551,16 @@ class AMR:
                 fi = slice(ng + r * (a0 - i0), ng + r * (a1 - i0)); fj = slice(ng + r * (b0 - j0), ng + r * (b1 - j0))
                 oi = slice(ng + r * (a0 - ob[0]), ng + r * (a1 - ob[0])); oj = slice(ng + r * (b0 - ob[2]), ng + r * (b1 - ob[2]))
                 U[:, fi, fj] = op.U[:, oi, oj]
+                if S is not None:
+                    S[:, fi, fj] = op.S[:, oi, oj]
+                if Er is not None:
+                    Er[fi.start - ng:fi.stop - ng, fj.start - ng:fj.stop - ng] = \
+                        op.Er[oi.start - ng:oi.stop - ng, oj.start - ng:oj.stop - ng]
             f.U = U
+            if S is not None:
+                f.S = xp.ascontiguousarray(S)
+            if Er is not None:
+                f.Er = xp.ascontiguousarray(Er)
             A = Af[r * i0:r * i1 + 1, r * j0:r * j1 + 1]
             Bx = xp.zeros((nxf + 2 * ng + 1, nyf + 2 * ng)); By = xp.zeros((nxf + 2 * ng, nyf + 2 * ng + 1))
             Bx[ng:ng + nxf + 1, ng:ng + nyf] = (A[:, 1:] - A[:, :-1]) / fc.dy
@@ -473,22 +586,32 @@ class AMR:
         s = self.coarse
         dt = s.compute_dt(cons_to_prim(s.U, s.eos))
         for f in self.patches:
-            f._set_ghost_source(*self._ghost_frames(f), self.t, 1.0)
+            (Po, Pn), Sf, Ef = self._ghost_frames(f)
+            f._set_ghost_source(Po, Pn, self.t, 1.0, Sf, Ef)
             f._theta = 0.0
             f.apply_bc(f.U)
             dt = min(dt, self.p.ratio * f.compute_dt(cons_to_prim(f.U, f.eos)))
         return dt
 
-    def _ghost_frames(self, f, U_old=None):
+    def _padded_Er(self, Er=None):
+        """coarse E_r with ng edge-copied ghost cells, shaped (1, ...) for prolong(); None without FLD"""
+        s = self.coarse
+        Er = s.Er if Er is None else Er
+        return None if Er is None else xp.pad(Er, s.ng, mode="edge")[None]
+
+    def _ghost_frames(self, f, old=None):
+        """coarse data prolonged onto patch f before (old = (U, S, E_r) saved before the coarse step) and after
+        the coarse step: (U frames, S frames or None, E_r frames or None)"""
         s, ng, r = self.coarse, self.coarse.ng, self.p.ratio
         i0, i1, j0, j1 = self.boxes[self.patches.index(f)]
-        Pn = prolong(s.U, i0, j0, f.cfg.nx, f.cfg.ny, r, ng)
-        Po = Pn if U_old is None else prolong(U_old, i0, j0, f.cfg.nx, f.cfg.ny, r, ng)
-        return Po, Pn
+        P = lambda A: prolong(A, i0, j0, f.cfg.nx, f.cfg.ny, r, ng)
+        new = (s.U, s.S if s.strength else None, self._padded_Er())
+        old = new if old is None else old
+        return tuple(None if a is None else (P(a), P(b)) for a, b in zip(old, new))
 
     def advance(self, dt):
         s, r, ng = self.coarse, self.p.ratio, self.coarse.ng
-        U_old = s.U.copy()
+        old = (s.U.copy(), s.S.copy() if s.strength else None, self._padded_Er())
         s._rec_reset(self.boxes, 0)
         s.dt = dt
         s.step_ssprk3()
@@ -496,8 +619,8 @@ class AMR:
         s.step += 1
         P = self.patches
         for k, f in enumerate(P):
-            Po, Pn = self._ghost_frames(f, U_old)
-            f._set_ghost_source(Po, Pn, self.t, dt)
+            (Po, Pn), Sf, Ef = self._ghost_frames(f, old)
+            f._set_ghost_source(Po, Pn, self.t, dt, Sf, Ef)
             f._rec_reset([self.boxes[k]], r)
         for m in range(r):                           # all patches take each RK stage together
             for f in P:
@@ -526,6 +649,7 @@ class AMR:
         dx, dy = s.cfg.dx, s.cfg.dy
         nx, ny = s.cfg.nx, s.cfg.ny
         dU = xp.zeros_like(s.U)
+        dEr = None if s.Er is None else xp.zeros_like(s.Er)
         dEc = xp.zeros((nx + 1, ny + 1))
         setc = np.zeros((nx + 1, ny + 1), bool)    # corners already corrected by a lower-index patch (owner)
         for k, (box, f) in enumerate(zip(self.boxes, self.patches)):
@@ -544,6 +668,10 @@ class AMR:
                                                    (cols, ng + j0 - 1, -1, dy), (cols, ng + j1, +1, dy))):
                 dU[:, ci, cj] += sign * dF[m] / h
                 dU[RHOC, ci, cj] += sign * (dua[m] - a_c[ci, cj] * du[m]) / h
+                if dEr is not None and "Er" in C:    # radiation energy fluxes (FLD), interior indices
+                    ei = ci - ng if isinstance(ci, int) else slice(ci.start - ng, ci.stop - ng)
+                    ej = cj - ng if isinstance(cj, int) else slice(cj.start - ng, cj.stop - ng)
+                    dEr[ei, ej] += sign * (agg(Fr["Er"][m]) - C["Er"][m]) / h
             # EMF correction on the boundary corners (fine corners every r-th, time-weighted)
             for m, (ksl, lsl) in enumerate(((i0, slice(j0, j1 + 1)), (i1, slice(j0, j1 + 1)),
                                             (slice(i0, i1 + 1), j0), (slice(i0, i1 + 1), j1))):
@@ -552,6 +680,8 @@ class AMR:
                 setc[ksl, lsl] = True
         dU[BX:BZ] = 0.0                              # in-plane B lives on the faces (B_z is a cell variable: refluxed)
         s.U += dU
+        if dEr is not None:
+            s.Er += dEr
         # faces next to the patches: dBx = -(dE(k, l+1) - dE(k, l)) / dy, dBy = (dE(k+1, l) - dE(k, l)) / dx
         s.Bf[0][ng:ng + nx + 1, ng:ng + ny] += -(dEc[:, 1:] - dEc[:, :-1]) / dy
         s.Bf[1][ng:ng + nx, ng:ng + ny + 1] += (dEc[1:, :] - dEc[:-1, :]) / dx
@@ -567,6 +697,11 @@ class AMR:
             s.Bf[0][ng + i0:ng + i1 + 1, ng + j0:ng + j1] = fx.reshape(i1 - i0 + 1, j1 - j0, r).mean(axis=2)
             fy = f.Bf[1][ng:ng + nxf, ng:ng + nyf + 1:r]
             s.Bf[1][ng + i0:ng + i1, ng + j0:ng + j1 + 1] = fy.reshape(i1 - i0, r, j1 - j0 + 1).mean(axis=1)
+            if s.strength:
+                Sf = f.S[:, ng:ng + nxf, ng:ng + nyf]
+                s.S[:, ng + i0:ng + i1, ng + j0:ng + j1] = Sf.reshape(Sf.shape[0], i1 - i0, r, j1 - j0, r).mean(axis=(2, 4))
+            if s.Er is not None:
+                s.Er[i0:i1, j0:j1] = f.Er.reshape(i1 - i0, r, j1 - j0, r).mean(axis=(1, 3))
         # cell B from the faces; the total energy keeps the conserved (averaged) value
         ct.cells_from_faces(s.U, s.Bf, (slice(ng, ng + nx), slice(ng, ng + ny)))
         s.apply_bc(s.U)
@@ -615,6 +750,10 @@ class AMR:
                         a_c = cons_to_prim(fB.U, fB.eos)[iCLR][ci, cj]
                         fB.U[:, ci, cj] += sign * dF / h
                         fB.U[RHOC, ci, cj] += sign * (dua - a_c * du) / h
+                        if "Er" in RA and "Er" in RB:
+                            ei = ci - ng if isinstance(ci, int) else slice(ci.start - ng, ci.stop - ng)
+                            ej = cj - ng if isinstance(cj, int) else slice(cj.start - ng, cj.stop - ng)
+                            fB.Er[ei, ej] += sign * (RA["Er"][sa][fa0:fa0 + nf] - RB["Er"][sb][fb0:fb0 + nf]) / h
                     # shared corners: B's faces get the owner's EMFs
                     if dE is None:
                         dE = xp.zeros((nxB + 1, nyB + 1))
@@ -632,12 +771,16 @@ class AMR:
 
     # -- diagnostics
     def totals(self):
-        """mass, momentum, total energy on the (synchronised) coarse level, and the boundary energy inflow"""
+        """mass, momentum, total energy (gas + radiation) on the (synchronised) coarse level, and the boundary
+        energy inflow"""
         s, ng = self.coarse, self.coarse.ng
         I = (slice(ng, -ng), slice(ng, -ng))
         dV = s.cfg.dx * s.cfg.dy
-        return {k: float(xp.sum(s.U[(v,) + I])) * dV for k, v in (("mass", RHO), ("mx", MX), ("my", MY), ("E", EN))} | \
-            {"boundary": s._cumulative_boundary_energy}
+        out = {k: float(xp.sum(s.U[(v,) + I])) * dV for k, v in (("mass", RHO), ("mx", MX), ("my", MY), ("E", EN))}
+        out["E_rad"] = s.radiation_energy()
+        out["E"] += out["E_rad"]
+        out["boundary"] = s._cumulative_boundary_energy + s.fld_inflow
+        return out
 
     def div_b(self):
         return max([self.coarse.div_b_max()] + [f.div_b_max() for f in self.patches])
