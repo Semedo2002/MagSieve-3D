@@ -2529,6 +2529,56 @@ def multigroup_test():
     return ok
 
 
+def experimental_test():
+    """Bundled open data and the benchmark that runs the solver against it (sieve/experimental_suite.py).
+    (1) The copper and nickel Hugoniot datasets (Marsh 1980, via LLNL BALSCD, MIT) load with their checksums; a
+    tampered copy is refused. (2) A shot trace written as CSV loads back through load_shot. (3) Copper plate
+    impacts at five particle velocities with the generated Cu table: the simulated shock speeds follow the table's
+    own Hugoniot (the flow solver adds no bias, within 1.5%) and the measured Us(Up) within 4% RMS, with chi^2_nu
+    reported for an assumed 2% measurement error."""
+    import tempfile
+    import shutil
+    from sieve import experimental_suite as ex, validation as val
+    print("\n--- Experimental data suite ---"); sys.stdout.flush()
+    ok = True
+    cu, ni = ex.load_dataset("copper_hugoniot"), ex.load_dataset("nickel_hugoniot")
+    tmp = tempfile.mkdtemp(prefix="exp_")
+    bad = os.path.join(tmp, "copper_marsh.csv")
+    shutil.copy(os.path.join(ex.DATA_DIR, "copper_marsh.csv"), bad)
+    with open(bad, "a") as fh:
+        fh.write("8.930,5.000,1.000,44.650,0.0900,11.1,0.800,xx\n")
+    saved = ex.DATA_DIR
+    ex.DATA_DIR = tmp
+    try:
+        ex.load_dataset("copper_hugoniot")
+        refused = False
+    except ValueError:
+        refused = True
+    finally:
+        ex.DATA_DIR = saved
+    good = len(cu["Us_km_s"]) == 145 and len(ni["Us_km_s"]) == 19 and refused
+    ok = ok and good
+    print(f"  datasets: copper {len(cu['Us_km_s'])} shots, nickel {len(ni['Us_km_s'])} shots, checksums verified; a "
+          f"tampered file refused: {refused}  [{'PASS' if good else 'FAIL'}]")
+    t = np.linspace(0, 1, 50)
+    tr = val.Trace("vis", t, np.sin(3 * t), 0.01, "km/s", "visar")
+    path = os.path.join(tmp, "shot.csv")
+    val.save_trace(path, tr)
+    back = ex.load_shot(path, "visar", "km/s")
+    d = float(np.max(np.abs(back.y - tr.y)))
+    good = d < 1e-12 and back.kind == "visar"
+    ok = ok and good
+    print(f"  shot trace CSV round trip: {d:.1e}  [{'PASS' if good else 'FAIL'}]")
+    r = ex.hugoniot_benchmark("copper_hugoniot", ups=[0.3, 0.8, 1.4, 2.0, 2.8], n=400,
+                              out_png=os.path.join(tmp, "shot_benchmark_comparison.png"))
+    good = r["sim_vs_table_max_rel"] < 0.015 and r["rms_rel"] < 0.04 and os.path.exists(os.path.join(tmp, "shot_benchmark_comparison.png"))
+    ok = ok and good
+    print(f"  copper plate impacts (5 Up values) vs {r['n_points']} Marsh shots: RMS {r['rms_km_s']:.3f} km/s "
+          f"({100 * r['rms_rel']:.1f}%), chi2_nu {r['chi2_nu']:.2f} (sigma 2% assumed); simulated vs the table's own "
+          f"Hugoniot within {100 * r['sim_vs_table_max_rel']:.2f}%  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -2865,6 +2915,7 @@ VERIFICATION_TESTS = {
     "amr_transport": amr_transport_test,
     "cylindrical3d": cylindrical3d_test,
     "multigroup": multigroup_test,
+    "experimental": experimental_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

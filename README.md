@@ -30,6 +30,7 @@ sieve/            solver package
   eos_fused.cu    device two-material / tabulated EOS, called inline by the HLLD kernel and the conversions
   eos_fused.py    its host side: packing, launches
   validation.py   shot data vs simulation: chi^2, RMS, peak offset, timing shifts, calibration, report plot
+  experimental_suite.py  bundled open data (Marsh 1980 Cu / Ni Hugoniots) and the plate-impact benchmark
   amr.py          block-structured adaptive mesh refinement (2D, CT, refluxing, touching patches)
   hall.py         generalized Ohm's law: Hall term, anisotropic (Spitzer) resistivity, on the CT staggering
   ions.py         ion gyroviscosity (finite-Larmor-radius stress) and the ion pressure for ion transport
@@ -367,6 +368,27 @@ velocity at the surface.
 
 ![Shot calibration](results/shot_fitting/shot_calibration_fit.png)
 
+### Open experimental data and benchmarks
+
+`sieve/experimental_suite.py` bundles open, citable experimental data and runs the solver against it:
+- **Bundled data:** copper (145 shots) and nickel (19 shots) shock Hugoniots, shock velocity against particle
+  velocity from plate impacts. They come from Marsh (ed.), *LASL Shock Hugoniot Data* (University of
+  California Press, 1980), as transcribed in LLNL's [BALSCD](https://github.com/llnl/BALSCD) repository (MIT
+  licence; its notice files sit next to the data in `sieve/data/experimental/`). Each file's SHA-256 is checked
+  on load.
+- **Benchmark:** `hugoniot_benchmark()` runs symmetric plate impacts with the solver and the generated Cu table
+  at a set of particle velocities, measures the shock speed from the front's motion, and reports RMS and
+  chi^2_nu against the data (the data carry no error bars, so a 2% sigma is assumed and stated).
+  `examples/shot_benchmark.py` writes `results/shot_benchmark/shot_benchmark_comparison.png` and `summary.json`:
+  10 impacts against 143 shots with Up <= 3 km/s, RMS 0.100 km/s (1.6%), chi^2_nu 0.64. The residuals show the model
+  Hugoniot slightly too shallow, 1-2% high below Up = 1 km/s and low above 2.5 km/s (its slope is a prediction;
+  only the ambient sound speed was fitted).
+
+![Cu Hugoniot benchmark](results/shot_benchmark/shot_benchmark_comparison.png)
+- **Not bundled:** no open pulsed-power shot data (B-dot, VISAR traces, x-ray core radii) in a machine-readable,
+  citable form were found, so none ship with the code. Your own traces load with `load_shot()` (CSV: t, value,
+  sigma) and compare with FCG / MagLIF runs through `sieve/validation.py` (`examples/experimental_shot_fitting.py`).
+
 ### Adaptive mesh refinement
 
 `sieve/amr.py` is a two-level, block-structured AMR for the 2D Cartesian solver (Berger-Colella style):
@@ -512,6 +534,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a T-junction of three patches keeps div B at 6e-15 (each shared corner takes the lowest-index patch's EMF once; corrected twice, as before, div B grew to 7e-3); CUDA-graph replay equals the eager run exactly; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
 | cylindrical3d | 3D (r, theta, z) with d/dtheta = 0 vs the 2D r-z solver (swirl, B_phi, B_z, z-dependent flow, the axis): 1.6e-14 after 30 steps; an m = 1 blob carried onto the axis along a uniform field: centroid error 3.4e-2 -> 1.4e-2 and field error 2.7e-2 -> 1.2e-2 from 16 x 24 to 32 x 48 cells, energy 4e-14, div B 2e-14 |
 | multigroup | one group = grey FLD (1e-8 at the solver tolerance); 8 grey groups sum to grey FLD in the thick limit (within the per-group limiter), energy to round-off; 12 Kramers groups with an edge relax to the Planck spectrum; decoupled groups diffuse with D_g = c / (3 rho kR_g) over three decades of D (peak within 2% of the exact Gaussian); 2D solver with an Al group table: gas + radiation energy to round-off |
+| experimental | Cu and Ni Hugoniot data load with verified checksums, a tampered file is refused; shot-trace CSV round trip; Cu plate impacts at 5 particle velocities follow the table's own Hugoniot to 0.3% (the flow solver adds no bias) and 143 Marsh shots (Up <= 3 km/s) to 1.8% RMS, chi^2_nu 0.82 for an assumed 2% error |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |

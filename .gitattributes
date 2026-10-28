@@ -4,3 +4,5 @@
 *.gif binary
 *.docx binary
 *.vti binary
+# bundled experimental data: keep byte-exact (checksums)
+sieve/data/experimental/*.csv -text
