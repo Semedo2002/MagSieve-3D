@@ -39,6 +39,12 @@
 #     (FLD; E_r is prolonged and restricted too). Gas + radiation energy stays conserved to round-off.
 # Scope: 2D Cartesian, constrained transport; viscosity, Nernst, two-temperature and optically thin radiation
 # are not coupled across levels yet and raise.
+#
+# Launch overhead: a fine sub-step of every patch (all three RK stages, the boundary registers, and the
+# post-step when it has no split diffusion) is recorded once as a CUDA graph and replayed, so a level with
+# tens of patches costs one graph launch per sub-step instead of tens of thousands of kernel launches from
+# Python. dt and the ghost-interpolation weights are device scalars, ghost frames live in persistent
+# buffers and the registers accumulate in place, so the same graph serves every sub-step until the next regrid.
 import dataclasses
 
 import numpy as np
@@ -57,13 +63,116 @@ def _check(cfg):
                                   "coupled across levels yet")
 
 
+# ------------------------------------------------------------------ kernels
+
+_KSRC = r"""
+extern "C" {
+// limited-linear prolongation (see prolong()): one thread per fine cell, all variables; Uc (nv, NX, NY),
+// out (nv, nfx, nfy); fine cell (fi, fj) lies in coarse array cell (i0 + ng + floor(xf), ...)
+__global__ void prolong2d(const double* __restrict__ Uc, double* __restrict__ out, const int nv, const int NX,
+                          const int NY, const int nfx, const int nfy, const int i0, const int j0, const int r,
+                          const int ng) {
+    long t = (long)blockDim.x * blockIdx.x + threadIdx.x;
+    if (t >= (long)nfx * nfy) return;
+    int fi = t / nfy, fj = t % nfy;
+    double xf = (fi - ng + 0.5) / r, yf = (fj - ng + 0.5) / r;
+    double fx = floor(xf), fy = floor(yf);
+    int ic = (int)fx + i0 + ng, jc = (int)fy + j0 + ng;
+    double ox = xf - fx - 0.5, oy = yf - fy - 0.5;
+    long nc = (long)NX * NY, k = (long)ic * NY + jc;
+    double rx = 1e300, ry = 1e300;
+    for (int v = 0; v < nv; v++) {
+        const double* C = Uc + v * nc;
+        double c0 = C[k];
+        double dm = c0 - C[k - NY], dp = C[k + NY] - c0, c = 0.5 * (dm + dp);
+        double mm = dm * dp > 0 ? (dm > 0 ? 1.0 : -1.0) * fmin(fabs(dm), fabs(dp)) : 0.0;
+        rx = fmin(rx, fabs(c) > 1e-300 ? mm / (c == 0 ? 1.0 : c) : 1.0);
+        dm = c0 - C[k - 1]; dp = C[k + 1] - c0; c = 0.5 * (dm + dp);
+        mm = dm * dp > 0 ? (dm > 0 ? 1.0 : -1.0) * fmin(fabs(dm), fabs(dp)) : 0.0;
+        ry = fmin(ry, fabs(c) > 1e-300 ? mm / (c == 0 ? 1.0 : c) : 1.0);
+    }
+    double px = fmin(fmax(rx, 0.0), 1.0), py = fmin(fmax(ry, 0.0), 1.0);
+    for (int v = 0; v < nv; v++) {
+        const double* C = Uc + v * nc;
+        double c0 = C[k];
+        double cx = 0.5 * (C[k + NY] - C[k - NY]), cy = 0.5 * (C[k + 1] - C[k - 1]);
+        out[v * (long)nfx * nfy + t] = c0 + (px * cx) * ox + (py * cy) * oy;
+    }
+}
+
+// ghost ring of A (nv, N0, N1) from the time-interpolated frames: (1 - th) Po + th Pn
+__global__ void ghost_ring(double* __restrict__ A, const double* __restrict__ Po, const double* __restrict__ Pn,
+                           const double* __restrict__ th_p, const int nv, const int N0, const int N1, const int ng) {
+    long t = (long)blockDim.x * blockIdx.x + threadIdx.x;
+    long n = (long)N0 * N1;
+    if (t >= n * nv) return;
+    long c = t % n;
+    int i = c / N1, j = c % N1;
+    if (i >= ng && i < N0 - ng && j >= ng && j < N1 - ng) return;
+    double th = th_p[0];
+    A[t] = (1.0 - th) * Po[t] + th * Pn[t];
+}
+}
+"""
+_KMOD = None
+
+
+def _kern(name):
+    global _KMOD
+    if _KMOD is None:
+        import cupy as cp
+        _KMOD = cp.RawModule(code=_KSRC)
+    return _KMOD.get_function(name)
+
+
+def _blocks(n):
+    return ((int(n) + 255) // 256,)
+
+
+def _ghost_ring(A, Po, Pn, th, ng):
+    """A's ghost ring from the frames at weight th (float or device scalar), in place, one launch"""
+    if xp.__name__ != "cupy" or not (A.flags.c_contiguous and Po.flags.c_contiguous and Pn.flags.c_contiguous):
+        G = (1.0 - th) * Po + th * Pn
+        A[:, :ng, :] = G[:, :ng, :]; A[:, -ng:, :] = G[:, -ng:, :]
+        A[:, :, :ng] = G[:, :, :ng]; A[:, :, -ng:] = G[:, :, -ng:]
+        return
+    thd = th if isinstance(th, xp.ndarray) else xp.full((), float(th))
+    nv, N0, N1 = A.shape
+    _kern("ghost_ring")(_blocks(A.size), (256,), (A, Po, Pn, thd, np.int32(nv), np.int32(N0), np.int32(N1),
+                                                np.int32(ng)))
+
+
 # ------------------------------------------------------------------ recording levels
 
 class _Recorder:
     """mixin: accumulate, weighted by the RK stage weights, the fluxes / vf terms / EMFs on the boundaries of
     the boxes in self._rec_boxes (coarse cell indices (i0, i1, j0, j1), interior numbering, faces k = 0..n)"""
 
+    def _rec_alloc(self, er=False):
+        """zeroed registers for the current boxes, so a graph can be recorded on the first step after a regrid"""
+        self._rec = []
+        for (i0, i1, j0, j1) in self._rec_boxes:
+            ri0, ri1, rj0, rj1 = (i0, i1, j0, j1) if self._rec_r == 0 else (0, self.cfg.nx, 0, self.cfg.ny)
+            L = [rj1 - rj0] * 2 + [ri1 - ri0] * 2
+            acc = {"F": [xp.zeros((NVAR, n)) for n in L], "u": [xp.zeros(n) for n in L],
+                   "ua": [xp.zeros(n) for n in L], "E": [xp.zeros(n + 1) for n in L]}
+            if er:
+                acc["Er"] = [xp.zeros(n) for n in L]
+            self._rec.append(acc)
+        self._stage = None
+
     def _rec_reset(self, boxes, ratio):
+        """new boxes: fresh registers; the same boxes again: zero them in place (graph replays write into them)"""
+        old = getattr(self, "_rec", None)
+        if old and all(a is not None for a in old) and list(boxes) == list(self._rec_boxes) \
+                and ratio == self._rec_r:
+            for acc in old:
+                for arrs in acc.values():
+                    for a in arrs:
+                        if a is not None:
+                            a.fill(0.0)
+            self._stage = None
+            return
         self._rec_boxes, self._rec_r = boxes, ratio
         self._rec = [None] * len(boxes)
         self._stage = None
@@ -126,7 +235,10 @@ class _Recorder:
                     acc["F"][m][var] += g
                 else:
                     acc.setdefault(key, [None] * 4)
-                    acc[key][m] = g.copy() if acc[key][m] is None else acc[key][m] + g
+                    if acc[key][m] is None:
+                        acc[key][m] = g.copy()
+                    else:
+                        acc[key][m] += g
 
     def _emf_hook(self, E):
         if getattr(self, "_rec_boxes", None) and self._stage is not None:
@@ -145,9 +257,24 @@ class _Recorder:
                 self._rec[k] = {key: [weight * a for a in st[key]] for key in st}
             else:
                 for key in st:
-                    for m, a in enumerate(st[key]):
-                        acc[key][m] = acc[key][m] + weight * a
+                    for a_acc, a in zip(acc[key], st[key]):
+                        _axpy(weight, a, a_acc)      # in place: a recorded graph replays into the same buffers
         self._stage = None
+
+
+_AXPY = None
+
+
+def _axpy(w, a, out):
+    """out += w a (w a float or a device scalar) in one launch"""
+    global _AXPY
+    if xp.__name__ != "cupy":
+        out += w * a
+        return
+    if _AXPY is None:
+        import cupy as cp
+        _AXPY = cp.ElementwiseKernel("raw float64 w, float64 a", "float64 y", "y += w[0] * a", "amr_axpy")
+    _AXPY(w if isinstance(w, xp.ndarray) else xp.full((), float(w)), a, out)
 
 
 class CoarseLevel(_Recorder, MHDSolver):
@@ -160,13 +287,26 @@ class FinePatch(_Recorder, MHDSolver):
     interpolated). gx0, gy0: global fine index of the first interior cell."""
 
     neighbours = ()
+    _th_d = None                                     # device ghost weights: RK stages 0, 1, 2 and the sub-step end
 
     def _set_ghost_source(self, P_old, P_new, t0, dtc, S=None, E=None):
         """coarse data prolonged onto this patch (with ghosts) before and after the coarse step: U, and the
-        stress S and radiation energy E_r frames when those are on"""
-        self._P_old, self._P_new, self._t0, self._dtc = P_old, P_new, t0, dtc
-        self._S_frames, self._E_frames = S, E
+        stress S and radiation energy E_r frames when those are on. Copied into persistent buffers (a recorded
+        graph reads those addresses)."""
+        def put(name, val):
+            cur = getattr(self, name, None)
+            if val is None or cur is None or cur.shape != val.shape:
+                setattr(self, name, val)
+            else:
+                cur[...] = val
+        put("_P_old", P_old); put("_P_new", P_new)
+        for nm, fr in (("_S", S), ("_E", E)):
+            put(nm + "_old", None if fr is None else fr[0]); put(nm + "_new", None if fr is None else fr[1])
+        self._S_frames = None if S is None else (self._S_old, self._S_new)
+        self._E_frames = None if E is None else (self._E_old, self._E_new)
+        self._t0, self._dtc = t0, dtc
         self._k = 0
+
 
     def _ghost_fill(self, A, frames, cur, interior_only=False):
         """ghost-inclusive array of a field from the coarse frames at the current theta, with touching patches'
@@ -189,10 +329,17 @@ class FinePatch(_Recorder, MHDSolver):
     def _halo(self, A):
         """ghost cells of the stress array (compute_rhs calls this after the domain boundary fill)"""
         if getattr(self, "_S_frames", None) is not None and A is not None and A.shape == self.S.shape:
-            A[...] = self._ghost_fill(A, self._S_frames, "_cur_S")
+            _ghost_ring(A, self._S_frames[0], self._S_frames[1], getattr(self, "_theta", 1.0), self.ng)
+            for o in self.neighbours:
+                ov = self._ov(o, 0, 0)
+                if ov is not None:
+                    A[(slice(None),) + ov[0]] = o._cur_S[(slice(None),) + ov[1]]
 
     def _post_step(self, dt):
-        self._theta = (self.t + dt - self._t0) / self._dtc     # end of this sub-step: the split steps' ghosts
+        if self._th_d is not None:                   # end of this sub-step: the split steps' ghosts
+            self._theta = self._th_d[3]
+        else:
+            self._theta = (self.t + dt - self._t0) / self._dtc
         self.apply_bc(self.U)
         super()._post_step(dt)
 
@@ -213,9 +360,12 @@ class FinePatch(_Recorder, MHDSolver):
                 (1, "hi"): {"E": G[I, ng + ny][:, None], "v": vy[I, ng + ny][:, None]}}
 
     def compute_rhs(self, U, out=None, Bf=None, dBf=None, S=None, dS=None):
-        ts = (0.0, self.dt, 0.5 * self.dt)[self._k % 3]
+        if self._th_d is not None:
+            self._theta = self._th_d[self._k % 3]
+        else:
+            ts = (0.0, self.dt, 0.5 * self.dt)[self._k % 3]
+            self._theta = (self.t + ts - self._t0) / self._dtc
         self._k += 1
-        self._theta = (self.t + ts - self._t0) / self._dtc
         return super().compute_rhs(U, out, Bf, dBf, S, dS)
 
     def _overlaps(self, o, sx, sy):
@@ -232,20 +382,19 @@ class FinePatch(_Recorder, MHDSolver):
                        ((lo[0], hi[0], self.gx0 - ng, o.gx0), (lo[1], hi[1], self.gy0 - ng, o.gy0)))
         return mine, theirs
 
+    def _ov(self, o, sx, sy):
+        key = (id(o), sx, sy)
+        c = self.__dict__.setdefault("_ov_cache", {})
+        if key not in c:
+            c[key] = self._overlaps(o, sx, sy)
+        return c[key]
+
     def apply_bc(self, U):
-        th = getattr(self, "_theta", 1.0)
-        G = (1.0 - th) * self._P_old + th * self._P_new
-        ng = self.ng
-        U[:, :ng, :] = G[:, :ng, :]
-        U[:, -ng:, :] = G[:, -ng:, :]
-        U[:, :, :ng] = G[:, :, :ng]
-        U[:, :, -ng:] = G[:, :, -ng:]
-        keep = U[:, ng:-ng, ng:-ng].copy()
-        for o in self.neighbours:                    # fine data from touching patches, same stage
-            ov = self._overlaps(o, 0, 0)
+        _ghost_ring(U, self._P_old, self._P_new, getattr(self, "_theta", 1.0), self.ng)
+        for o in self.neighbours:                    # fine data from touching patches, same stage (it lands in
+            ov = self._ov(o, 0, 0)                   # the ghost ring only: patch interiors never overlap)
             if ov is not None:
                 U[(slice(None),) + ov[0]] = o._cur_U[(slice(None),) + ov[1]]
-        U[:, ng:-ng, ng:-ng] = keep
         return U
 
     def _ghost_faces(self, Bf, U):
@@ -254,7 +403,7 @@ class FinePatch(_Recorder, MHDSolver):
         keep = [Bf[0][ng:ng + nx + 1, ng:ng + ny].copy(), Bf[1][ng:ng + nx, ng:ng + ny + 1].copy()]
         for o in self.neighbours:
             for a, (sx, sy) in enumerate(((1, 0), (0, 1))):
-                ov = self._overlaps(o, sx, sy)
+                ov = self._ov(o, sx, sy)
                 if ov is not None:
                     Bf[a][ov[0]] = o._cur_F[a][ov[1]]
         Bf[0][ng:ng + nx + 1, ng:ng + ny] = keep[0]
@@ -310,20 +459,40 @@ class FinePatch(_Recorder, MHDSolver):
 
 # ------------------------------------------------------------------ prolongation, vector potential
 
+_PROLONG_IDX = {}
+
+
+def _prolong_index(i0, j0, nxf, nyf, r, ng):
+    """device index / offset arrays of prolong(), cached (they were re-uploaded on every call)"""
+    key = (i0, j0, nxf, nyf, r, ng)
+    if key not in _PROLONG_IDX:
+        if len(_PROLONG_IDX) > 4096:
+            _PROLONG_IDX.clear()
+        xf = (np.arange(nxf + 2 * ng) - ng + 0.5) / r       # fine centres in coarse-cell units from the box origin
+        yf = (np.arange(nyf + 2 * ng) - ng + 0.5) / r
+        ic = np.floor(xf).astype(int) + i0 + ng             # coarse array index (ghost-inclusive)
+        jc = np.floor(yf).astype(int) + j0 + ng
+        lo_i, hi_i, lo_j, hi_j = ic.min() - 1, ic.max() + 2, jc.min() - 1, jc.max() + 2
+        _PROLONG_IDX[key] = (xp.asarray(xf - np.floor(xf) - 0.5)[:, None], xp.asarray(yf - np.floor(yf) - 0.5)[None, :],
+                             (lo_i, hi_i, lo_j, hi_j), xp.asarray(ic - lo_i)[:, None], xp.asarray(jc - lo_j)[None, :])
+    return _PROLONG_IDX[key]
+
+
 def prolong(Uc, i0, j0, nxf, nyf, r, ng):
     """conservative limited-linear prolongation of the coarse conserved array (with ghosts) onto a fine array of
     nxf x nyf interior cells (+ ng ghosts) starting at coarse interior cell (i0, j0); one limiter factor per
-    coarse cell for all variables, so linear relations between them survive"""
-    nfx, nfy = nxf + 2 * ng, nyf + 2 * ng
-    xf = (np.arange(nfx) - ng + 0.5) / r                    # fine centres in coarse-cell units from the box origin
-    yf = (np.arange(nfy) - ng + 0.5) / r
-    ic = np.floor(xf).astype(int) + i0 + ng                 # coarse array index (ghost-inclusive)
-    jc = np.floor(yf).astype(int) + j0 + ng
-    ox = xp.asarray(xf - np.floor(xf) - 0.5)[:, None]
-    oy = xp.asarray(yf - np.floor(yf) - 0.5)[None, :]
-    lo_i, hi_i, lo_j, hi_j = ic.min() - 1, ic.max() + 2, jc.min() - 1, jc.max() + 2
+    coarse cell for all variables, so linear relations between them survive. One kernel launch on the GPU."""
+    if xp.__name__ == "cupy":
+        Uc = xp.ascontiguousarray(Uc)
+        nv, NX, NY = Uc.shape
+        nfx, nfy = nxf + 2 * ng, nyf + 2 * ng
+        out = xp.empty((nv, nfx, nfy))
+        _kern("prolong2d")(_blocks(nfx * nfy), (256,), (Uc, out, np.int32(nv), np.int32(NX), np.int32(NY),
+                                                       np.int32(nfx), np.int32(nfy), np.int32(i0), np.int32(j0),
+                                                       np.int32(r), np.int32(ng)))
+        return out
+    ox, oy, (lo_i, hi_i, lo_j, hi_j), I, J = _prolong_index(i0, j0, nxf, nyf, r, ng)
     C = Uc[:, lo_i:hi_i, lo_j:hi_j]
-    ii, jj = ic - lo_i, jc - lo_j
 
     def slopes(C, ax):
         f = C.shape[1 + ax]
@@ -338,7 +507,6 @@ def prolong(Uc, i0, j0, nxf, nyf, r, ng):
         out[tuple(mid)] = phi[None] * c
         return out
     Sx, Sy = slopes(C, 0), slopes(C, 1)
-    I, J = xp.asarray(ii)[:, None], xp.asarray(jj)[None, :]
     return C[:, I, J] + Sx[:, I, J] * ox + Sy[:, I, J] * oy
 
 
@@ -368,6 +536,7 @@ class AMRParams:
     max_patches: int = 64
     efficiency: float = 0.7                          # split boxes filled less than this
     region: object = None                            # optional callable(coarse solver) -> host bool mask (interior)
+    graphs: bool = True                              # record the fine sub-step as a CUDA graph
 
 
 class AMR:
@@ -385,6 +554,10 @@ class AMR:
         self.patches, self.boxes = [], []
         self.t, self.step = 0.0, 0
         self.fine_cell_steps = 0
+        self._dt_d, self._th_d = xp.zeros(()), xp.zeros(4)    # fine dt and ghost weights, read by the patches
+        self._cdt_d = xp.zeros(())
+        self._graphs, self._warm = {}, set()
+        self.graph_launches = {}                     # replays per graph kind (diagnostic)
 
     # -- setup
     def set_state(self, U):
@@ -518,6 +691,8 @@ class AMR:
         A_z interpolated, old fine A_z offset-matched into the old patches), so every new patch, and two that
         touch, gets divergence-free faces that agree on shared edges and sum to the coarse face fluxes."""
         boxes = self.cluster(self.flags()) if boxes is None else boxes
+        if [tuple(b_) for b_ in boxes] == self.boxes and self.patches:
+            return                                   # same boxes: keep the patches (and their recorded graphs)
         old = list(zip(self.boxes, self.patches))
         s, r, ng = self.coarse, self.p.ratio, self.coarse.ng
         nx, ny = s.cfg.nx, s.cfg.ny
@@ -578,18 +753,29 @@ class AMR:
         for f, bf in zip(new, boxes):                # touching or close: within a ghost layer of each other
             f.neighbours = [o for o, bo in zip(new, boxes) if o is not f and bo[0] <= bf[1] and bf[0] <= bo[1]
                             and bo[2] <= bf[3] and bf[2] <= bo[3]]
+        for k, f in enumerate(new):
+            f._th_d = self._th_d
+            f._rec_alloc(self.cfg.fld)
         self.boxes, self.patches = [tuple(b_) for b_ in boxes], new
         s._rec_reset(self.boxes, 0)
+        s._rec_alloc(self.cfg.fld)
+        # corners on several patch boundaries: the lower-index patch owns them (EMF correction in _sync)
+        setc = np.zeros((nx + 1, ny + 1), bool)
+        self._emf_free = []
+        for (i0, i1, j0, j1) in self.boxes:
+            masks = []
+            for ksl, lsl in ((i0, slice(j0, j1 + 1)), (i1, slice(j0, j1 + 1)), (slice(i0, i1 + 1), j0),
+                             (slice(i0, i1 + 1), j1)):
+                masks.append(xp.asarray(~setc[ksl, lsl]))
+                setc[ksl, lsl] = True
+            self._emf_free.append(masks)
+        self._graphs = {}                            # new patches: record new graphs
 
     # -- time stepping
     def compute_dt(self):
         s = self.coarse
         dt = s.compute_dt(cons_to_prim(s.U, s.eos))
-        for f in self.patches:
-            (Po, Pn), Sf, Ef = self._ghost_frames(f)
-            f._set_ghost_source(Po, Pn, self.t, 1.0, Sf, Ef)
-            f._theta = 0.0
-            f.apply_bc(f.U)
+        for f in self.patches:                       # ghost cells hold the last sub-step's values: fine for dt
             dt = min(dt, self.p.ratio * f.compute_dt(cons_to_prim(f.U, f.eos)))
         return dt
 
@@ -614,7 +800,7 @@ class AMR:
         old = (s.U.copy(), s.S.copy() if s.strength else None, self._padded_Er())
         s._rec_reset(self.boxes, 0)
         s.dt = dt
-        s.step_ssprk3()
+        self._coarse_step(dt)
         s.t += dt
         s.step += 1
         P = self.patches
@@ -622,17 +808,17 @@ class AMR:
             (Po, Pn), Sf, Ef = self._ghost_frames(f, old)
             f._set_ghost_source(Po, Pn, self.t, dt, Sf, Ef)
             f._rec_reset([self.boxes[k]], r)
+        h = dt / r
+        post_in_graph = not (self.cfg.cond_kappa0 > 0 or self.cfg.fld)   # split diffusion decides on the host
+        self._dt_d.fill(h)
         for m in range(r):                           # all patches take each RK stage together
+            t1 = self.t + m * h
+            self._th_d.set(np.array([t1 - self.t, t1 + h - self.t, t1 + 0.5 * h - self.t, t1 + h - self.t]) / dt)
+            self._fine_substep(P, post_in_graph)
             for f in P:
-                f.rk_begin(dt / r)
-            for k in range(3):
-                for f in P:
-                    f.stage_rhs(k)
-                for f in P:
-                    f.stage_update(k)
-            for f in P:
-                f._post_step(dt / r)
-                f.t += dt / r
+                if not post_in_graph:
+                    f._post_step(h)
+                f.t += h
                 f.step += 1
         for f in P:
             f._theta = 1.0
@@ -644,14 +830,66 @@ class AMR:
         if self.p.regrid_every and self.step % self.p.regrid_every == 0:
             self.regrid()
 
+    def _coarse_step(self, dt):
+        """the coarse SSP-RK3 core with its recording hooks, as a CUDA graph like the fine sub-step (eager
+        right after a regrid, then recorded and replayed); the split post-step runs eagerly"""
+        s = self.coarse
+        s._glm_ch_frozen = s.cfg.glm_ch
+        s._ct_sync()
+        self._cdt_d.fill(dt)
+        self._graphed("coarse", lambda: s._rk_core(self._cdt_d))
+        s._post_step(dt)
+
+    def _graphed(self, name, fn):
+        """run fn as a CUDA graph: recorded on first use after a regrid (the very first call of each kind runs
+        eagerly, so kernels are compiled and buffers exist), replayed afterwards; eager without CuPy or patches"""
+        if not (self.p.graphs and xp.__name__ == "cupy" and self.patches):
+            return fn()
+        if name not in self._warm:
+            self._warm.add(name)
+            return fn()
+        import cupy as cp
+        if name not in self._graphs:
+            pool, stream = cp.cuda.MemoryPool(), cp.cuda.Stream(non_blocking=True)
+            cp.cuda.Device().synchronize()
+            with cp.cuda.using_allocator(pool.malloc), stream:
+                stream.begin_capture()
+                fn()
+                self._graphs[name] = (stream.end_capture(), stream, pool)
+        g, stream, _ = self._graphs[name]
+        self.graph_launches[name] = self.graph_launches.get(name, 0) + 1
+        cp.cuda.Device().synchronize()
+        g.launch(stream=stream)
+        stream.synchronize()
+
+    def _fine_core(self, P, post):
+        for f in P:
+            f.rk_begin(self._dt_d)
+        for k in range(3):
+            for f in P:
+                f.stage_rhs(k)
+            for f in P:
+                f.stage_update(k)
+        if post:
+            for f in P:
+                f._post_step(self._dt_d)
+
+    def _fine_substep(self, P, post):
+        """one fine sub-step of every patch, as one recorded graph (the registers accumulate in place)"""
+        self._graphed("fine" + ("+post" if post else ""), lambda: self._fine_core(P, post))
+
     def _sync(self):
+        """synchronisation after the fine sub-steps (_sync_core), as one recorded graph"""
+        self._graphed("sync", self._sync_core)
+
+    def _sync_core(self):
         s, r, ng = self.coarse, self.p.ratio, self.coarse.ng
         dx, dy = s.cfg.dx, s.cfg.dy
         nx, ny = s.cfg.nx, s.cfg.ny
         dU = xp.zeros_like(s.U)
         dEr = None if s.Er is None else xp.zeros_like(s.Er)
         dEc = xp.zeros((nx + 1, ny + 1))
-        setc = np.zeros((nx + 1, ny + 1), bool)    # corners already corrected by a lower-index patch (owner)
+        a_c = cons_to_prim(s.U, s.eos)[iCLR]
         for k, (box, f) in enumerate(zip(self.boxes, self.patches)):
             i0, i1, j0, j1 = box
             C, Fr = s._rec[k], f._rec[0]
@@ -662,7 +900,6 @@ class AMR:
             du = [agg(Fr["u"][m]) - C["u"][m] for m in range(4)]
             dua = [agg(Fr["ua"][m]) - C["ua"][m] for m in range(4)]
             rows, cols = slice(ng + j0, ng + j1), slice(ng + i0, ng + i1)
-            a_c = cons_to_prim(s.U, s.eos)[iCLR]
             # reflux: left (outside cell's high face), right (low face), bottom, top
             for m, (ci, cj, sign, h) in enumerate(((ng + i0 - 1, rows, -1, dx), (ng + i1, rows, +1, dx),
                                                    (cols, ng + j0 - 1, -1, dy), (cols, ng + j1, +1, dy))):
@@ -675,9 +912,7 @@ class AMR:
             # EMF correction on the boundary corners (fine corners every r-th, time-weighted)
             for m, (ksl, lsl) in enumerate(((i0, slice(j0, j1 + 1)), (i1, slice(j0, j1 + 1)),
                                             (slice(i0, i1 + 1), j0), (slice(i0, i1 + 1), j1))):
-                free = xp.asarray(~setc[ksl, lsl])
-                dEc[ksl, lsl] = xp.where(free, Fr["E"][m][::r] - C["E"][m], dEc[ksl, lsl])
-                setc[ksl, lsl] = True
+                dEc[ksl, lsl] = xp.where(self._emf_free[k][m], Fr["E"][m][::r] - C["E"][m], dEc[ksl, lsl])
         dU[BX:BZ] = 0.0                              # in-plane B lives on the faces (B_z is a cell variable: refluxed)
         s.U += dU
         if dEr is not None:
@@ -711,15 +946,17 @@ class AMR:
         """patches that touch: the lower-index one owns the shared faces and corners. The other one's cells next
         to the shared faces are refluxed with the owner's fluxes (and both tracer terms), and its faces get the
         owner's corner EMFs, so the two agree on the shared edge and both stay conservative and divergence-free.
-        Patches touching at a single corner share only that corner's EMF."""
+        Patches touching at a single corner share only that corner's EMF. A corner on the boundary of several
+        patches (a T-junction, or four patches meeting) takes the EMF of the lowest-index one, once: corrected
+        twice, a patch's faces there would no longer match its neighbours' and the coarse divergence would grow."""
         r, ng = self.p.ratio, self.coarse.ng
         bx = self.boxes
+        dEs, owned = {}, {}
         for a in range(len(bx)):
             for b in range(a + 1, len(bx)):
                 A, B = bx[a], bx[b]
                 fA, fB = self.patches[a], self.patches[b]
                 RA, RB = fA._rec[0], fB._rec[0]
-                dE = None
                 # (owner side, other side, other's cell index along the normal, sign, h, axis of the edge)
                 for sa, sb, ax in ((1, 0, 0), (0, 1, 0), (3, 2, 1), (2, 3, 1)):
                     line_a = (A[1] if sa == 1 else A[0]) if ax == 0 else (A[3] if sa == 3 else A[2])
@@ -747,27 +984,43 @@ class AMR:
                         else:
                             ci = slice(ng + fb0, ng + fb0 + nf)
                             cj = ng if sb == 2 else ng + nyB - 1
-                        a_c = cons_to_prim(fB.U, fB.eos)[iCLR][ci, cj]
+                        Ue = fB.U[:, ci, cj]
+                        a_c = Ue[RHOC] if fB._vf else Ue[RHOC] / xp.maximum(Ue[RHO], 1e-300)
                         fB.U[:, ci, cj] += sign * dF / h
                         fB.U[RHOC, ci, cj] += sign * (dua - a_c * du) / h
                         if "Er" in RA and "Er" in RB:
                             ei = ci - ng if isinstance(ci, int) else slice(ci.start - ng, ci.stop - ng)
                             ej = cj - ng if isinstance(cj, int) else slice(cj.start - ng, cj.stop - ng)
                             fB.Er[ei, ej] += sign * (RA["Er"][sa][fa0:fa0 + nf] - RB["Er"][sb][fb0:fb0 + nf]) / h
-                    # shared corners: B's faces get the owner's EMFs
-                    if dE is None:
-                        dE = xp.zeros((nxB + 1, nyB + 1))
-                    eA = RA["E"][sa][fa0:fa0 + nf + 1]
-                    eB = RB["E"][sb][fb0:fb0 + nf + 1]
-                    if ax == 0:
-                        dE[0 if sb == 0 else nxB, fb0:fb0 + nf + 1] = eA - eB
-                    else:
-                        dE[fb0:fb0 + nf + 1, 0 if sb == 2 else nyB] = eA - eB
-                if dE is not None:
-                    nxB, nyB = fB.cfg.nx, fB.cfg.ny
-                    fB.Bf[0][ng:ng + nxB + 1, ng:ng + nyB] += -(dE[:, 1:] - dE[:, :-1]) / fB.cfg.dy
-                    fB.Bf[1][ng:ng + nxB, ng:ng + nyB + 1] += (dE[1:, :] - dE[:-1, :]) / fB.cfg.dx
-                    ct.cells_from_faces(fB.U, fB.Bf, (slice(ng, ng + nxB), slice(ng, ng + nyB)))
+                    # shared corners: B's faces get the owner's EMFs (corners not already owned by a lower patch;
+                    # the ownership is host bookkeeping, fixed by the boxes, so this also records into a graph)
+                    if b not in dEs:
+                        dEs[b], owned[b] = xp.zeros((nxB + 1, nyB + 1)), np.zeros((nxB + 1, nyB + 1), bool)
+                    line = (0 if sb == 0 else nxB) if ax == 0 else (0 if sb == 2 else nyB)
+                    idx = (line, slice(fb0, fb0 + nf + 1)) if ax == 0 else (slice(fb0, fb0 + nf + 1), line)
+                    free = ~owned[b][idx]
+                    k = 0
+                    while k <= nf:                   # contiguous runs of free corners
+                        if not free[k]:
+                            k += 1
+                            continue
+                        k1 = k
+                        while k1 <= nf and free[k1]:
+                            k1 += 1
+                        run = slice(fb0 + k, fb0 + k1)
+                        d = RA["E"][sa][fa0 + k:fa0 + k1] - RB["E"][sb][fb0 + k:fb0 + k1]
+                        if ax == 0:
+                            dEs[b][line, run] = d
+                        else:
+                            dEs[b][run, line] = d
+                        k = k1
+                    owned[b][idx] = True
+        for b, dE in dEs.items():
+            fB = self.patches[b]
+            nxB, nyB = fB.cfg.nx, fB.cfg.ny
+            fB.Bf[0][ng:ng + nxB + 1, ng:ng + nyB] += -(dE[:, 1:] - dE[:, :-1]) / fB.cfg.dy
+            fB.Bf[1][ng:ng + nxB, ng:ng + nyB + 1] += (dE[1:, :] - dE[:-1, :]) / fB.cfg.dx
+            ct.cells_from_faces(fB.U, fB.Bf, (slice(ng, ng + nxB), slice(ng, ng + nyB)))
 
     # -- diagnostics
     def totals(self):

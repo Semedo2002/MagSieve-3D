@@ -39,7 +39,7 @@ def _pack(eos):
     base = eos.base if tab else eos
     if not isinstance(base, EOS) or base.fuel.kind not in ("ideal", "stiffened"):
         return None
-    P = np.zeros(24)
+    P = np.zeros(28)
     P[0], P[1] = _const_phis(base.fuel)
     if tab:
         P[4] = 2
@@ -87,8 +87,8 @@ def evaluate(eos, mode, rho, y, a):
     if d is None:
         return None
     shape = cp.broadcast(*[v for v in ins if v is not None]).shape
-    X, Y, A = (cp.ascontiguousarray(cp.broadcast_to(cp.asarray(0.0 if v is None else v, dtype=cp.float64), shape))
-               for v in ins)
+    X, Y, A = (cp.zeros(shape) if v is None else
+               cp.ascontiguousarray(cp.broadcast_to(cp.asarray(v, dtype=cp.float64), shape)) for v in ins)
     out = cp.empty(shape)
     n = out.size
     if n:

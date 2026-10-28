@@ -289,10 +289,26 @@ radiation are not coupled across levels yet (they raise).
 t = 0.2 three ways: uniform 128^2 (15.6 um cells), uniform 512^2 (3.9 um) and AMR 128^2 + ratio-4 patches.
 The AMR run resolves the instability fingers and spikes that the coarse run washes out (density error against
 the 512^2 run 0.40 vs 0.62 for the coarse run; core radius 0.326 between coarse 0.272 and fine 0.365), using
-44% of the fine cells on average with up to about 20 patches, energy to 7e-14 and div B at round-off. It is not
-faster here: 3270 s against 635 s for the uniform 512^2 run, because the patches step stage by stage from
-Python and on a Quadro P1000 that launch overhead outweighs the saved cells. On this hardware AMR buys
-resolution a uniform grid cannot hold in memory, not speed.
+44% of the fine cells on average with up to about 20 patches, energy to 7e-14 and div B at round-off, in 232 s against
+273 s for the uniform 512^2 run on a Quadro P1000.
+
+Launch overhead: the coarse step, a fine sub-step of every patch together (three RK stages, the flux registers and
+the post-step) and the synchronisation are each recorded once as a CUDA graph and replayed until the next regrid
+(dt and the ghost time-interpolation weights are device scalars, ghost frames sit in persistent buffers, the
+registers accumulate in place, and a regrid that returns the same boxes keeps the patches). Prolongation is one
+kernel, and so are the ghost-ring fill and the register updates. The replay matches the eager code bit for bit.
+Before this the patches stepped stage by stage from Python and the same AMR run took 3270 s.
+`examples/amr_localized_benchmark.py` times localized problems against the uniform fine grid:
+
+| problem | fine cells | AMR | uniform fine | density L1 vs fine (coarse / AMR) |
+|---|---|---|---|---|
+| Mach-3 shock on a dense bubble, 256 x 128 + ratio 4 vs 1024 x 512 | 8% | 217 s | 371 s | 0.032 / 0.020 |
+| liner implosion, refining only the fuel, 128^2 + ratio 4 vs 512^2 | 8% | 69 s | 111 s | 0.53 / 0.41 |
+| liner implosion, refining liner, shocks and core (above) | 44% | 232 s | 273 s | 0.62 / 0.40 |
+
+The remaining cost per fine cell is still about twice a uniform grid's (each patch is its own set of kernels:
+with tens of patches the graph holds tens of thousands of small nodes), so AMR pays off when the refined region
+is a modest fraction of the domain.
 
 ![AMR implosion](results/amr_implosion/amr_implosion.png)
 
@@ -369,7 +385,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | render3d | 3D snapshots to .vti/.pvd and .h5 and back exactly; off-screen PyVista renders and an MP4 (skipped without pyvista) |
 | tabular | SESAME ASCII 301/502/505 write and read back (1e-15); an ideal-gas table reproduces the ideal-gas Sod tube to 1e-13; a Mie-Gruneisen Al table reproduces the analytic 2 km/s impact (shocked p 17.998 vs 17.998 GPa, fields to 2e-4) and p(e) stays continuous into the fallback; the device EOS matches the array EOS on 160k random states (blend band, mixed, off-table) to 3e-10 and over the impact run to 1e-14; FLD with tabulated opacities matches the power laws to 2e-11 |
 | validation | analytic signals with known noise: chi^2_nu of the true model 1.001, RMS 1.000 sigma; a 37 ns delay recovered by the cross-correlation offset and the fitted shift to 0.5 ns; a 1-parameter scan recovers the amplitude with the Fisher sigma; CSV round trip |
-| amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
+| amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a T-junction of three patches keeps div B at 6e-15 (each shared corner takes the lowest-index patch's EMF once; corrected twice, as before, div B grew to 7e-3); CUDA-graph replay equals the eager run exactly; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
 | amr_physics | resistive, conduction, FLD and strength each with three touching patches moving every 4 steps: conservation 5e-16 to 8e-16 (1e-7 to 3e-4 with the new registers off), div B at round-off; a feature inside one patch matches a uniform fine run to 1e-3 to 1e-4 of the coarse run's L1 error |
 
 ## Reproducing the study

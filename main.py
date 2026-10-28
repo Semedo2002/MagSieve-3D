@@ -1886,6 +1886,42 @@ def amr_test():
     print(f"  three touching patches (edge and corner), 24 steps: mass/momentum/energy {cons:.1e}, div B {div:.1e}, "
           f"shared-edge faces agree to {seam:.1e}  [{'PASS' if good else 'FAIL'}]")
 
+    # (1b') a T-junction: the top corners of two side-by-side patches lie on the bottom edge of a third, so that
+    # corner is shared by three patches (the coarse divergence once grew there, step after step)
+    a = AMR(box(64), AMRParams(ratio=4, regrid_every=0))
+    with contextlib.redirect_stdout(io.StringIO()):
+        U = state(MHDSolver(box(64)), ot)
+    a.set_state(U)
+    a.regrid([(12, 24, 12, 32), (24, 36, 18, 32), (16, 44, 32, 44)])
+    T0, div = a.totals(), 0.0
+    for _ in range(60):
+        a.advance(a.compute_dt())
+        div = max(div, a.div_b())
+    T1 = a.totals()
+    cons = max(abs(T1[k] - T0[k]) / max(abs(T0[k]), abs(T0["E"])) for k in ("mass", "mx", "my", "E"))
+    good = cons < 1e-12 and div < 1e-12
+    ok = ok and good
+    print(f"  T-junction of three patches, 60 steps: mass/momentum/energy {cons:.1e}, div B (both levels) {div:.1e}  "
+          f"[{'PASS' if good else 'FAIL'}]")
+
+    # (1c) the recorded CUDA graphs (coarse step, fine sub-step, synchronisation) replay exactly what the eager
+    # code computes, through regrids
+    runs = []
+    for graphs in (False, True):
+        a = AMR(box(64), AMRParams(ratio=4, regrid_every=4, tol_rho=0.15, tol_p=0.3, margin=3, graphs=graphs))
+        with contextlib.redirect_stdout(io.StringIO()):
+            U = state(MHDSolver(box(64)), ot)
+        a.set_state(U)
+        a.regrid()
+        for _ in range(12):
+            a.advance(a.compute_dt())
+        runs.append((a.composite(iRHO), a.composite(iBX), a.graph_launches))
+    dg = max(float(np.max(np.abs(runs[1][k] - runs[0][k]))) for k in (0, 1))
+    good = dg == 0.0 and len(runs[1][2]) == 3
+    ok = ok and good
+    print(f"  CUDA-graph replay vs eager, 12 steps with regrids: max difference {dg:.1e} (replays: "
+          f"{', '.join(f'{k} {v}' for k, v in sorted(runs[1][2].items()))})  [{'PASS' if good else 'FAIL'}]")
+
     # (2) material interface across coarse-fine boundaries at uniform p, u
     mm = dict(B_transverse=0.0, material_tracer="volume_fraction", gamma=1.4, eos_liner="stiffened", gamma_liner=4.4,
               p_inf_liner=6.0)
