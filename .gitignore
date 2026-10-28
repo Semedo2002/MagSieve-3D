@@ -12,3 +12,6 @@ results/phase1_checks/
 results/phase2_checks/
 results/phase3_checks/
 results/shot_fitting/runs/
+
+# generated material tables (python tools/generate_sesame.py)
+tables/

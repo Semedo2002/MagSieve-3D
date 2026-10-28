@@ -2334,6 +2334,110 @@ def ion_transport_test():
     return ok
 
 
+def sesame_test():
+    """Material tables from tools/generate_sesame.py (Al, Cu, D-T, Au, Pb; free-energy model, no LANL data):
+    (1) every table loads into the solver's tabular EOS (p and e increasing in T) and Al survives a SESAME ASCII
+    (301 / 502 / 505) round trip; (2) metals: p(rho0, 300 K) = 0 and the ambient sound speed at the measured bulk
+    value (both are fitted: the cold reference density and K0); (3) independently, the principal Hugoniot within 5%
+    of the measured Us-up fits at up = 1, 2, 3 km/s;
+    (4) fully ionized hot plasma (D-T, Al) gives p = (1 + Z) rho k T / m within 1%, and kappa_R its Thomson floor;
+    (5) thermodynamic consistency de/drho|_T = (p - T dp/dT|_rho) / rho^2 at random states; (6) the tabular EOS
+    p(rho, e) against the model at random in-table states."""
+    import tempfile
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
+    import generate_sesame as gs
+    from sieve import tabular
+    from sieve.eos import Material
+    print("\n--- Generated material tables (tools/generate_sesame.py) ---"); sys.stdout.flush()
+    tmp = tempfile.mkdtemp(prefix="ses_")
+    ok = True
+    rng = np.random.default_rng(5)
+    with np.errstate(all="ignore"):
+        loaded, adj = [], 0.0
+        for name in gs.MATERIALS:
+            tab = gs.table(name, 50, 56)
+            adj = max(adj, tab.pop("adjust_max"))
+            gs.write(name, tab, tmp, sesame=(name == "al"))
+            d = tabular.load(os.path.join(tmp, f"{name}.npz"))
+            fb = Material("stiffened", 3.0, 1.0)
+            tabular.TabularMaterial(d, 1000.0, 1000.0, fb)
+            loaded.append(name)
+        back = tabular.load(os.path.join(tmp, "al.ses"))
+        ref = np.load(os.path.join(tmp, "al.npz"))
+        rt = max(float(np.max(np.abs(back[k] - ref[k]) / np.max(np.abs(ref[k])))) for k in ("p", "e", "kappa_R"))
+        good = len(loaded) == 5 and rt < 1e-12 and adj < 1e-4
+        ok = ok and good
+        print(f"  tables {', '.join(loaded)} load into the tabular EOS (largest monotonicity fix {adj:.1e} of a row); "
+              f"Al SESAME ASCII round trip {rt:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+        rows, worst_p, worst_c, worst_h = [], 0.0, 0.0, 0.0
+        for name in ("al", "cu", "au", "pb"):
+            m = gs.MATERIALS[name]
+            r0, T0 = np.array([m["rho0"]]), np.array([300.0])
+            p0, _, c2 = gs.thermo(m, r0, T0)
+            c0, sl = m["hug"]
+            H = gs.hugoniot(name, [1.0, 2.0, 3.0])
+            dh = float(np.max(np.abs(H[:, 0] - (c0 + sl * np.array([1.0, 2.0, 3.0]))) / (c0 + sl * np.array([1.0, 2.0, 3.0]))))
+            worst_p = max(worst_p, abs(p0[0]) / m["K0"])
+            worst_c = max(worst_c, abs(np.sqrt(c2[0]) / 1e3 / c0 - 1))
+            worst_h = max(worst_h, dh)
+            rows.append(f"{name} c_s {np.sqrt(c2[0]) / 1e3:.2f} ({c0}) Us(2) {H[1, 0]:.2f} ({c0 + 2 * sl:.2f})")
+        good = worst_p < 1e-9 and worst_c < 1e-3 and worst_h < 0.05
+        ok = ok and good
+        print(f"  ambient and Hugoniot (km/s, measured in brackets): {'; '.join(rows)}; |p(rho0, 300 K)| / K0 "
+              f"{worst_p:.0e}, sound speed (fitted) within {100 * worst_c:.1f}%, Hugoniot (not fitted) within {100 * worst_h:.1f}%  "
+              f"[{'PASS' if good else 'FAIL'}]")
+
+        lim = []
+        for name, rho, T in (("dt", 1.0, 1e7), ("al", 1.0, 1e8)):
+            m = gs.MATERIALS[name]
+            p, _ = gs.eos(m, np.array([rho]), np.array([T]))
+            ideal = (1 + m["Z"]) * rho * gs.KB * T / (m["A"] * gs.MU)
+            kR, _ = gs.opacities(m, np.array([1e-3]), np.array([1e9]))
+            th = 6.6524587e-29 * m["Z"] / (m["A"] * gs.MU)
+            lim.append((name, p[0] / ideal, kR[0] / th))
+        good = all(abs(a - 1) < 0.01 and abs(b - 1) < 0.02 for _, a, b in lim)
+        ok = ok and good
+        print(f"  fully ionized limit: p / ((1 + Z) rho k T / m) " + ", ".join(f"{n} {a:.4f}" for n, a, _ in lim)
+              + "; kappa_R / Thomson " + ", ".join(f"{n} {b:.4f}" for n, _, b in lim) + f"  [{'PASS' if good else 'FAIL'}]")
+
+        res = 0.0
+        for name in gs.MATERIALS:
+            m = gs.MATERIALS[name]
+            r = m["rho0"] * 10**rng.uniform(-3, 1.3, 40)
+            T = 10**rng.uniform(np.log10(m["T"][0]) + 0.5, 7.5, 40)
+            h = 1e-3
+            p, e = gs.eos(m, r, T)
+            er = (gs.eos(m, r * (1 + h), T)[1] - gs.eos(m, r * (1 - h), T)[1]) / (2 * h * r)
+            pT = (gs.eos(m, r, T * (1 + h))[0] - gs.eos(m, r, T * (1 - h))[0]) / (2 * h * T)
+            scale = (np.abs(p) + T * np.abs(pT)) / r**2
+            res = max(res, float(np.max(np.abs(er - (p - T * pT) / r**2) / scale)))
+        good = res < 1e-4
+        ok = ok and good
+        print(f"  thermodynamic consistency, 200 random states: largest residual {res:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+        m = gs.MATERIALS["al"]
+        tab = gs.table("al", 300, 160, opacity=False)
+        tab.pop("adjust_max")
+        tm = tabular.TabularMaterial(tab, 1000.0, 1000.0, Material("stiffened", 3.0, 1.0))
+        errs = {}
+        for region, (lr, lT) in (("compressed (rho0-10 rho0, 1e3-1e7 K)", ((0.0, 1.0), (3.0, 7.0))),
+                                 ("hot (0.01-10 rho0, 2e4-1e7 K)", ((-2.0, 1.0), (4.3, 7.0))),
+                                 ("expanded liquid-vapour (0.01-1 rho0, 1e3-2e4 K)", ((-2.0, 0.0), (3.0, 4.3)))):
+            r = m["rho0"] * 10**rng.uniform(*lr, 300)
+            T = 10**rng.uniform(*lT, 300)
+            p, e = gs.eos(m, r, T)
+            pt = to_numpy(tm.pressure(xp.asarray(r / 1000.0), xp.asarray(e / 1e6))) * 1e9
+            errs[region] = np.abs(pt - p) / (np.abs(p) + 1e-3 * m["K0"])
+        single = np.concatenate([v for k, v in errs.items() if not k.startswith("expanded")])
+        good = float(np.median(single)) < 2e-3 and float(np.max(single)) < 3e-2
+        ok = ok and good
+        print(f"  tabular p(rho, e) vs the model, Al 300 x 160 table, 300 random states per region (error relative to "
+              f"|p| + 1e-3 K0): " + "; ".join(f"{k} median {np.median(v):.1e}, largest {np.max(v):.1e}" for k, v in errs.items())
+              + f" (the last, where tension and thermal pressure cancel, is reported, not tested)  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 VERIFICATION_TESTS = {
     "brio_wu": brio_wu_test,
     "alfven": alfven_convergence_test,
@@ -2372,6 +2476,7 @@ VERIFICATION_TESTS = {
     "amr_physics": amr_physics_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
+    "sesame": sesame_test,
 }
 
 

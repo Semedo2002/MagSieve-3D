@@ -33,6 +33,7 @@ sieve/            solver package
   hall.py         generalized Ohm's law: Hall term, anisotropic (Spitzer) resistivity, on the CT staggering
   ions.py         ion gyroviscosity (finite-Larmor-radius stress) and the ion pressure for ion transport
 main.py           CLI: verification tests, single cases, legacy campaign
+tools/            generate_sesame.py: Al, Cu, D-T, Au, Pb EOS / opacity tables from a free-energy model
 examples/         MTIF liner flux compression; synthetic magnetic probes (SI units); 3D target asymmetries;
                   MagLIF-style r-z implosion; metal-liner flux compression generator (FCG)
 experiments/      sweeps A-H and analysis scripts; data/ holds the saved results
@@ -258,6 +259,43 @@ impact on a Quadro P1000:
 
 Interpolation is bilinear (bicubic is not implemented).
 
+### Generated material tables
+
+`tools/generate_sesame.py` writes EOS and opacity tables for Al, Cu, D-T, Au and Pb without LANL data (SI .npz,
+and SESAME ASCII 301 / 502 / 505 with `--sesame`; default 300 x 160 points over 1e-4 ... 30 rho0 and up to 1e8 K,
+about a minute per material; tables/ is not committed). Everything follows from one Helmholtz free energy, so p, e
+and c_s are thermodynamically consistent:
+- cold: a Vinet curve (Murnaghan-like near rho0, energy saturating at the cohesive energy in expansion), with
+  the 0 K reference density and K0 fitted so that p = 0 and the bulk sound speed equals the measured value at
+  ambient conditions;
+- ions: a Gruneisen solid with Lindemann melting going over to an ideal gas, built so that below melting
+  p_ion = 3 Gamma rho k T / m exactly;
+- electrons: an ideal Fermi-Dirac gas of Z* n_i free electrons (Fermi integrals by quadrature with exact-derivative
+  Hermite interpolation and the Sommerfeld series) with Dirac exchange, thermal part only. Z* is the
+  Thomas-Fermi ionization (More's fit), and for D-T also Saha with the binding and mixing-entropy terms;
+- opacities: Planck and Rosseland means integrated over frequency of free-free, screened-hydrogenic
+  bound-free and (Rosseland) Thomson scattering.
+
+Checks (`--test sesame`):
+- the principal Hugoniot of Al, Cu, Au and Pb is within 2.7% of the measured Us-up fits up to up = 3 km/s, which
+  were not fitted;
+- the fully ionized limit p = (1 + Z) rho k T / m and the Thomson floor of kappa_R are recovered;
+- thermodynamic consistency holds to 1e-5;
+- the solver's tabular EOS reproduces the model to about 1e-3 in the compressed and hot branches.
+
+These are smooth, consistent development tables, not evaluated data:
+- there is no line opacity (the means are lower bounds for partially ionized mid- and high-Z matter);
+- the classical ion heat capacity leaves solid D-T at 10 K with 0.036 GPa of thermal pressure at its measured
+  density;
+- in the expanded liquid-vapour region tension and thermal pressure nearly cancel and the table interpolation
+  error reaches several %;
+- a sliver of the solid-vapour corner was raised by up to 1e-5 of its row to keep p and e increasing in T.
+
+```
+python tools/generate_sesame.py                                   # tables/al.npz ... pb.npz
+python examples/fcg_flux_compression.py --eos-table tables/al.npz --opacity-table tables/al.npz
+```
+
 ### Shot calibration against diagnostics
 
 `sieve/validation.py` compares simulated observables with measured traces (VISAR free-surface velocity, B-dot
@@ -419,6 +457,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a T-junction of three patches keeps div B at 6e-15 (each shared corner takes the lowest-index patch's EMF once; corrected twice, as before, div B grew to 7e-3); CUDA-graph replay equals the eager run exactly; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |
+| sesame | generated Al, Cu, D-T, Au, Pb tables load into the tabular EOS; Al SESAME ASCII round trip 9e-15; p(rho0, 300 K) = 0 and fitted ambient sound speeds; principal Hugoniot within 2.7% of measured Us-up fits (not fitted) at up = 1-3 km/s; fully ionized p / ((1 + Z) rho k T / m) = 0.9997 (D-T), 1.0016 (Al), kappa_R at the Thomson value; thermodynamic consistency 1.4e-5; tabular p(rho, e) vs the model: median 1e-3, largest 8e-3 (compressed and hot branches) |
 | amr_physics | resistive, conduction, FLD and strength each with three touching patches moving every 4 steps: conservation 5e-16 to 8e-16 (1e-7 to 3e-4 with the new registers off), div B at round-off; a feature inside one patch matches a uniform fine run to 1e-3 to 1e-4 of the coarse run's L1 error |
 
 ## Reproducing the study
