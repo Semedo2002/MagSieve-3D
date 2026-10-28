@@ -175,13 +175,14 @@ def pressure_margin(U, gamma):
     return gamma.pressure(rho, eps, a) - gamma.p_min(rho, a)
 
 
-def radiate(U, gamma, coeff, T_min, tracer_max, dt, electron_Z=None):
+def radiate(U, gamma, coeff, T_min, tracer_max, dt, electron_Z=None, mask=None):
     """Optically thin bremsstrahlung over dt, in place on U[EN]; returns the energy removed per cell.
 
     Q = coeff rho^2 sqrt(theta), theta = p/rho. At fixed density the internal energy changes as
     d eps = phi1 dp (eps = phi1 p + phi2), so d theta/dt = -K sqrt(theta) with K = coeff rho/phi1, which
     has the exact solution sqrt(theta_new) = sqrt(theta) - K dt/2. Cooling stops at theta = T_min and acts
-    only where the liner fraction is below tracer_max. Exact, so no stability limit on dt."""
+    only where the liner fraction is below tracer_max (and mask, if given: AMR leaves out coarse cells under a
+    patch, which the patch radiates). Exact, so no stability limit on dt."""
     W = cons_to_prim(U, gamma)
     rho, p, a = W[iRHO], W[iPR], xp.clip(W[iCLR], 0.0, 1.0)
     if electron_Z is not None:               # two-temperature: the electrons radiate, at T_e
@@ -194,6 +195,8 @@ def radiate(U, gamma, coeff, T_min, tracer_max, dt, electron_Z=None):
         theta = p / rho
         phi1 = 1.0 / (gamma - 1) if _ideal(gamma) else gamma.coeffs(rho, a)[0]
     on = (theta > T_min) & (a < tracer_max)
+    if mask is not None:
+        on = on & mask
     K = coeff * rho / phi1
     s = xp.maximum(xp.sqrt(theta) - 0.5 * K * dt, np.sqrt(T_min))
     dE = xp.where(on, phi1 * rho * (theta - s * s), 0.0)
@@ -420,8 +423,12 @@ def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5, radial=N
         ng = (ghost_U.shape[1] - U.shape[1]) // 2
         ring = ghost_U[(slice(None),) + tuple(slice(ng - 1, ng + n + 1) for n in U.shape[1:])]
         Wg = cons_to_prim(ring, gamma)
-        ghost = (xp.maximum(Wg[iPR], 0.0) / Wg[iRHO], Wg[iRHO], xp.clip(Wg[iCLR], 0.0, 1.0),
-                 (Wg[iBX], Wg[iBY], Wg[iBZ]))
+        tg = xp.maximum(Wg[iPR], 0.0) / Wg[iRHO]
+        if electron_Z is not None or ion_Z is not None:
+            from . import twotemp
+            te_g, ti_g = twotemp.temperatures(ring, gamma, electron_Z if electron_Z is not None else ion_Z)
+            tg = te_g if electron_Z is not None else ti_g
+        ghost = (tg, Wg[iRHO], xp.clip(Wg[iCLR], 0.0, 1.0), (Wg[iBX], Wg[iBY], Wg[iBZ]))
     track = flux_out is not None
 
     def rate(E):

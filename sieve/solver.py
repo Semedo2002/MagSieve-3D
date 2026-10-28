@@ -624,6 +624,22 @@ class MHDSolver:
         """time-integrated face fluxes of a split step on interior faces ((nx+1, ny), (nx, ny+1)); key "F" (U
         variable var) or "Er" (radiation energy)"""
 
+    def _pad_faces(self, a, axis):
+        """face array on interior rows (x-faces, axis 0) or columns (y-faces, axis 1) -> the Fx / Fy layout"""
+        ng, nx, ny = self.ng, self.cfg.nx, self.cfg.ny
+        if axis == 0:
+            out = xp.zeros((nx + 1, self.ny_tot))
+            out[:, ng:ng + ny] = a
+        else:
+            out = xp.zeros((self.nx_tot, ny + 1))
+            out[ng:ng + nx, :] = a
+        return out
+
+    def _rad_mask(self):
+        """interior cells the thin radiation acts on besides its own criteria (None: all; AMR coarse level: not
+        under a patch)"""
+        return None
+
     def _split_ghosts(self):
         """ghost-inclusive U whose first ghost ring the split conduction step conducts to (None: domain walls)"""
         return None
@@ -754,8 +770,14 @@ class MHDSolver:
             E = fused.emf2d(Fx, Fy, W, nx, ny, cfg.dx, cfg.dy)
             if cfg.nernst_coeff > 0:
                 # Nernst EMF (and the out-of-plane field it carries), Poynting + Ettingshausen energy flux
-                En, dBw, Gnx, Gny, _, divqE = transport.nernst_2d(W, Bf, cfg.nernst_coeff, cfg.cond_x0,
-                                                                  cfg.cond_tracer_max, cfg.dx, cfg.dy, nx, ny)
+                En, dBw, Gnx, Gny, _, divqE, FBw, FqE = transport.nernst_2d(W, Bf, cfg.nernst_coeff, cfg.cond_x0,
+                                                                            cfg.cond_tracer_max, cfg.dx, cfg.dy,
+                                                                            nx, ny)
+                if self._records_fluxes:             # AMR: B_w flux, Poynting + Ettingshausen, electron share
+                    self._add_flux(BZ, *FBw)
+                    self._add_flux(EN, Gnx, Gny)
+                    if cfg.two_temp:
+                        self._add_flux("Fe", *FqE)
                 if cfg.two_temp:                     # the Ettingshausen heat flux is carried by the electrons
                     rho_i = W[iRHO, ng:ng+nx, ng:ng+ny]
                     R[RHOSE, ng:ng+nx, ng:ng+ny] -= (cfg.gamma - 1) * divqE * rho_i**(1 - cfg.gamma)
@@ -785,6 +807,9 @@ class MHDSolver:
                 if cfg.two_temp and qa is not None:  # anisotropic Ohmic heat goes to the electrons
                     rho_i = W[iRHO, ng:ng+nx, ng:ng+ny]
                     R[RHOSE, ng:ng+nx, ng:ng+ny] += (cfg.gamma - 1) * qa * rho_i**(1 - cfg.gamma)
+                if self._records_fluxes:             # interior-row face arrays -> the Fx / Fy layout
+                    self._add_flux(EN, self._pad_faces(Sx, 0), self._pad_faces(Sy, 1))
+                    self._add_flux(BZ, self._pad_faces(Fbx, 0), self._pad_faces(Fby, 1))
             E = self._emf_hook(E)
             dBf[0][...] = 0.0
             dBf[1][...] = 0.0
@@ -827,6 +852,8 @@ class MHDSolver:
             for var, gx, gy in ((MX, gfx[0], gfy[0]), (MY, gfx[1], gfy[1]), (MZ, gfx[2], gfy[2]), (EN, gfx[3], gfy[3])):
                 R[var, ng:ng+nx, ng:ng+ny] -= ((gx[1:, ng:ng+ny] - gx[:-1, ng:ng+ny]) / cfg.dx
                                                + (gy[ng:ng+nx, 1:] - gy[ng:ng+nx, :-1]) / cfg.dy)
+                if self._records_fluxes:
+                    self._add_flux(var, gx, gy)
             boundary_rate = boundary_rate + (xp.sum(gfx[3][0, ng:ng+ny] - gfx[3][nx, ng:ng+ny]) * cfg.dy
                                              + xp.sum(gfy[3][ng:ng+nx, 0] - gfy[3][ng:ng+nx, ny]) * cfg.dx)
         self._stage_boundary_rate = boundary_rate
@@ -946,7 +973,7 @@ class MHDSolver:
             inner = (slice(None), slice(ng, ng + cfg.nx), slice(ng, ng + cfg.ny))
             Ui = self.U[inner]
             dE = radiate(Ui, self.eos, cfg.rad_coeff, cfg.rad_T_min, cfg.rad_tracer_max, dt,
-                         electron_Z=cfg.z_ion if cfg.two_temp else None)
+                         electron_Z=cfg.z_ion if cfg.two_temp else None, mask=self._rad_mask())
             self.U[inner] = Ui
             self._acc_rad += xp.sum(dE * self.dV)
         if self.cfg.fld:
@@ -973,12 +1000,18 @@ class MHDSolver:
                                        ghost_U=self._split_ghosts(), flux_out=faces)
             if faces:
                 self._add_split_flux("F", EN, *faces)
+                if cfg.two_temp:                     # all of it is electron heat
+                    self._add_split_flux("Fe", None, *faces)
         cfg, ng = self.cfg, self.ng
         if cfg.cond_kappa_i0 > 0:                    # ion conduction on T_i (two-temperature)
             Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
             per = (cfg.get_bc_x() == "periodic", cfg.bc_y_type == "periodic")
+            faces = [] if self._records_fluxes else None
             self.cond_i_stages = conduct(Ui, self.eos, cfg.cond_kappa_i0, cfg.cond_x0_i, cfg.cond_tracer_max,
-                                         (cfg.dx, cfg.dy), per, dt, perp="simple", ion_Z=cfg.z_ion)
+                                         (cfg.dx, cfg.dy), per, dt, perp="simple", ion_Z=cfg.z_ion,
+                                         ghost_U=self._split_ghosts(), flux_out=faces)
+            if faces:
+                self._add_split_flux("F", EN, *faces)
         if cfg.two_temp and cfg.te_eq_coeff > 0:
             Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
             fuel = xp.clip(cons_to_prim(Ui, self.eos)[iCLR], 0, 1) < cfg.cond_tracer_max
@@ -992,7 +1025,20 @@ class MHDSolver:
             else:
                 theta_i = Wi[iPR] / Wi[iRHO]
             eta = cfg.visc_coeff * xp.maximum(theta_i, 0.0)**2.5
-            self.visc_stages = viscous_step(Ui, eta, (cfg.dx, cfg.dy), self._periodic(), fuel, dt)
+            ghost, faces = None, ([] if self._records_fluxes else None)
+            Ug = self._split_ghosts()
+            if Ug is not None:                       # AMR patch: neighbour ring for v, B, eta and the fuel mask
+                ring = Ug[:, ng - 1:ng + cfg.nx + 1, ng - 1:ng + cfg.ny + 1]
+                Wr = cons_to_prim(ring, self.eos)
+                ti_r = twotemp.temperatures(ring, cfg.gamma, cfg.z_ion)[1] if cfg.two_temp else Wr[iPR] / Wr[iRHO]
+                ghost = ([Wr[iVX], Wr[iVY], Wr[iVZ]], [Wr[iBX], Wr[iBY], Wr[iBZ]],
+                         cfg.visc_coeff * xp.maximum(ti_r, 0.0)**2.5,
+                         (xp.clip(Wr[iCLR], 0, 1) < cfg.cond_tracer_max).astype(Wr.dtype))
+            self.visc_stages = viscous_step(Ui, eta, (cfg.dx, cfg.dy), self._periodic(), fuel, dt, ghost=ghost,
+                                            flux_out=faces)
+            if faces:
+                for k, var in enumerate((MX, MY, MZ, EN)):
+                    self._add_split_flux("F", var, faces[0][k], faces[1][k])
         self.apply_bc(self.U)
         if self.ct:
             self._ghost_faces(self.Bf, self.U)

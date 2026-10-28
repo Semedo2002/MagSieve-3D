@@ -67,7 +67,9 @@ def nernst_velocity(W, cN, x0, tracer_max, dx, dy, vf):
 def nernst_2d(W, Bf, cN, x0, tracer_max, dx, dy, nx, ny):
     """Nernst and Ettingshausen terms for the 2D solver (2 ghost layers, CT faces Bf = [Bx, By]).
     Returns (E corner EMF on x-faces 2..nx+2 x y-faces 2..ny+2, dBw/dt on interior cells for the out-of-plane
-    field, Gx on x-faces 2..nx+2 x all rows, Gy on all columns x y-faces 2..ny+2, max |v_N|)."""
+    field, Gx on x-faces 2..nx+2 x all rows, Gy on all columns x y-faces 2..ny+2, max |v_N|, div of the
+    Ettingshausen flux on interior cells, and the face fluxes behind dBw and that divergence for AMR refluxing:
+    (B_w flux x, y), (Ettingshausen flux x, y) in the Gx / Gy layouts)."""
     vx, vy, fac, theta, fuel = nernst_velocity(W, cN, x0, tracer_max, dx, dy, None)
     Bxf, Byf = Bf
     # corner EMF, upwind on the face fields: E = -(v_x B_y - v_y B_x)
@@ -101,7 +103,7 @@ def nernst_2d(W, Bf, cN, x0, tracer_max, dx, dy, nx, ny):
     qEx, qEy = 0.5 * (qx[1:nx + 2] + qx[2:nx + 3]), 0.5 * (qy[:, 1:ny + 2] + qy[:, 2:ny + 3])
     divqE = (qEx[1:, 2:ny + 2] - qEx[:-1, 2:ny + 2]) / dx + (qEy[2:nx + 2, 1:] - qEy[2:nx + 2, :-1]) / dy
     vmax = xp.max(xp.sqrt(vx**2 + vy**2))                    # device scalar (no host sync)
-    return E, dBw, Gx, Gy, vmax, divqE
+    return E, dBw, Gx, Gy, vmax, divqE, (Fx, Fy), (qEx, qEy)
 
 
 # ------------------------------------------------------------------ 3D (CT on all three face fields)

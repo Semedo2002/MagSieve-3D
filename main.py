@@ -2141,6 +2141,145 @@ def amr_physics_test():
     return ok
 
 
+def amr_transport_test():
+    """The remaining terms across AMR levels (sieve/amr.py), 32^2 coarse, ratio 2: Hall + anisotropic resistivity,
+    Nernst + Ettingshausen (two-temperature), two-temperature electron and ion conduction with equilibration,
+    gyroviscosity, Braginskii viscosity and optically thin radiation. For each: (1) three touching patches moving
+    every 4 steps conserve mass, momentum and total energy (radiated energy counted) to round-off with div B at
+    round-off, and switching off the new registers (for radiation: the coarse level radiating under patches too)
+    breaks the budget; (2) a feature inside one patch, initialised at the fine resolution, matches a uniform fine
+    run to under 5% of the coarse run's L1 error. (3) The electron-energy register: under electron conduction only,
+    the refluxed heat must stay with the electrons; without the register the coarse cells next to the patch heat
+    their ions: the change of T_i over the run departs from the uniform fine run's (the change, so that the coarse
+    sampling of the initial state cancels)."""
+    from sieve.amr import AMR, AMRParams, _Recorder
+    from sieve import ct as _ct, twotemp
+    print("\n--- AMR with Hall, Nernst, two-temperature, gyroviscosity, viscosity, radiation ---"); sys.stdout.flush()
+    g2 = lambda X, Y, w: xp.exp(-((X - 0.5)**2 + (Y - 0.5)**2) / w)
+
+    def st_hall(W, X, Y):
+        W[iRHO], W[iPR], W[iBX], W[iBZ] = 1.0, 20.0, 0.3, 0.5 + g2(X, Y, 0.01)
+
+    def st_hot(W, X, Y):
+        W[iRHO], W[iPR], W[iBZ], W[iBX] = 1.0, 1.0 + 2.0 * g2(X, Y, 0.01), 1.0, 0.2
+
+    def st_shear(W, X, Y):
+        W[iRHO], W[iPR], W[iBZ], W[iBX] = 1.0, 1.0 + g2(X, Y, 0.01), 1.0, 0.3
+        W[iVX], W[iVY] = 0.3 * g2(X, Y, 0.01), 0.2 * g2(X, Y, 0.02)
+    Te = lambda U: twotemp.temperatures(U, 5 / 3, 1.0)[0]
+    tt = dict(two_temp=True, cond_kappa0=2e-3, cond_x0=0.5, cond_kappa_i0=1e-3, cond_x0_i=0.5, te_eq_coeff=0.5)
+    cases = [("Hall", dict(hall_di=0.05, eta_resistivity=2e-3, eta_perp_ratio=1.96), st_hall, 0.01, iBZ),
+             ("Nernst", dict(nernst_coeff=0.05, cond_x0=2.0, two_temp=True), st_hot, 0.03, iBZ),
+             ("two-temp", tt, st_hot, 0.03, Te),
+             ("gyroviscous", dict(gyro_di=0.3), st_shear, 0.03, iVY),
+             ("viscosity", dict(visc_coeff=2e-3), st_shear, 0.03, iVX),
+             ("radiation", dict(rad_coeff=0.5, rad_T_min=0.1), st_hot, 0.05, iPR)]
+
+    def cfg_of(n, kw):
+        c = dict(nx=n, ny=n, x_max=1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=5 / 3, B_transverse=1.0,
+                 bc_x_type="periodic", bc_y_type="periodic", powell_source=False, diag_interval=10**9, snapshot_times=[])
+        c.update(kw)
+        return Config(**c)
+
+    def fill(s, fn):
+        W = xp.zeros((NVAR,) + s.U.shape[1:])
+        fn(W, s.X, s.Y)
+        U = prim_to_cons(W, s.eos)
+        if fn is st_electron:                        # p = 1 uniform, p_e = 0.5 (1 + bump), p_i takes the rest
+            twotemp.set_pe(U, 0.5 * (1.0 + 0.8 * g2(s.X, s.Y, 0.01)), 5 / 3)
+        return U
+
+    def st_electron(W, X, Y):
+        W[iRHO], W[iPR], W[iBZ] = 1.0, 1.0, 1.0
+
+    def amr_run(kw, fn, steps=None, t_end=None, boxes=None, move=False, exact=False, rad_off=False, at0=None):
+        cfg = cfg_of(32, kw)
+        a = AMR(cfg, AMRParams(ratio=2, regrid_every=0))
+        with contextlib.redirect_stdout(io.StringIO()):
+            s0 = MHDSolver(cfg)
+        a.set_state(fill(s0, fn))
+        a.regrid(boxes)
+        if exact:                                    # patch data at the fine resolution, not prolonged
+            for f in a.patches:
+                ng = f.ng
+                f.U[:, ng:-ng, ng:-ng] = fill(f, fn)[:, ng:-ng, ng:-ng]
+                _ct.cells_from_faces(f.U, f.Bf, (slice(ng, -ng), slice(ng, -ng)))
+                if cfg.two_temp and fn is not st_electron:
+                    twotemp.init_equal(f.U, cfg.gamma, cfg.z_ion)
+        if at0 is not None:
+            at0.append(a.composite(at0[0]))
+        T0, div, k = a.totals(), 0.0, 0
+        shift = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+        while (steps is not None and k < steps) or (t_end is not None and a.t < t_end - 1e-12):
+            if rad_off:
+                a.coarse._uncovered = None
+            a.advance(a.compute_dt() if t_end is None else min(a.compute_dt(), t_end - a.t))
+            k += 1
+            div = max(div, a.div_b())
+            if move and k % 4 == 0:
+                dx_, dy_ = shift[(k // 4 - 1) % 4]
+                a.regrid([(b[0] + dx_, b[1] + dx_, b[2] + dy_, b[3] + dy_) for b in a.boxes])
+        T1 = a.totals()
+        dE = T1["E"] - T0["E"] - (T1["boundary"] - T0["boundary"]) + (T1["radiated"] - T0["radiated"])
+        cons = max([abs(T1[q] - T0[q]) / abs(T0["E"]) for q in ("mass", "mx", "my")] + [abs(dE) / abs(T0["E"])])
+        return a, cons, div
+
+    def uniform(n, kw, fn, t_end, var, change=False):
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg_of(n, kw))
+        s.U = fill(s, fn); s.t = 0.0; s.step = 0
+        q0 = var(s.U).copy() if change else 0.0
+        _march(s, t_end)
+        if change:
+            return to_numpy((var(s.U) - q0)[s.ng:-s.ng, s.ng:-s.ng])
+        q = var(s.U) if callable(var) else cons_to_prim(s.U, s.eos)[var]
+        return to_numpy(q[s.ng:-s.ng, s.ng:-s.ng])
+
+    touching = [(9, 17, 11, 19), (17, 23, 9, 21), (23, 27, 21, 25)]
+    up = lambda q: np.repeat(np.repeat(q, 2, 0), 2, 1)
+    sl = (slice(12, 52), slice(12, 52))
+    ok = True
+    for name, kw, fn, t_end, var in cases:
+        _, cons, div = amr_run(kw, fn, steps=12, boxes=touching, move=True)
+        saved = (_Recorder._add_flux, _Recorder._add_split_flux)
+        if name != "radiation":
+            _Recorder._add_flux = _Recorder._add_split_flux = lambda *a_: None
+        try:
+            _, cons_off, _ = amr_run(kw, fn, steps=8, boxes=touching, move=True, rad_off=(name == "radiation"))
+        finally:
+            _Recorder._add_flux, _Recorder._add_split_flux = saved
+        a, _, _ = amr_run(kw, fn, t_end=t_end, boxes=[(6, 26, 6, 26)], exact=True)
+        fine, coarse = uniform(64, kw, fn, t_end, var), uniform(32, kw, fn, t_end, var)
+        e_amr = float(np.mean(np.abs(a.composite(var)[sl] - fine[sl])))
+        e_c = float(np.mean(np.abs(up(coarse)[sl] - fine[sl])))
+        good = cons < 1e-13 and div < 1e-12 and cons_off > 1e-8 and e_amr < 0.05 * e_c
+        ok = ok and good
+        print(f"  {name:11s}: moving touching patches, 12 steps: conservation {cons:.1e} (control {cons_off:.1e}), "
+              f"div B {div:.1e}; feature in a patch: L1 error vs uniform 64^2 {e_amr:.1e} (coarse {e_c:.1e})  "
+              f"[{'PASS' if good else 'FAIL'}]")
+
+    # electron register: T_i (which electron conduction must not touch), patch edge inside the hot region
+    Ti = lambda U: twotemp.temperatures(U, 5 / 3, 1.0)[1]
+    kw = dict(two_temp=True, cond_kappa0=4e-3, cond_x0=0.0)
+    fine = uniform(64, kw, st_electron, 0.03, Ti, change=True)
+    errs = []
+    for on in (True, False):
+        saved = _Recorder._add_split_flux
+        if not on:
+            _Recorder._add_split_flux = lambda self, key, *a_: None if key == "Fe" else saved(self, key, *a_)
+        try:
+            at0 = [Ti]
+            a, cons, _ = amr_run(kw, st_electron, t_end=0.03, boxes=[(12, 20, 10, 22)], exact=True, at0=at0)
+        finally:
+            _Recorder._add_split_flux = saved
+        errs.append(float(np.max(np.abs(a.composite(Ti) - at0[1] - fine))))
+    good = errs[0] < 0.2 * errs[1]
+    ok = ok and good
+    print(f"  electron-energy register (electron conduction across a patch edge): max |dT_i - dT_i(uniform 64^2)| "
+          f"{errs[0]:.1e} with it, {errs[1]:.1e} without  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -2474,6 +2613,7 @@ VERIFICATION_TESTS = {
     "validation": validation_test,
     "amr": amr_test,
     "amr_physics": amr_physics_test,
+    "amr_transport": amr_transport_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

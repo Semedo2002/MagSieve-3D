@@ -350,9 +350,19 @@ Non-ideal terms are coupled across the levels with the same flux registers:
   divergence. These are refluxed into the coarse energy, or into the coarse E_r, which is prolonged and
   restricted like U.
 
-With patches that touch and move, mass, momentum and gas + radiation energy stay conserved to round-off. With
-these registers switched off the error is 1e-7 to 3e-4. Viscosity, Nernst, two-temperature and optically thin
-radiation are not coupled across levels yet (they raise).
+- the Hall term, anisotropic resistivity, Nernst and Ettingshausen terms: their corner EMFs are part of the
+  corrected EMF, and their B_z and energy face fluxes are refluxed;
+- gyroviscous stresses: refluxed like the strength stresses;
+- viscosity and ion conduction: split steps like conduction (ghost ring, time-integrated face fluxes);
+- two-temperature: the electron entropy rides with the hydro fluxes, and an electron-energy register
+  (electron conduction, Ettingshausen) puts the electron share of refluxed energy into the coarse electron
+  entropy; without it that heat would land in the coarse cells' ions;
+- optically thin radiation: local, with the coarse level not radiating under patches and `totals()` counting
+  what every level radiated.
+
+With patches that touch and move, mass, momentum and gas + radiation energy stay conserved to round-off for
+every term; with the corresponding registers switched off the error is 1e-7 to 1e-3. Every 2D Cartesian module
+now runs under AMR.
 
 `examples/amr_implosion_demo.py` implodes the 2D magnetized liner (1% mode-6 ripple, 1 mm per code unit) to
 t = 0.2 three ways: uniform 128^2 (15.6 um cells), uniform 512^2 (3.9 um) and AMR 128^2 + ratio-4 patches.
@@ -455,6 +465,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | tabular | SESAME ASCII 301/502/505 write and read back (1e-15); an ideal-gas table reproduces the ideal-gas Sod tube to 1e-13; a Mie-Gruneisen Al table reproduces the analytic 2 km/s impact (shocked p 17.998 vs 17.998 GPa, fields to 2e-4) and p(e) stays continuous into the fallback; the device EOS matches the array EOS on 160k random states (blend band, mixed, off-table) to 3e-10 and over the impact run to 1e-14; FLD with tabulated opacities matches the power laws to 2e-11 |
 | validation | analytic signals with known noise: chi^2_nu of the true model 1.001, RMS 1.000 sigma; a 37 ns delay recovered by the cross-correlation offset and the fitted shift to 0.5 ns; a 1-parameter scan recovers the amplitude with the Fisher sigma; CSV round trip |
 | amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a T-junction of three patches keeps div B at 6e-15 (each shared corner takes the lowest-index patch's EMF once; corrected twice, as before, div B grew to 7e-3); CUDA-graph replay equals the eager run exactly; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
+| amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |
 | sesame | generated Al, Cu, D-T, Au, Pb tables load into the tabular EOS; Al SESAME ASCII round trip 9e-15; p(rho0, 300 K) = 0 and fitted ambient sound speeds; principal Hugoniot within 2.7% of measured Us-up fits (not fitted) at up = 1-3 km/s; fully ionized p / ((1 + Z) rho k T / m) = 0.9997 (D-T), 1.0016 (Al), kappa_R at the Thomson value; thermodynamic consistency 1.4e-5; tabular p(rho, e) vs the model: median 1e-3, largest 8e-3 (compressed and hot branches) |
@@ -697,7 +708,7 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 ## Model and numerical limitations
 
 - Ideal gas (γ = 5/3) by default; liner strength is elastic-perfectly plastic (constant G and Y, no work or rate hardening, no thermal softening) with a threshold spall model, and there is no phase change. The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. Viscosity is the Braginskii parallel part plus the gyroviscous (FLR) stress, without the dissipative perpendicular terms (eta_1, eta_2), and gyroviscosity is 2D Cartesian only; thermal conduction is electron (Braginskii k_perp fit, no Righi-Leduc term) and, in two-temperature mode, ion (1/(1 + x_i^2) cross-field form), the liner is treated as an isothermal heat sink, and at grid-oblique field angles the limited scheme adds numerical cross-field diffusion that falls at second order with resolution. Radiation is optically thin bremsstrahlung or grey flux-limited diffusion (one group, no radiation pressure, power-law opacities unless a table is supplied, single gas temperature), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
-- The Hall term and anisotropic resistivity are 2D Cartesian only (not r-z, 3D or AMR), without the electron pressure gradient term of Ohm's law; the cross-field resistivity uses the strongly magnetized ratio wherever B is nonzero. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
+- The Hall term and anisotropic resistivity are 2D Cartesian only (not r-z or 3D), without the electron pressure gradient term of Ohm's law; the cross-field resistivity uses the strongly magnetized ratio wherever B is nonzero. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
 - Constrained transport keeps div B at round-off; the cylindrical geometry is 2D (r, z) only, and the Cartesian 2D MTIF examples are still cross-sections with a four-fold grid imprint (use `examples/maglif_rz.py` for an axisymmetric implosion).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.
 - Shock-parallel stripes are restricted to the fast-shock regime, B0 < 6.55 sqrt(p_bar) at Mach 10; switch-on shocks are not modelled.

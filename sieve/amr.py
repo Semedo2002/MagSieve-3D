@@ -37,8 +37,15 @@
 #     taken from the coarse level at the end of the sub-step (and from touching patches), and each returns its
 #     time-integrated face fluxes, which are refluxed into the coarse energy (conduction) or the coarse E_r
 #     (FLD; E_r is prolonged and restricted too). Gas + radiation energy stays conserved to round-off.
-# Scope: 2D Cartesian, constrained transport; viscosity, Nernst, two-temperature and optically thin radiation
-# are not coupled across levels yet and raise.
+#   - Hall term, anisotropic resistivity, Nernst and Ettingshausen: their corner EMFs are part of the corrected
+#     EMF, their B_z and energy face fluxes are refluxed; gyroviscous stresses likewise;
+#   - viscosity and ion conduction: split steps like conduction (ghost ring, time-integrated face fluxes);
+#   - two-temperature: the electron entropy is advected with the hydro fluxes (refluxed with them), and an
+#     electron-energy register (electron conduction, Ettingshausen) moves the refluxed electron share into the
+#     coarse electron entropy; equilibration is local;
+#   - optically thin radiation is local: the coarse level does not radiate under a patch (the patch does) and
+#     totals() counts what all levels radiated.
+# Scope: 2D Cartesian with constrained transport.
 #
 # Launch overhead: a fine sub-step of every patch (all three RK stages, the boundary registers, and the
 # post-step when it has no split diffusion) is recorded once as a CUDA graph and replayed, so a level with
@@ -49,7 +56,7 @@ import dataclasses
 
 import numpy as np
 
-from .config import Config, NVAR, RHO, MX, MY, MZ, BX, BY, BZ, EN, RHOC, iRHO, iVX, iVY, iBX, iBY, iBZ, iPR, iCLR
+from .config import Config, NVAR, RHO, MX, MY, MZ, BX, BY, BZ, EN, RHOC, RHOSE, iRHO, iVX, iVY, iBX, iBY, iBZ, iPR, iCLR
 from .physics import xp, cons_to_prim
 from .solver import MHDSolver, to_numpy
 from . import ct
@@ -58,9 +65,6 @@ from . import ct
 def _check(cfg):
     if cfg.geometry != "cartesian" or cfg.div_b != "ct":
         raise NotImplementedError("AMR: 2D Cartesian with constrained transport")
-    if cfg.visc_coeff > 0 or cfg.nernst_coeff > 0 or cfg.rad_coeff > 0 or cfg.two_temp or cfg.hall_di > 0             or cfg.eta_perp_ratio != 1.0 or cfg.gyro_di > 0:
-        raise NotImplementedError("AMR: viscosity, Nernst, two-temperature, optically thin radiation, the Hall term, "
-                                  "anisotropic resistivity and gyroviscosity are not coupled across levels yet")
 
 
 # ------------------------------------------------------------------ kernels
@@ -158,6 +162,8 @@ class _Recorder:
                    "ua": [xp.zeros(n) for n in L], "E": [xp.zeros(n + 1) for n in L]}
             if er:
                 acc["Er"] = [xp.zeros(n) for n in L]
+            if self.cfg.two_temp:
+                acc["Fe"] = [xp.zeros(n) for n in L]
             self._rec.append(acc)
         self._stage = None
 
@@ -200,6 +206,8 @@ class _Recorder:
             rec = {"F": [Fx[:, ri0, rows], Fx[:, ri1, rows], Fy[:, cols, rj0], Fy[:, cols, rj1]],
                    "u": [ux[ri0, rows], ux[ri1, rows], uy[cols, rj0], uy[cols, rj1]],
                    "ua": [uax[ri0, rows], uax[ri1, rows], uay[cols, rj0], uay[cols, rj1]]}
+            if self.cfg.two_temp:                    # electron energy fluxes (Ettingshausen) added below
+                rec["Fe"] = [xp.zeros_like(a) for a in rec["u"]]
             self._stage.append(rec)
 
     @property
@@ -217,6 +225,11 @@ class _Recorder:
 
     def _add_flux(self, var, Gx, Gy):
         if self._stage is None:
+            return
+        if var == "Fe":                              # electron energy flux (own register)
+            for k, st in enumerate(self._stage):
+                for m, g in enumerate(self._sides(k, Gx, Gy, False)):
+                    st["Fe"][m] += g
             return
         if not self._stage_own:                      # the recorded pieces are views of Fx, Fy: copy before adding
             for st in self._stage:
@@ -278,7 +291,10 @@ def _axpy(w, a, out):
 
 
 class CoarseLevel(_Recorder, MHDSolver):
-    pass
+    _uncovered = None                                # interior cells not under a patch (set at regrid)
+
+    def _rad_mask(self):
+        return self._uncovered
 
 
 class FinePatch(_Recorder, MHDSolver):
@@ -554,6 +570,7 @@ class AMR:
         self.patches, self.boxes = [], []
         self.t, self.step = 0.0, 0
         self.fine_cell_steps = 0
+        self._rad_retired = 0.0
         self._dt_d, self._th_d = xp.zeros(()), xp.zeros(4)    # fine dt and ghost weights, read by the patches
         self._cdt_d = xp.zeros(())
         self._graphs, self._warm = {}, set()
@@ -566,6 +583,7 @@ class AMR:
         self.coarse.t, self.coarse.step = 0.0, 0
         self.coarse.apply_bc(self.coarse.U)
         self.coarse._ct_sync()
+        self.coarse._te_sync()                       # two-temperature: T_e = T_i where s_e was never set
 
     def _fine_cfg(self, box):
         i0, i1, j0, j1 = box
@@ -696,6 +714,11 @@ class AMR:
         old = list(zip(self.boxes, self.patches))
         s, r, ng = self.coarse, self.p.ratio, self.coarse.ng
         nx, ny = s.cfg.nx, s.cfg.ny
+        self._rad_retired += sum(float(op._acc_rad) for _, op in old)      # what replaced patches radiated
+        cov = np.zeros((nx, ny), bool)
+        for (i0, i1, j0, j1) in boxes:
+            cov[i0:i1, j0:j1] = True
+        s._uncovered = xp.asarray(~cov)
         s._ct_sync()
         Ac = potential(s.Bf[0], s.Bf[1], ng, ng + nx, ng, ng + ny, (s.cfg.dx, s.cfg.dy))
         xs, ys = np.arange(r * nx + 1) / r, np.arange(r * ny + 1) / r
@@ -809,7 +832,8 @@ class AMR:
             f._set_ghost_source(Po, Pn, self.t, dt, Sf, Ef)
             f._rec_reset([self.boxes[k]], r)
         h = dt / r
-        post_in_graph = not (self.cfg.cond_kappa0 > 0 or self.cfg.fld)   # split diffusion decides on the host
+        c = self.cfg                                 # split diffusion decides on the host (stage counts)
+        post_in_graph = not (c.cond_kappa0 > 0 or c.fld or c.cond_kappa_i0 > 0 or c.visc_coeff > 0)
         self._dt_d.fill(h)
         for m in range(r):                           # all patches take each RK stage together
             t1 = self.t + m * h
@@ -836,6 +860,7 @@ class AMR:
         s = self.coarse
         s._glm_ch_frozen = s.cfg.glm_ch
         s._ct_sync()
+        s._te_sync()
         self._cdt_d.fill(dt)
         self._graphed("coarse", lambda: s._rk_core(self._cdt_d))
         s._post_step(dt)
@@ -905,6 +930,10 @@ class AMR:
                                                    (cols, ng + j0 - 1, -1, dy), (cols, ng + j1, +1, dy))):
                 dU[:, ci, cj] += sign * dF[m] / h
                 dU[RHOC, ci, cj] += sign * (dua[m] - a_c[ci, cj] * du[m]) / h
+                if "Fe" in C:                        # electron energy: p_e += (gamma - 1) e_e, rho s_e = p_e rho^(1-g)
+                    g_ = s.cfg.gamma
+                    dU[RHOSE, ci, cj] += sign * (g_ - 1) * (agg(Fr["Fe"][m]) - C["Fe"][m]) / h \
+                        * xp.maximum(s.U[RHO, ci, cj], 1e-300)**(1 - g_)
                 if dEr is not None and "Er" in C:    # radiation energy fluxes (FLD), interior indices
                     ei = ci - ng if isinstance(ci, int) else slice(ci.start - ng, ci.stop - ng)
                     ej = cj - ng if isinstance(cj, int) else slice(cj.start - ng, cj.stop - ng)
@@ -988,6 +1017,10 @@ class AMR:
                         a_c = Ue[RHOC] if fB._vf else Ue[RHOC] / xp.maximum(Ue[RHO], 1e-300)
                         fB.U[:, ci, cj] += sign * dF / h
                         fB.U[RHOC, ci, cj] += sign * (dua - a_c * du) / h
+                        if "Fe" in RA and "Fe" in RB:
+                            g_ = fB.cfg.gamma
+                            fB.U[RHOSE, ci, cj] += sign * (g_ - 1) * (RA["Fe"][sa][fa0:fa0 + nf] - RB["Fe"][sb][fb0:fb0 + nf]) / h \
+                                * xp.maximum(fB.U[RHO, ci, cj], 1e-300)**(1 - g_)
                         if "Er" in RA and "Er" in RB:
                             ei = ci - ng if isinstance(ci, int) else slice(ci.start - ng, ci.stop - ng)
                             ej = cj - ng if isinstance(cj, int) else slice(cj.start - ng, cj.stop - ng)
@@ -1033,6 +1066,7 @@ class AMR:
         out["E_rad"] = s.radiation_energy()
         out["E"] += out["E_rad"]
         out["boundary"] = s._cumulative_boundary_energy + s.fld_inflow
+        out["radiated"] = float(s._acc_rad) + sum(float(f._acc_rad) for f in self.patches) + self._rad_retired
         return out
 
     def div_b(self):
@@ -1044,11 +1078,12 @@ class AMR:
         return sum(f.cfg.nx * f.cfg.ny for f in self.patches) / (r * r * self.cfg.nx * self.cfg.ny)
 
     def composite(self, var=iRHO):
-        """primitive variable on a uniform grid at the fine resolution: patches where they exist, the coarse
-        level repeated elsewhere (host array)"""
+        """primitive variable (an index, or a function of the conserved array) on a uniform grid at the fine
+        resolution: patches where they exist, the coarse level repeated elsewhere (host array)"""
         s, r, ng = self.coarse, self.p.ratio, self.coarse.ng
-        Wc = to_numpy(cons_to_prim(s.U, s.eos)[var, ng:-ng, ng:-ng])
+        q = (lambda lev: var(lev.U)) if callable(var) else (lambda lev: cons_to_prim(lev.U, lev.eos)[var])
+        Wc = to_numpy(q(s)[ng:-ng, ng:-ng])
         out = np.repeat(np.repeat(Wc, r, axis=0), r, axis=1)
         for (i0, i1, j0, j1), f in zip(self.boxes, self.patches):
-            out[r * i0:r * i1, r * j0:r * j1] = to_numpy(cons_to_prim(f.U, f.eos)[var, ng:-ng, ng:-ng])
+            out[r * i0:r * i1, r * j0:r * j1] = to_numpy(q(f)[ng:-ng, ng:-ng])
         return out

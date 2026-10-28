@@ -10,13 +10,24 @@ from .config import RHO, MX, MY, MZ, EN, iBX, iBY, iBZ, FLOOR_RHO
 from .physics import xp, _along, _pad1, rkl2
 
 
-def stress_rates(rho, m, E, B, eta, h, periodic, fuel):
-    """(d m / dt for the three components, dE/dt) from the viscous stress, interior arrays"""
+def stress_rates(rho, m, E, B, eta, h, periodic, fuel, ghost=None, fluxes=None):
+    """(d m / dt for the three components, dE/dt) from the viscous stress, interior arrays. ghost: one-cell
+    padded (v, B, eta, fuel) whose outer ring is used as neighbour data, the domain faces then carrying stress
+    (an AMR patch); fluxes: a list receiving, per axis, the stacked face fluxes (momentum x, y, z, energy)"""
     nd = rho.ndim
     v = [mk / rho for mk in m]
-    vp = [_pad1(f, periodic) for f in v]
-    Bp = [_pad1(f, periodic) for f in B]
-    ep, fp = _pad1(eta, periodic), _pad1(fuel.astype(rho.dtype), periodic)
+    if ghost is None:
+        vp = [_pad1(f, periodic) for f in v]
+        Bp = [_pad1(f, periodic) for f in B]
+        ep, fp = _pad1(eta, periodic), _pad1(fuel.astype(rho.dtype), periodic)
+    else:
+        core_ = (slice(1, -1),) * nd
+        vp = []
+        for f, g in zip(v, ghost[0]):
+            q = g.copy()
+            q[core_] = f
+            vp.append(q)
+        Bp, ep, fp = ghost[1], ghost[2], ghost[3]
     dm = [xp.zeros_like(rho) for _ in range(3)]
     dE = xp.zeros_like(rho)
     core = slice(1, -1)
@@ -46,26 +57,32 @@ def stress_rates(rho, m, E, B, eta, h, periodic, fuel):
         mag = Bm > 0
         vf = [0.5 * (c[L] + c[R]) for c in vp]
         flux_E = 0.0
+        face = []
         for mm in range(3):
             d = 1.0 if mm == ax else 0.0
             Pi_par = -3.0 * ef * (b[ax] * b[mm] - d / 3.0) * psi
             Pi_iso = -ef * (G[ax][mm] + G[mm][ax] - (2.0 / 3.0) * d * divv)
             Pi = xp.where(mag, Pi_par, Pi_iso)
-            if not periodic[ax]:
+            if not periodic[ax] and ghost is None:
                 n = Pi.shape[ax]
                 Pi[_along(nd, ax, 0)] = 0.0
                 Pi[_along(nd, ax, n - 1)] = 0.0
             dm[mm] -= (Pi[_along(nd, ax, slice(1, None))] - Pi[_along(nd, ax, slice(0, -1))]) / h[ax]
             flux_E = flux_E + Pi * vf[mm]
+            face.append(Pi)
         dE -= (flux_E[_along(nd, ax, slice(1, None))] - flux_E[_along(nd, ax, slice(0, -1))]) / h[ax]
+        if fluxes is not None:
+            fluxes.append(xp.stack(face + [flux_E]))
     return dm, dE
 
 
-def viscous_step(U, eta, h, periodic, fuel, dt, cfl=0.5):
+def viscous_step(U, eta, h, periodic, fuel, dt, cfl=0.5, ghost=None, flux_out=None):
     """split step over dt on the interior conservative array U (in place: momentum and energy), eta frozen.
-    Returns the RKL2 stage count."""
+    Returns the RKL2 stage count. ghost: (v, B, eta, fuel) padded by one cell (see stress_rates); flux_out: a list
+    receiving the time-integrated face fluxes per axis, stacked (momentum x, y, z, energy)."""
     rho = xp.maximum(U[RHO], FLOOR_RHO)
     B = (U[iBX], U[iBY], U[iBZ])
+    track = flux_out is not None
     nu_max = float(xp.max(xp.where(fuel, 3.0 * eta / rho, 0.0)))
     if nu_max <= 0:
         return 0
@@ -73,9 +90,14 @@ def viscous_step(U, eta, h, periodic, fuel, dt, cfl=0.5):
     y0 = xp.stack([U[MX], U[MY], U[MZ], U[EN]])
 
     def rate(y):
-        dm, dE = stress_rates(rho, (y[0], y[1], y[2]), y[3], B, eta, h, periodic, fuel)
-        return xp.stack([dm[0], dm[1], dm[2], dE])
+        fl = [] if track else None
+        dm, dE = stress_rates(rho, (y[0], y[1], y[2]), y[3], B, eta, h, periodic, fuel, ghost=ghost, fluxes=fl)
+        out = xp.stack([dm[0], dm[1], dm[2], dE])
+        return (out, fl) if track else out
 
-    y, stages = rkl2(y0, rate, dt, dt_expl)
+    res = rkl2(y0, rate, dt, dt_expl)
+    y, stages = res[0], res[1]
+    if track:
+        flux_out.extend(res[2])
     U[MX], U[MY], U[MZ], U[EN] = y[0], y[1], y[2], y[3]
     return stages
