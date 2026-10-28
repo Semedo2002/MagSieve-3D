@@ -91,8 +91,23 @@ values. `div_b="glm"` keeps the cell-centred GLM/Powell scheme the published sie
 scripts and the RMI benchmark pin it, so their results reproduce). `geometry="cylindrical"` runs the 2D solver
 in axisymmetric (r, z): x is the radius with a reflecting axis at x = 0, y the axial coordinate, the
 out-of-plane components are -v_phi and -B_phi; fluxes are area weighted, the geometric sources
-(rho v_phi^2 - B_phi^2 + p_T)/r, -(rho v_r v_phi - B_r B_phi)/r and F_r[B_phi]/r are added, and CT updates
-B_z with r-weighted edge EMFs (E_phi = 0 on the axis).
+(rho v_phi^2 - B_phi^2 + p_T)/r and -(rho v_r v_phi - B_r B_phi)/r are added, B_phi follows
+(curl E)_phi = d_z E_r - d_r E_z with plain flux differences (no metric factor; the toroidal flux is conserved),
+and CT updates B_z with r-weighted edge EMFs (E_phi = 0 on the axis).
+
+The 3D solver runs `geometry="cylindrical"` in (r, theta, z), scale factors (1, r, 1):
+- cells are r dr dtheta dz, the radial flux divergence is (1/r) d(r F)/dr and the azimuthal one dF/(r dtheta),
+  with the same momentum sources as 2D;
+- the CT faces (B_r, B_theta, B_z) follow Stokes on the curved faces: dB_r/dt = -dE_z/(r dtheta) + dE_theta/dz,
+  dB_theta/dt = -dE_r/dz + dE_z/dr, dB_z/dt = -(1/r) d(r E_theta)/dr + dE_r/(r dtheta), so the cylindrical
+  divergence stays at round-off;
+- with x_min = 0 the domain contains the axis (theta over 2 pi, even cell count). Ghost cells behind the axis are
+  the cells at theta + pi with r and theta components reversed, E_z on the axis takes its theta average (E_z is
+  single-valued there), and the axis cell's cell-centred B_r keeps all the m >= 1 part of the outer face value;
+- without theta variation it reproduces the 2D r-z solver to 1.6e-14, and an m = 1 blob carried onto the axis
+  along a uniform field converges with resolution (`--test cylindrical3d`);
+- it covers ideal MHD with the EOS options and the tracer; the other 3D physics modules are Cartesian, and the
+  azimuthal CFL limit at the axis (r dtheta) sets the time step.
 
 ### Thermal conduction
 
@@ -465,6 +480,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | tabular | SESAME ASCII 301/502/505 write and read back (1e-15); an ideal-gas table reproduces the ideal-gas Sod tube to 1e-13; a Mie-Gruneisen Al table reproduces the analytic 2 km/s impact (shocked p 17.998 vs 17.998 GPa, fields to 2e-4) and p(e) stays continuous into the fallback; the device EOS matches the array EOS on 160k random states (blend band, mixed, off-table) to 3e-10 and over the impact run to 1e-14; FLD with tabulated opacities matches the power laws to 2e-11 |
 | validation | analytic signals with known noise: chi^2_nu of the true model 1.001, RMS 1.000 sigma; a 37 ns delay recovered by the cross-correlation offset and the fitted shift to 0.5 ns; a 1-parameter scan recovers the amplitude with the Fisher sigma; CSV round trip |
 | amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a T-junction of three patches keeps div B at 6e-15 (each shared corner takes the lowest-index patch's EMF once; corrected twice, as before, div B grew to 7e-3); CUDA-graph replay equals the eager run exactly; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
+| cylindrical3d | 3D (r, theta, z) with d/dtheta = 0 vs the 2D r-z solver (swirl, B_phi, B_z, z-dependent flow, the axis): 1.6e-14 after 30 steps; an m = 1 blob carried onto the axis along a uniform field: centroid error 3.4e-2 -> 1.4e-2 and field error 2.7e-2 -> 1.2e-2 from 16 x 24 to 32 x 48 cells, energy 4e-14, div B 2e-14 |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |
@@ -709,7 +725,7 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 
 - Ideal gas (γ = 5/3) by default; liner strength is elastic-perfectly plastic (constant G and Y, no work or rate hardening, no thermal softening) with a threshold spall model, and there is no phase change. The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. Viscosity is the Braginskii parallel part plus the gyroviscous (FLR) stress, without the dissipative perpendicular terms (eta_1, eta_2), and gyroviscosity is 2D Cartesian only; thermal conduction is electron (Braginskii k_perp fit, no Righi-Leduc term) and, in two-temperature mode, ion (1/(1 + x_i^2) cross-field form), the liner is treated as an isothermal heat sink, and at grid-oblique field angles the limited scheme adds numerical cross-field diffusion that falls at second order with resolution. Radiation is optically thin bremsstrahlung or grey flux-limited diffusion (one group, no radiation pressure, power-law opacities unless a table is supplied, single gas temperature), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
 - The Hall term and anisotropic resistivity are 2D Cartesian only (not r-z or 3D), without the electron pressure gradient term of Ohm's law; the cross-field resistivity uses the strongly magnetized ratio wherever B is nonzero. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
-- Constrained transport keeps div B at round-off; the cylindrical geometry is 2D (r, z) only, and the Cartesian 2D MTIF examples are still cross-sections with a four-fold grid imprint (use `examples/maglif_rz.py` for an axisymmetric implosion).
+- Constrained transport keeps div B at round-off; 3D cylindrical (r, theta, z) covers ideal MHD only (resistive, transport, strength and radiation are Cartesian in 3D) and has no axis-specific time-step relief (the r dtheta spacing of the axis cells limits dt), and the Cartesian 2D MTIF examples are still cross-sections with a four-fold grid imprint (use `examples/maglif_rz.py` for an axisymmetric implosion).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.
 - Shock-parallel stripes are restricted to the fast-shock regime, B0 < 6.55 sqrt(p_bar) at Mach 10; switch-on shocks are not modelled.
 - Most sweeps use one resolution and one realisation. The lock boundary was rechecked at 2x and 4x resolution (`experiments/convergence_lock.py`): interface roughness converges, mixing-layer enstrophy of the hydrodynamic reference does not (no physical viscosity), so enstrophy ratios against hydro are not grid-converged.

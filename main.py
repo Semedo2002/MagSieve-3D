@@ -2280,6 +2280,118 @@ def amr_transport_test():
     return ok
 
 
+def cylindrical3d_test():
+    """3D cylindrical (r, theta, z) geometry in solver3d. (1) Without theta variation the 3D solver reproduces the 2D
+    r-z solver (swirl, azimuthal and axial field, z-dependent flow, the axis) to round-off over 30 steps of the same
+    dt. (2) Non-axisymmetric (m = 1): a density blob carried straight across the axis by a uniform Cartesian flow
+    along a uniform Cartesian field (v_r = U cos theta, v_theta = -U sin theta, faces from A_z = B0 y), here onto the
+    axis: the errors in the blob's centroid (exact: moves U t) and in the field (exact: uniform) fall with
+    resolution, energy is conserved to round-off and the cylindrical face divergence stays at round-off."""
+    from sieve.solver3d import MHDSolver3D
+    print("\n--- 3D cylindrical geometry (r, theta, z) ---"); sys.stdout.flush()
+    ok = True
+    base = dict(cfl=0.3, gamma=5 / 3, mach=1.0, B_transverse=1.0, geometry="cylindrical", div_b="ct",
+                bc_x_type="extrapolation", bc_y_type="periodic", powell_source=False, diag_interval=10**9,
+                snapshot_times=[], t_end=1.0)
+    Nr, Nz, Nth = 32, 24, 4
+    with contextlib.redirect_stdout(io.StringIO()):
+        s2 = MHDSolver(Config(nx=Nr, ny=Nz, x_min=0.0, x_max=1.0, y_min=0.0, y_max=1.0, **base))
+        s3 = MHDSolver3D(Config(nx=Nr, ny=Nth, nz=Nz, x_min=0.0, x_max=1.0, y_min=0.0, y_max=2 * np.pi, z_min=0.0,
+                                z_max=1.0, **base))
+    R, Z = s2.X, s2.Y
+    W2 = xp.zeros((NVAR,) + s2.U.shape[1:])
+    W2[iRHO] = 1.0 + 0.3 * xp.exp(-((R - 0.4)**2 + (Z - 0.5)**2) / 0.02)
+    W2[iPR] = 1.0 + 0.5 * xp.exp(-(R**2) / 0.05)
+    W2[iVX] = 0.2 * xp.sin(2 * np.pi * Z) * R * xp.exp(-R**2 / 0.2)
+    W2[iVY] = 0.1 * xp.cos(2 * np.pi * Z)
+    W2[iVZ] = -0.3 * R * xp.exp(-R**2 / 0.1)          # w = -v_phi: swirl
+    W2[iBY] = 0.5 + 0.2 * xp.exp(-R**2 / 0.1)
+    W2[iBZ] = -0.4 * R * xp.exp(-R**2 / 0.1)          # B_w = -B_phi
+    s2.U = prim_to_cons(W2, s2.eos); s2.t = 0.0
+    m3 = lambda q: xp.repeat(q[:, None, :], s3.U.shape[2], axis=1)
+    W3 = xp.zeros((NVAR,) + s3.U.shape[1:])
+    W3[iRHO], W3[iPR] = m3(W2[iRHO]), m3(W2[iPR])
+    W3[iVX], W3[iVY], W3[iVZ] = m3(W2[iVX]), -m3(W2[iVZ]), m3(W2[iVY])
+    W3[iBX], W3[iBY], W3[iBZ] = m3(W2[iBX]), -m3(W2[iBZ]), m3(W2[iBY])
+    s3.U = prim_to_cons(W3, s3.eos); s3.t = 0.0
+    for _ in range(30):
+        dt = s2.compute_dt(cons_to_prim(s2.U, s2.eos))
+        s2.dt = s3.dt = dt
+        s2.step_ssprk3(); s2.t += dt
+        s3.step_ssprk3(); s3.t += dt
+    ng = s2.ng
+    A = to_numpy(cons_to_prim(s2.U, s2.eos)[:, ng:-ng, ng:-ng])
+    Bq = to_numpy(cons_to_prim(s3.U, s3.eos)[:, ng:-ng, ng:-ng, ng:-ng])
+    worst = 0.0
+    for v2, v3, sg in ((iRHO, iRHO, 1), (iPR, iPR, 1), (iVX, iVX, 1), (iVY, iVZ, 1), (iVZ, iVY, -1), (iBX, iBX, 1),
+                       (iBY, iBZ, 1), (iBZ, iBY, -1)):
+        sc = max(float(np.max(np.abs(A[v2]))), 1e-30)
+        worst = max(worst, max(float(np.max(np.abs(sg * Bq[v3][:, j, :] - A[v2]))) for j in range(Nth)) / sc)
+    good = worst < 1e-12 and s3.div_b_max() < 1e-12
+    ok = ok and good
+    print(f"  3D cylindrical with d/dtheta = 0 vs the 2D r-z solver, 30 steps: largest difference {worst:.1e}, div B "
+          f"{s3.div_b_max():.1e}  [{'PASS' if good else 'FAIL'}]")
+    res = [_cyl3d_blob(Nr_, Nt_, T=0.3) for Nr_, Nt_ in ((16, 24), (32, 48))]
+    e_c = [abs(r_["xc"] - r_["xc_exact"]) for r_ in res]
+    good = (res[1]["dB"] < 0.7 * res[0]["dB"] and e_c[1] < 0.7 * e_c[0] and max(r_["dE"] for r_ in res) < 1e-13
+            and max(r_["div"] for r_ in res) < 1e-12)
+    ok = ok and good
+    print(f"  m = 1 blob carried onto the axis along a uniform field (t = 0.3): centroid error {e_c[0]:.1e} / {e_c[1]:.1e}, "
+          f"field deviation {res[0]['dB']:.1e} / {res[1]['dB']:.1e} at 16 x 24 / 32 x 48 cells (r x theta); energy "
+          f"{max(r_['dE'] for r_ in res):.1e}, div B {max(r_['div'] for r_ in res):.1e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
+def _cyl3d_blob(Nr, Nth, T=0.5, U=1.0, B0=0.5):
+    """the m = 1 blob of cylindrical3d_test: returns centroid, field deviation, energy error, max div B"""
+    from sieve.solver3d import MHDSolver3D
+    from sieve import ct as _ct
+    c = Config(nx=Nr, ny=Nth, nz=4, x_min=0.0, x_max=1.0, y_min=0.0, y_max=2 * np.pi, z_min=0.0, z_max=4.0 / Nr,
+               cfl=0.3, gamma=5 / 3, mach=1.0, B_transverse=1.0, geometry="cylindrical", div_b="ct",
+               bc_x_type="extrapolation", bc_y_type="periodic", powell_source=False, diag_interval=10**9,
+               snapshot_times=[], t_end=T)
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver3D(c)
+    ng = s.ng
+    r = to_numpy(s.x)[:, None, None]
+    th = to_numpy(s.y)[None, :, None]
+    X, Y = r * np.cos(th), r * np.sin(th)
+    rf = to_numpy(s.rf)
+    thf = c.y_min + (np.arange(s.ny_tot + 1) - ng) * c.dy
+    Az = B0 * rf[:, None] * np.sin(thf)[None, :]                       # A_z = B0 y on the z-edges
+    Br = (Az[:, 1:] - Az[:, :-1]) / (np.where(rf > 0, rf, np.inf)[:, None] * c.dy)
+    Bt = -(Az[1:, :] - Az[:-1, :]) / c.dx
+    nz = s.nz_tot
+    Bf = [xp.asarray(np.repeat(Br[:, :, None], nz, 2)), xp.asarray(np.repeat(Bt[:, :, None], nz, 2)),
+          xp.zeros((s.nx_tot, s.ny_tot, nz + 1))]
+    W = xp.zeros((NVAR,) + s.U.shape[1:])
+    W[iRHO] = xp.asarray(1.0 + np.exp(-((X + 0.3)**2 + Y**2) / 0.01) + 0 * r * th)
+    W[iPR] = 1.0
+    W[iVX] = xp.asarray(U * np.cos(th) + 0 * r)
+    W[iVY] = xp.asarray(-U * np.sin(th) + 0 * r)
+    s.U = prim_to_cons(W, s.eos)
+    s.Bf = Bf; s._faces_owner = s.U
+    s._Bf1 = [xp.empty_like(f) for f in Bf]; s._dBf = [xp.empty_like(f) for f in Bf]
+    _ct.cells_from_faces(s.U, Bf, (slice(None),) * 3)
+    s.U[EN] += 0.5 * (s.U[iBX]**2 + s.U[iBY]**2 + s.U[iBZ]**2)
+    s.t, s.step = 0.0, 0
+    E0, div = s.total_energy(), 0.0
+    while s.t < T - 1e-12:
+        s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), T - s.t)
+        s.step_ssprk3(); s.t += s.dt; s.step += 1
+        div = max(div, s.div_b_max())
+    Wn = to_numpy(cons_to_prim(s.U, s.eos))
+    I = (slice(ng, -ng),) * 3
+    dV = to_numpy(s.dV)
+    rho = Wn[iRHO][I] - 1.0
+    thi = th[:, ng:-ng]
+    xc = float(np.sum(rho * X[ng:-ng, ng:-ng] * dV) / np.sum(rho * dV))
+    Bx = Wn[iBX][I] * np.cos(thi) - Wn[iBY][I] * np.sin(thi)
+    By = Wn[iBX][I] * np.sin(thi) + Wn[iBY][I] * np.cos(thi)
+    return {"xc": xc, "xc_exact": -0.3 + U * T, "dB": max(float(np.max(np.abs(Bx - B0))), float(np.max(np.abs(By)))) / B0,
+            "dE": abs(s.total_energy() - E0 - float(s._acc_boundary)) / E0, "div": div}
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -2614,6 +2726,7 @@ VERIFICATION_TESTS = {
     "amr": amr_test,
     "amr_physics": amr_physics_test,
     "amr_transport": amr_transport_test,
+    "cylindrical3d": cylindrical3d_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

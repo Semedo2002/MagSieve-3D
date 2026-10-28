@@ -132,14 +132,33 @@ def _curl(ax_, ay_, az_, dx, dy, dz):
 
 
 class MHDSolver3D:
-    """3D MHD with HLLD fluxes on all three face orientations (unsplit, SSP-RK3), optional constant eta."""
+    """3D MHD with HLLD fluxes on all three face orientations (unsplit, SSP-RK3), optional constant eta.
+
+    geometry="cylindrical": (x, y, z) = (r, theta, z), scale factors (1, r, 1). Cells are r dr dtheta dz; the radial
+    flux divergence is (1/r) d(r F)/dr, the azimuthal one dF/(r dtheta), with the momentum sources
+    (rho v_theta^2 - B_theta^2 + p_T)/r (radial) and -(rho v_r v_theta - B_r B_theta)/r (azimuthal). The CT faces
+    (B_r on r-faces, B_theta on theta-faces, B_z on z-faces) follow Stokes on the curved cell faces:
+        dB_r/dt = -dE_z/(r dtheta) + dE_theta/dz,  dB_theta/dt = -dE_r/dz + dE_z/dr,
+        dB_z/dt = -(1/r) d(r E_theta)/dr + dE_r/(r dtheta),
+    so the cylindrical face divergence stays at round-off. With x_min = 0 the domain holds the axis: theta must
+    span 2 pi with an even cell count, and the ghost cells behind the axis are the cells at theta + pi (radial and
+    azimuthal components reversed). Without theta variation this reproduces the 2D r-z solver to round-off.
+    Ideal MHD with the EOS options and the volume-fraction tracer; the other 3D physics modules are Cartesian."""
 
     def __init__(self, config):
         cfg = config
         if cfg.nz < 4:
             raise ValueError("solver3d needs nz >= 4")
-        if cfg.geometry != "cartesian":
-            raise NotImplementedError("cylindrical geometry is implemented in the 2D solver")
+        self.cyl = cfg.geometry == "cylindrical"
+        if self.cyl:
+            if cfg.div_b != "ct" or cfg.x_min < 0:
+                raise ValueError("3D cylindrical geometry needs div_b='ct' and x_min >= 0")
+            if (cfg.is_resistive() or cfg.nernst_coeff > 0 or cfg.strength or cfg.cond_kappa0 > 0 or cfg.fld
+                    or cfg.visc_coeff > 0 or cfg.rad_coeff > 0 or cfg.two_temp):
+                raise NotImplementedError("3D cylindrical geometry: ideal MHD (with the EOS options) only")
+            self.axis = cfg.x_min == 0
+            if self.axis and (abs(cfg.y_max - cfg.y_min - 2 * np.pi) > 1e-9 or cfg.ny % 2):
+                raise ValueError("3D cylindrical with the axis (x_min = 0) needs theta over 2 pi, ny even")
         if cfg.hall_di > 0 or cfg.eta_perp_ratio != 1.0 or cfg.gyro_di > 0 or cfg.cond_kappa_i0 > 0:
             raise NotImplementedError("the Hall term, anisotropic resistivity and ion transport are in the 2D solver")
         self.cfg = cfg
@@ -156,6 +175,10 @@ class MHDSolver3D:
         self.x = xp.asarray(cfg.x_min + (np.arange(self.nx_tot) - ng + 0.5) * cfg.dx)
         self.y = xp.asarray(cfg.y_min + (np.arange(self.ny_tot) - ng + 0.5) * cfg.dy)
         self.z = xp.asarray(cfg.z_min + (np.arange(self.nz_tot) - ng + 0.5) * cfg.dz)
+        if self.cyl:                                 # face and cell radii, interior cell volumes r dr dtheta dz
+            self.rf = xp.asarray(cfg.x_min + (np.arange(self.nx_tot + 1) - ng) * cfg.dx)
+            self.rc = self.x
+            self.dV = (self.rc[ng:ng + cfg.nx] * cfg.dx * cfg.dy * cfg.dz)[:, None, None]
         shape = (NVAR, self.nx_tot, self.ny_tot, self.nz_tot)
         self.U = xp.zeros(shape)
         self.U_temp = xp.empty(shape)
@@ -315,9 +338,31 @@ class MHDSolver3D:
 
     # ------------------------------------------------------------ boundaries and time step
 
+    def _behind_axis(self, A, sign_rows=(), shift_faces=False):
+        """ghost rows i < ng of a (var, x, theta, z) array from the rows across the axis, theta + pi: row ng-1-k
+        takes row ng+k (cells; faces: row ng-k takes ng+k, the axis face itself zero), components in sign_rows
+        reversed. Only interior theta entries; the periodic theta fill follows."""
+        ng, nth = self.ng, self.cfg.ny
+        half = nth // 2
+        th = slice(ng, ng + nth)
+        pairs = [(ng - k, ng + k) for k in range(1, ng + 1)] if shift_faces else \
+            [(ng - 1 - k, ng + k) for k in range(ng)]
+        for dst, src in pairs:
+            A[:, dst, th] = xp.roll(A[:, src, th], -half, axis=1)
+            for v in sign_rows:
+                A[v, dst, th] = -A[v, dst, th]
+
     def apply_bc(self, U):
         ng = self.ng
-        if self.cfg.get_bc_x() == "periodic":
+        if self.cyl:
+            for i in range(ng):                          # outer radius: zero gradient
+                U[:, -(i + 1)] = U[:, -(ng + 1)]
+            if self.axis:
+                self._behind_axis(U, (MX, MY, BX, BY))
+            else:
+                for i in range(ng):
+                    U[:, i] = U[:, ng]
+        elif self.cfg.get_bc_x() == "periodic":
             U[:, :ng] = U[:, -2 * ng:-ng]
             U[:, -ng:] = U[:, ng:2 * ng]
         elif self.cfg.get_bc_x() == "extrapolation":
@@ -348,7 +393,8 @@ class MHDSolver3D:
         self._ch = max(float(xp.max(xp.maximum(xp.maximum(sx, sy), sz))), 1e-12)
         h3 = (cfg.dx, cfg.dy, cfg.dz)
         h = min(h3)
-        inv = max(float(xp.max(xp.maximum(xp.maximum(sx / cfg.dx, sy / cfg.dy), sz / cfg.dz))), self._ch / h)
+        hy = cfg.dy * xp.maximum(self.rc, 0.5 * cfg.dx)[:, None, None] if self.cyl else cfg.dy
+        inv = max(float(xp.max(xp.maximum(xp.maximum(sx / cfg.dx, sy / hy), sz / cfg.dz))), self._ch / h)
         dt = cfg.cfl / inv
         if cfg.is_resistive():
             # explicit diffusion: dt <= 1 / (2 eta_max (1/dx^2 + 1/dy^2 + 1/dz^2))
@@ -372,6 +418,22 @@ class MHDSolver3D:
     # hooks a domain-decomposed subclass (sieve/parallel.py) overrides: ghost faces, edge EMFs, extra arrays
     def _ghost_faces(self, Bf, U):
         ct.ghost_faces(Bf, U, self.ng, (self.cfg.nx, self.cfg.ny, self.cfg.nz), self._periodic())
+        if self.cyl and self.axis:                   # B_r odd (zero on the axis face), B_theta odd, B_z even
+            ng, nth = self.ng, self.cfg.ny
+            Bf[0][ng] = 0.0
+            self._behind_axis(Bf[0][None], (0,), shift_faces=True)
+            Bt = Bf[1]
+            self._behind_axis(Bt[None], (0,))       # theta-faces of the ghost rows (interior faces ng..ng+nth-1)
+            self._behind_axis(Bf[2][None], ())
+            for A, nf in ((Bf[0], 0), (Bt, 1), (Bf[2], 0)):  # periodic theta for the rows just filled
+                rows = slice(0, ng + 1) if A is Bf[0] else slice(0, ng)
+                if nf:
+                    A[rows, ng + nth] = A[rows, ng]
+                    A[rows, :ng] = A[rows, nth:nth + ng]
+                    A[rows, ng + nth + 1:] = A[rows, ng + 1:2 * ng + 1]
+                else:
+                    A[rows, :ng] = A[rows, nth:nth + ng]
+                    A[rows, ng + nth:] = A[rows, ng:2 * ng]
 
     def _emf_hook(self, E):
         return E
@@ -386,11 +448,26 @@ class MHDSolver3D:
         if not self.ct or self._faces_owner is self.U:
             return
         U = self.U
+        if self.cyl:
+            self.apply_bc(U)
         self.Bf = ct.faces_from_cells(U, 3)
-        ct.cells_from_faces(U, self.Bf, (slice(None),) * 3)            # E kept, so the budget is unaffected
+        if self.cyl and self.axis:
+            self.Bf[0][self.ng] = 0.0                    # B_r = 0 on the axis
+        self._cells_from_faces(U, self.Bf, (slice(None),) * 3)      # E kept, so the budget is unaffected
         self._faces_owner = U
         self._Bf1 = [xp.empty_like(f) for f in self.Bf]
         self._dBf = [xp.empty_like(f) for f in self.Bf]
+
+    def _cells_from_faces(self, U, Bf, region):
+        """cell B from the faces (averages); in a cylindrical axis cell the inner r-face has no area and carries
+        B_r = 0, which is right for the axisymmetric part (B_r ~ r) but not for m >= 1 (B_r finite on the axis):
+        there the cell takes half the theta-mean of the outer-face B_r plus all of its theta variation"""
+        ct.cells_from_faces(U, Bf, region)
+        if self.cyl and self.axis:
+            ng, nth = self.ng, self.cfg.ny
+            th = slice(ng, ng + nth)
+            Bo = Bf[0][ng + 1, th]
+            U[BX, ng, th] = Bo - 0.5 * xp.mean(Bo, axis=0, keepdims=True)
 
     def set_vector_potential(self, Ax, Ay, Az):
         """Set B from A = (Ax, Ay, Az) (numpy callables, each evaluated on its cell edges): faces are its
@@ -407,14 +484,24 @@ class MHDSolver3D:
             self._faces_owner = U
             self._Bf1 = [xp.empty_like(f) for f in Bf]
             self._dBf = [xp.empty_like(f) for f in Bf]
-        ct.cells_from_faces(U, Bf, (slice(None),) * 3)
+        self._cells_from_faces(U, Bf, (slice(None),) * 3)
         U[EN] += 0.5 * (U[BX]**2 + U[BY]**2 + U[BZ]**2 - B2)
 
     def div_b_max(self):
         """max |div B| h / max |B| on interior cells (face divergence with CT)"""
         cfg, ng = self.cfg, self.ng
         n, h = (cfg.nx, cfg.ny, cfg.nz), (cfg.dx, cfg.dy, cfg.dz)
-        if self.ct:
+        if self.ct and self.cyl:
+            self._ct_sync()
+            Br, Bt, Bz = self.Bf
+            I = [slice(ng, ng + m) for m in n]
+            rf = self.rf[ng:ng + n[0] + 1][:, None, None]
+            rc = self.rc[ng:ng + n[0]][:, None, None]
+            rB = Br[ng:ng + n[0] + 1, I[1], I[2]] * rf
+            d = ((rB[1:] - rB[:-1]) / (rc * h[0]) + (Bt[I[0], ng + 1:ng + n[1] + 1, I[2]] - Bt[I[0], ng:ng + n[1], I[2]])
+                 / (rc * h[1]) + (Bz[I[0], I[1], ng + 1:ng + n[2] + 1] - Bz[I[0], I[1], ng:ng + n[2]]) / h[2])
+            h = (h[0], float(self.rc[ng]) * h[1], h[2])      # smallest physical spacing for the normalisation
+        elif self.ct:
             self._ct_sync()
             d = ct.div_faces(self.Bf, h, ng, n)
         else:
@@ -446,6 +533,12 @@ class MHDSolver3D:
                                                 Bf[a].transpose(order), Bf[b].transpose(order), n[a], n[b])
             E.append(Ec.transpose(tuple(int(k) for k in np.argsort(order))))   # back to (x, y, z)
         E = self._emf_hook(E)
+        if self.cyl and self.axis:
+            E[1][0] = 0.0                            # E_theta = 0 on the axis
+            # E_z on the axis is one value: the theta average of the edge EMFs there (otherwise the axis cells'
+            # divergence changes at the rate d E_z(axis) / dtheta)
+            nth = cfg.ny
+            E[2][0] = xp.mean(E[2][0, :nth], axis=0, keepdims=True)
         for f in range(3):
             p, q = (f + 1) % 3, (f + 2) % 3
             # dB_f = -(d_p E_q - d_q E_p); E_q: faces on f and p, cells on q; E_p: faces on q and f, cells on p
@@ -454,12 +547,22 @@ class MHDSolver3D:
             sq[q] = slice(ng, ng + n[q])
             hi, lo = list(sq), list(sq)
             hi[p], lo[p] = slice(1, None), slice(0, -1)
+            hi_p, lo_p = hi, lo
             dEq = (Eq[tuple(hi)] - Eq[tuple(lo)]) / h[p]
             sp = [slice(None)] * 3
             sp[p] = slice(ng, ng + n[p])
             hi, lo = list(sp), list(sp)
             hi[q], lo[q] = slice(1, None), slice(0, -1)
             dEp = (Ep[tuple(hi)] - Ep[tuple(lo)]) / h[q]
+            if self.cyl:                             # scale factors: r on theta lengths, r-weighted E_theta
+                rf = self.rf[ng:ng + n[0] + 1][:, None, None]
+                rc = self.rc[ng:ng + n[0]][:, None, None]
+                if f == 0:                           # r-faces: dE_z / (r dtheta) (zero area on the axis face)
+                    dEq = dEq / xp.where(rf > 0, rf, xp.inf)
+                elif f == 2:                         # z-faces: (1/r) d(r E_theta)/dr - dE_r/(r dtheta)
+                    rEq = Eq * self.rf[ng:ng + n[0] + 1][:, None, None]
+                    dEq = (rEq[tuple(hi_p)] - rEq[tuple(lo_p)]) / (h[p] * rc)
+                    dEp = dEp / rc
             dBf[f][...] = 0.0
             tgt = [slice(ng, ng + m) for m in n]
             tgt[f] = slice(ng, ng + n[f] + 1)
@@ -472,7 +575,7 @@ class MHDSolver3D:
         h = (cfg.dx, cfg.dy, cfg.dz)
         if self.ct:
             ch = 0.0
-            ct.cells_from_faces(U, Bf, tuple(slice(ng, ng + m) for m in n))
+            self._cells_from_faces(U, Bf, tuple(slice(ng, ng + m) for m in n))
         U = self.apply_bc(U)
         if self.ct:
             self._ghost_faces(Bf, U)
@@ -503,19 +606,48 @@ class MHDSolver3D:
             if self._vf:
                 # volume fraction: da/dt + u.grad(a) = 0 from the same face values as the energy flux
                 a_c = W[iCLR][tuple(slice(ng, ng + m) if d == ax - 1 else slice(None) for d in range(3))]
-                rv = vf_advection_rate(F, WL, WR, a_c, ax - 1, h[ax - 1])
+                if self.cyl and ax == 1:
+                    rv = vf_advection_rate(F, WL, WR, a_c, 0, h[0], self.rf[ng:ng + m + 1][:, None, None],
+                                           self.rc[ng:ng + m][:, None, None])
+                elif self.cyl and ax == 2:
+                    rv = vf_advection_rate(F, WL, WR, a_c, 1, h[1] * self.rc[:, None, None])
+                else:
+                    rv = vf_advection_rate(F, WL, WR, a_c, ax - 1, h[ax - 1])
                 vf_rate += rv[tuple(slice(None) if d == ax - 1 else slice(ng, ng + n[d]) for d in range(3))]
-            dF = F[_sl(ax, slice(1, 1 + m))] - F[_sl(ax, slice(0, m))]
             sel = list(inner)
             sel[ax] = slice(None)
-            out[inner] -= dF[tuple(sel)] / h[ax - 1]
+            if self.cyl and ax == 1:                 # (1/r) d(r F)/dr
+                rF = F * self.rf[ng:ng + m + 1][None, :, None, None]
+                dF = (rF[:, 1:1 + m] - rF[:, 0:m]) / self.rc[ng:ng + m][None, :, None, None]
+                out[inner] -= dF[tuple(sel)] / h[0]
+            elif self.cyl and ax == 2:               # dF / (r dtheta)
+                dF = F[_sl(ax, slice(1, 1 + m))] - F[_sl(ax, slice(0, m))]
+                out[inner] -= dF[tuple(sel)] / (h[1] * self.rc[ng:ng + n[0]][None, :, None, None])
+            else:
+                dF = F[_sl(ax, slice(1, 1 + m))] - F[_sl(ax, slice(0, m))]
+                out[inner] -= dF[tuple(sel)] / h[ax - 1]
             # net energy inflow through the two domain faces normal to ax
-            face_area = np.prod([h[i] for i in range(3) if i != ax - 1])
             lo = list(sel); lo[0] = EN; lo[ax] = 0
             hi = list(sel); hi[0] = EN; hi[ax] = m
-            rate = rate + xp.sum(F[tuple(lo)] - F[tuple(hi)]) * face_area
+            if self.cyl:                             # face areas r_f dtheta dz, dr dz, r_c dr dtheta
+                if ax == 1:
+                    rate = rate + (xp.sum(F[tuple(lo)]) * self.rf[ng] - xp.sum(F[tuple(hi)]) * self.rf[ng + m]) * h[1] * h[2]
+                elif ax == 2:
+                    rate = rate + xp.sum(F[tuple(lo)] - F[tuple(hi)]) * h[0] * h[2]
+                else:
+                    rc_ = self.rc[ng:ng + n[0]][:, None]
+                    rate = rate + xp.sum((F[tuple(lo)] - F[tuple(hi)]) * rc_) * h[0] * h[1]
+            else:
+                face_area = np.prod([h[i] for i in range(3) if i != ax - 1])
+                rate = rate + xp.sum(F[tuple(lo)] - F[tuple(hi)]) * face_area
         if self._vf:
             out[(RHOC,) + inner[1:]] = vf_rate
+        if self.cyl:                                 # geometric sources (x = r, y = theta)
+            Wi = W[inner]
+            ri = self.rc[ng:ng + n[0]][:, None, None]
+            pT = Wi[iPR] + 0.5 * (Wi[iBX]**2 + Wi[iBY]**2 + Wi[iBZ]**2)
+            out[(MX,) + inner[1:]] += (Wi[iRHO] * Wi[iVY]**2 - Wi[iBY]**2 + pT) / ri
+            out[(MY,) + inner[1:]] -= (Wi[iRHO] * Wi[iVX] * Wi[iVY] - Wi[iBX] * Wi[iBY]) / ri
         self._rate_boundary = rate
         self._rate_powell = xp.zeros(())
         if cfg.powell_source and cfg.is_mhd() and not self.ct:
@@ -570,6 +702,13 @@ class MHDSolver3D:
             self._ct_face_rates(Fs, W, Bf, dBf, eta, vN)
         return out
 
+    def total_energy(self):
+        """total energy on the interior cells (r dr dtheta dz volumes in cylindrical geometry)"""
+        ng = self.ng
+        I = (slice(ng, -ng),) * 3
+        dV = self.dV if self.cyl else self.cfg.dx * self.cfg.dy * self.cfg.dz
+        return float(xp.sum(self.U[EN][I] * dV))
+
     def radiation_energy(self):
         """FLD radiation energy on the grid"""
         return float(xp.sum(self.Er)) * self.cfg.dx * self.cfg.dy * self.cfg.dz if self.Er is not None else 0.0
@@ -616,7 +755,7 @@ class MHDSolver3D:
         self.U[...] = U0 / 3 + 2.0 / 3.0 * (self.U_stage + dt * self.dU)
         if self.ct:
             n3 = (self.cfg.nx, self.cfg.ny, self.cfg.nz)
-            ct.cells_from_faces(self.U, self.Bf, tuple(slice(self.ng, self.ng + m) for m in n3))
+            self._cells_from_faces(self.U, self.Bf, tuple(slice(self.ng, self.ng + m) for m in n3))
         if self._vf:
             self.U[RHOC] = xp.clip(self.U[RHOC], 0.0, 1.0)
         else:

@@ -702,6 +702,9 @@ class MHDSolver:
             rfx = self.rf[2:self.nx_tot - 1][None, :, None]
             rFx = Fx * rfx
             dFx = (rFx[:, 1:1+nx, :] - rFx[:, 0:nx, :]) / self.rc[ng:ng+nx][None, :, None]
+            # B_phi: (curl E)_phi = d_z E_r - d_r E_z has no metric factor, so plain differences (conserves the
+            # toroidal flux sum B_phi dr dz; the 3D cylindrical CT update on theta-faces is the same)
+            dFx[BZ] = Fx[BZ, 1:1+nx, :] - Fx[BZ, 0:nx, :]
         else:
             dFx = Fx[:, 1:1+nx, :] - Fx[:, 0:nx, :]
         dFy = Fy[:, :, 1:1+ny] - Fy[:, :, 0:ny]
@@ -726,13 +729,12 @@ class MHDSolver:
                              + xp.sum(Fy[EN, ng:ng+nx, 0] - Fy[EN, ng:ng+nx, ny]) * cfg.dx)
         if self.cyl:
             # geometric sources (x = r, y = z, third = -phi): radial momentum (rho w^2 - B_w^2 + p_T)/r,
-            # azimuthal momentum -(rho u w - B_x B_w)/r, B_phi: +F_r[B_w]/r
+            # azimuthal momentum -(rho u w - B_x B_w)/r (B_phi needs none, see dFx above)
             Wi = W[:, ng:ng+nx, ng:ng+ny]
             ri = self.rc[ng:ng+nx][:, None]
             pT = Wi[iPR] + 0.5 * (Wi[iBX]**2 + Wi[iBY]**2 + Wi[iBZ]**2)
             R[MX, ng:ng+nx, ng:ng+ny] += (Wi[iRHO] * Wi[iVZ]**2 - Wi[iBZ]**2 + pT) / ri
             R[MZ, ng:ng+nx, ng:ng+ny] -= (Wi[iRHO] * Wi[iVX] * Wi[iVZ] - Wi[iBX] * Wi[iBZ]) / ri
-            R[BZ, ng:ng+nx, ng:ng+ny] += (Wi[iVX] * Wi[iBZ] - Wi[iVZ] * Wi[iBX]) / ri
         powell_rate = xp.zeros(())
         ohmic_rate = xp.zeros(())
         # Powell source for ANY MHD case (uniform or striped); not with CT
