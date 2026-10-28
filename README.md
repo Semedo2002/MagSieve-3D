@@ -30,6 +30,7 @@ sieve/            solver package
   eos_fused.py    its host side: packing, launches
   validation.py   shot data vs simulation: chi^2, RMS, peak offset, timing shifts, calibration, report plot
   amr.py          block-structured adaptive mesh refinement (2D, CT, refluxing, touching patches)
+  hall.py         generalized Ohm's law: Hall term, anisotropic (Spitzer) resistivity, on the CT staggering
 main.py           CLI: verification tests, single cases, legacy campaign
 examples/         MTIF liner flux compression; synthetic magnetic probes (SI units); 3D target asymmetries;
                   MagLIF-style r-z implosion; metal-liner flux compression generator (FCG)
@@ -116,6 +117,20 @@ Ettingshausen heat flux (beta_wedge kT_e/e) b x J, and the Poynting flux of E_N 
 face fluxes, so total energy is conserved exactly. 2D solver (Cartesian and r-z) and 3D: there the Nernst EMF
 -v_N x B sits on all three edge orientations with the same upwinding, and a z-invariant 3D run reduces to the
 2D scheme (to 7e-12 over 1240 steps, the two forms summing in a different order).
+
+### Hall term and anisotropic resistivity
+
+`sieve/hall.py` adds to the induction and energy equations the part of the generalized Ohm's law beyond eta J,
+
+    E' = d_i (J x B) / rho + (eta_perp - eta_par) J_perp,     J_perp = J - (b . J) b,
+
+with `hall_di` the ion inertial length at unit density in code units (the Hall term J x B / (e n_e) for Z = 1)
+and `eta_perp_ratio` = eta_perp / eta_par (1.96 for a magnetized Z = 1 Spitzer plasma; the configured resistivity,
+any `eta_model`, is the parallel value). J and B are formed on the cell corners for E'_z, which joins the CT corner
+EMF, and on the faces for E'_x, E'_y, which move B_z in flux form; the energy equation gets the Poynting flux
+E' x B, so total energy is conserved to round-off and div B stays at round-off. Whistlers set an explicit time
+step, omega = d_i |B| k^2 / rho at the grid scale (kept at 0.75 of the SSP-RK3 imaginary-axis bound at cfl 0.3).
+2D Cartesian with CT; the electron pressure gradient term is not included.
 
 ### Two-temperature plasma
 
@@ -386,6 +401,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | tabular | SESAME ASCII 301/502/505 write and read back (1e-15); an ideal-gas table reproduces the ideal-gas Sod tube to 1e-13; a Mie-Gruneisen Al table reproduces the analytic 2 km/s impact (shocked p 17.998 vs 17.998 GPa, fields to 2e-4) and p(e) stays continuous into the fallback; the device EOS matches the array EOS on 160k random states (blend band, mixed, off-table) to 3e-10 and over the impact run to 1e-14; FLD with tabulated opacities matches the power laws to 2e-11 |
 | validation | analytic signals with known noise: chi^2_nu of the true model 1.001, RMS 1.000 sigma; a 37 ns delay recovered by the cross-correlation offset and the fitted shift to 0.5 ns; a 1-parameter scan recovers the amplitude with the Fisher sigma; CSV round trip |
 | amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a T-junction of three patches keeps div B at 6e-15 (each shared corner takes the lowest-index patch's EMF once; corrected twice, as before, div B grew to 7e-3); CUDA-graph replay equals the eager run exactly; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
+| hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | amr_physics | resistive, conduction, FLD and strength each with three touching patches moving every 4 steps: conservation 5e-16 to 8e-16 (1e-7 to 3e-4 with the new registers off), div B at round-off; a feature inside one patch matches a uniform fine run to 1e-3 to 1e-4 of the coarse run's L1 error |
 
 ## Reproducing the study
@@ -625,7 +641,7 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 ## Model and numerical limitations
 
 - Ideal gas (γ = 5/3) by default; liner strength is elastic-perfectly plastic (constant G and Y, no work or rate hardening, no thermal softening) with a threshold spall model, and there is no phase change. The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. Viscosity is the Braginskii parallel part only (no gyroviscosity or perpendicular terms); thermal conduction is electron-only (Braginskii k_perp fit, no Righi-Leduc term), the liner is treated as an isothermal heat sink, and at grid-oblique field angles the limited scheme adds numerical cross-field diffusion that falls at second order with resolution. Radiation is optically thin bremsstrahlung or grey flux-limited diffusion (one group, no radiation pressure, power-law opacities unless a table is supplied, single gas temperature), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
-- Resistivity is scalar (isotropic), with no Hall term. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
+- The Hall term and anisotropic resistivity are 2D Cartesian only (not r-z, 3D or AMR), without the electron pressure gradient term of Ohm's law; the cross-field resistivity uses the strongly magnetized ratio wherever B is nonzero. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
 - Constrained transport keeps div B at round-off; the cylindrical geometry is 2D (r, z) only, and the Cartesian 2D MTIF examples are still cross-sections with a four-fold grid imprint (use `examples/maglif_rz.py` for an axisymmetric implosion).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.
 - Shock-parallel stripes are restricted to the fast-shock regime, B0 < 6.55 sqrt(p_bar) at Mach 10; switch-on shocks are not modelled.

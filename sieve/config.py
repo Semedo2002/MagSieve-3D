@@ -219,6 +219,18 @@ class PhysicsConfig:
     # Braginskii parallel ion viscosity, eta_0 = visc_coeff theta_i^2.5 (units.viscosity_kwargs); 0 = off.
     # Cartesian geometry; fuel only (tracer < cond_tracer_max).
     visc_coeff: float = 0.0
+    # generalized Ohm's law (sieve/hall.py), 2D Cartesian with CT: Hall term d_i (J x B)/rho with hall_di the ion
+    # inertial length at unit density in code units (0 = off); anisotropic resistivity eta_perp = eta_perp_ratio
+    # eta_par with eta (any eta_model) the parallel value (1.96 for a magnetized Z = 1 Spitzer plasma; 1 = isotropic)
+    hall_di: float = 0.0
+    eta_perp_ratio: float = 1.0
+    # ion Braginskii transport (sieve/ions.py): ion conduction on T_i in two-temperature mode, k_i,par =
+    # cond_kappa_i0 theta_i^5/2, k_i,perp = k_i,par / (1 + x_i^2), x_i = cond_x0_i |B| theta_i^3/2 / rho (0 = off);
+    # ion gyroviscosity (the non-dissipative finite-Larmor-radius stress) with gyro_di the ion inertial length at
+    # unit density (Omega_i = |B| / gyro_di; 0 = off), 2D Cartesian
+    cond_kappa_i0: float = 0.0
+    cond_x0_i: float = 0.0
+    gyro_di: float = 0.0
     # liner strength (sieve/strength.py): elastic-perfectly-plastic, von Mises yield, spall damage; code units
     # (units.strength_kwargs); scaled by the liner fraction. 2D solver.
     strength: bool = False
@@ -278,6 +290,13 @@ class PhysicsConfig:
             raise ValueError("fld needs fld_c > 0, fld_kr0 > 0, fld_a >= 0, fld_kp0 >= 0")
         if self.fld and self.two_temp:
             raise ValueError("fld couples to a single gas temperature: not with two_temp")
+        if min(self.hall_di, self.cond_kappa_i0, self.cond_x0_i, self.gyro_di) < 0 or self.eta_perp_ratio <= 0:
+            raise ValueError("hall_di, cond_kappa_i0, cond_x0_i, gyro_di must be >= 0 and eta_perp_ratio > 0")
+        if (self.hall_di > 0 or self.eta_perp_ratio != 1.0 or self.gyro_di > 0) and                 (self.div_b != "ct" or self.geometry != "cartesian"):
+            raise ValueError("the Hall term, anisotropic resistivity and gyroviscosity need div_b='ct' and Cartesian "
+                             "geometry")
+        if self.cond_kappa_i0 > 0 and not self.two_temp:
+            raise ValueError("ion conduction (cond_kappa_i0) acts on T_i: it needs two_temp")
         if self.eos_liner == "mie_gruneisen" and min(self.mg_rho0, self.mg_c0, self.mg_s, self.mg_gamma0) <= 0:
             raise ValueError("eos_liner='mie_gruneisen' needs mg_rho0, mg_c0, mg_s, mg_gamma0 > 0")
 

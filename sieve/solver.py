@@ -29,6 +29,7 @@ from .eos import make_eos
 from . import fld
 from . import ct
 from . import fused
+from . import hall
 from . import transport
 from . import twotemp
 from .viscosity import viscous_step
@@ -479,11 +480,16 @@ class MHDSolver:
         if cfg.is_resistive():
             # Explicit diffusion of B: FTCS 2D limit dt <= 1 / (2 eta (1/dx^2 + 1/dy^2))
             # (= dx^2 / 4 eta for dx = dy); SSP-RK3 is stable to ~2.5x this.
-            eta_max = eta_max_of(resistivity_field(W, cfg))
+            eta_max = eta_max_of(resistivity_field(W, cfg)) * max(1.0, cfg.eta_perp_ratio)
             dt_par = 0.5 / (max(eta_max, 1e-300) * (1.0 / cfg.dx**2 + 1.0 / cfg.dy**2))
             if dt_par < dt:
                 dt = dt_par
                 self._dt_limiter = "parabolic"
+        if cfg.hall_di > 0:
+            dt_h = hall.dt_limit(W, cfg, cfg.dx, cfg.dy)
+            if dt_h < dt:
+                dt = dt_h
+                self._dt_limiter = "whistler"
         return dt
 
     @property
@@ -764,6 +770,15 @@ class MHDSolver:
             if eta is not None:
                 J = ct.edge_current([f[..., None] for f in Bf], 0, 1, cfg.dx, cfg.dy, nx, ny)[..., 0]
                 E = E + ct.edge_eta(eta, nx, ny) * J
+            if hall.active(cfg):                     # Hall term, anisotropic resistivity (sieve/hall.py)
+                Ek, Fbx, Fby, Sx, Sy, qa = hall.ohm_extra(W, Bf, eta, cfg, cfg.dx, cfg.dy, nx, ny, ng)
+                E = E + Ek
+                R[BZ, ng:ng+nx, ng:ng+ny] -= (Fbx[1:] - Fbx[:-1]) / cfg.dx + (Fby[:, 1:] - Fby[:, :-1]) / cfg.dy
+                R[EN, ng:ng+nx, ng:ng+ny] -= (Sx[1:] - Sx[:-1]) / cfg.dx + (Sy[:, 1:] - Sy[:, :-1]) / cfg.dy
+                boundary_rate = boundary_rate + (xp.sum(Sx[0] - Sx[nx]) * cfg.dy + xp.sum(Sy[:, 0] - Sy[:, ny]) * cfg.dx)
+                if cfg.two_temp and qa is not None:  # anisotropic Ohmic heat goes to the electrons
+                    rho_i = W[iRHO, ng:ng+nx, ng:ng+ny]
+                    R[RHOSE, ng:ng+nx, ng:ng+ny] += (cfg.gamma - 1) * qa * rho_i**(1 - cfg.gamma)
             E = self._emf_hook(E)
             dBf[0][...] = 0.0
             dBf[1][...] = 0.0

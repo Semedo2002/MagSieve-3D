@@ -2141,6 +2141,105 @@ def amr_physics_test():
     return ok
 
 
+def _mode_run(cfg, init, T, var_fn, k):
+    """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
+    x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(cfg)
+    W = xp.zeros((NVAR,) + s.U.shape[1:])
+    init(W, s.X)
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    ng = s.ng
+    x = to_numpy(s.x[ng:-ng])
+
+    def amp():
+        q = to_numpy(var_fn(cons_to_prim(s.U, s.eos))[ng:-ng, ng])
+        return np.sum(q * np.exp(-1j * k * x)) / x.size
+    ts, a = [0.0], [amp()]
+    while s.t < T - 1e-12:
+        s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), T - s.t)
+        s.step_ssprk3(); s.t += s.dt; s.step += 1
+        ts.append(s.t); a.append(amp())
+    a = np.array(a)
+    return -np.polyfit(ts, np.unwrap(np.angle(a)), 1)[0], abs(a[-1]) / abs(a[0]), s.step, s._dt_limiter, s
+
+
+def hall_test():
+    """Generalized Ohm's law (sieve/hall.py). (1) Circularly polarized waves along B_0 with the Hall term
+    (d_i k = 1): the whistler and ion-cyclotron branches, omega = k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2), measured from
+    the phase of B_y + i B_z, converge at second order. (2) Anisotropic resistivity: a B_z ripple decays at
+    eta_par k^2 when its current is along B_0 and at 1.96 eta_par k^2 when across it. (3) Hall + anisotropic
+    resistivity in a periodic sheared, magnetized box: total energy conserved to round-off, div B at round-off."""
+    print("\n--- Hall term and anisotropic resistivity ---"); sys.stdout.flush()
+    ok = True
+    k = 2 * np.pi
+    di = 1 / k
+    base = dict(ny=4, x_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=5 / 3, B_transverse=1.0, bc_x_type="periodic",
+                bc_y_type="periodic", powell_source=False, diag_interval=10**9, snapshot_times=[])
+    for branch in ("whistler", "ion cyclotron"):
+        a = k * di / 2
+        w = -k * (np.sqrt(1 + a * a) + a) if branch == "whistler" else k * (np.sqrt(1 + a * a) - a)
+        errs = []
+        for N in (32, 64):
+            def init(W, X, w=w):
+                W[iRHO], W[iPR], W[iBX] = 1.0, 10.0, 1.0
+                W[iBY], W[iBZ] = 1e-4 * xp.cos(k * X), 1e-4 * xp.sin(k * X)
+                W[iVY], W[iVZ] = -(k / w) * W[iBY], -(k / w) * W[iBZ]
+            cfg = Config(nx=N, y_max=4.0 / N, hall_di=di, **base)
+            wm, amp, n, lim, _ = _mode_run(cfg, init, 2 * np.pi / abs(w), lambda W: W[iBY] + 1j * W[iBZ], k)
+            errs.append(abs(wm - w) / abs(w))
+        good = errs[0] < 1e-2 and errs[1] < 2.5e-3 and errs[0] / errs[1] > 3.0
+        ok = ok and good
+        print(f"  {branch:13s} (d_i k = 1): omega exact {w:+.4f}; relative error N=32 {errs[0]:.1e}, N=64 {errs[1]:.1e} "
+              f"(order {np.log2(errs[0] / errs[1]):.1f})  [{'PASS' if good else 'FAIL'}]")
+
+    eta, ratio = 0.01, 1.96
+    rates = {}
+    # the ripple varies along x, across B_0 in both cases (k . B_0 = 0: no Alfven wave, which resistivity would damp
+    # at half the rate): B_0 along y with a B_z ripple (J along y, parallel), B_0 along z with a B_z ripple held in
+    # total pressure balance (J along y, perpendicular)
+    for name, B0 in (("parallel", iBY), ("perpendicular", iBZ)):
+        def init(W, X, B0=B0):
+            W[iRHO], W[iPR], W[B0] = 1.0, 100.0, 1.0
+            W[iBZ] = W[iBZ] + 1e-3 * xp.sin(k * X)
+            if B0 == iBZ:                            # p + B^2/2 uniform
+                W[iPR] = 100.0 - 0.5 * (W[iBZ]**2 - 1.0)
+        cfg = Config(nx=64, y_max=4.0 / 64, eta_resistivity=eta, eta_perp_ratio=ratio, **base)
+        T = 1.0
+        _, amp, _, _, _ = _mode_run(cfg, init, T, lambda W: W[iBZ], k)
+        rates[name] = -np.log(amp) / T
+    exp_par, exp_perp = eta * k * k, ratio * eta * k * k
+    e1, e2 = abs(rates["parallel"] / exp_par - 1), abs(rates["perpendicular"] / exp_perp - 1)
+    good = e1 < 0.01 and e2 < 0.01
+    ok = ok and good
+    print(f"  anisotropic resistivity (eta_perp = 1.96 eta_par): B_z ripple decay rate with J along B "
+          f"{rates['parallel']:.4f} (eta_par k^2 = {exp_par:.4f}), across B {rates['perpendicular']:.4f} "
+          f"(eta_perp k^2 = {exp_perp:.4f})  [{'PASS' if good else 'FAIL'}]")
+
+    cfg = Config(nx=48, ny=48, x_max=1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=5 / 3, B_transverse=1.0,
+                 bc_x_type="periodic", bc_y_type="periodic", powell_source=False, hall_di=0.05, eta_resistivity=2e-3,
+                 eta_perp_ratio=1.96, diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(cfg)
+    W = xp.zeros((NVAR,) + s.U.shape[1:])
+    X, Y = s.X, s.Y
+    W[iRHO], W[iPR] = 1.0 + 0.2 * xp.sin(2 * np.pi * X), 2.0
+    W[iVX], W[iVY] = 0.3 * xp.sin(2 * np.pi * Y), 0.2 * xp.cos(2 * np.pi * X)
+    W[iBX], W[iBY], W[iBZ] = 0.5 + 0.3 * xp.sin(2 * np.pi * Y), 0.4 * xp.cos(4 * np.pi * X), 0.6 + 0.2 * xp.sin(2 * np.pi * (X + Y))
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    E0 = _energy(s)
+    div = 0.0
+    for _ in range(60):
+        s.dt = s.compute_dt(cons_to_prim(s.U, s.eos)); s.step_ssprk3(); s.t += s.dt; s.step += 1
+        div = max(div, s.div_b_max())
+    dE = abs(_energy(s) - E0) / abs(E0)
+    good = dE < 1e-13 and div < 1e-12
+    ok = ok and good
+    print(f"  Hall + anisotropic resistivity, periodic box, 60 steps ({s._dt_limiter}-limited): energy {dE:.1e}, "
+          f"div B {div:.1e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 VERIFICATION_TESTS = {
     "brio_wu": brio_wu_test,
     "alfven": alfven_convergence_test,
@@ -2177,6 +2276,7 @@ VERIFICATION_TESTS = {
     "validation": validation_test,
     "amr": amr_test,
     "amr_physics": amr_physics_test,
+    "hall": hall_test,
 }
 
 

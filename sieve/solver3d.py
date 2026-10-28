@@ -140,6 +140,8 @@ class MHDSolver3D:
             raise ValueError("solver3d needs nz >= 4")
         if cfg.geometry != "cartesian":
             raise NotImplementedError("cylindrical geometry is implemented in the 2D solver")
+        if cfg.hall_di > 0 or cfg.eta_perp_ratio != 1.0 or cfg.gyro_di > 0 or cfg.cond_kappa_i0 > 0:
+            raise NotImplementedError("the Hall term, anisotropic resistivity and ion transport are in the 2D solver")
         self.cfg = cfg
         self.strength = cfg.strength
         # float gamma for one ideal gas, eos.EOS for two materials (volume-fraction tracer)

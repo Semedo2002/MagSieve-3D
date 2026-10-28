@@ -58,9 +58,9 @@ from . import ct
 def _check(cfg):
     if cfg.geometry != "cartesian" or cfg.div_b != "ct":
         raise NotImplementedError("AMR: 2D Cartesian with constrained transport")
-    if cfg.visc_coeff > 0 or cfg.nernst_coeff > 0 or cfg.rad_coeff > 0 or cfg.two_temp:
-        raise NotImplementedError("AMR: viscosity, Nernst, two-temperature and optically thin radiation are not "
-                                  "coupled across levels yet")
+    if cfg.visc_coeff > 0 or cfg.nernst_coeff > 0 or cfg.rad_coeff > 0 or cfg.two_temp or cfg.hall_di > 0             or cfg.eta_perp_ratio != 1.0 or cfg.gyro_di > 0:
+        raise NotImplementedError("AMR: viscosity, Nernst, two-temperature, optically thin radiation, the Hall term, "
+                                  "anisotropic resistivity and gyroviscosity are not coupled across levels yet")
 
 
 # ------------------------------------------------------------------ kernels
