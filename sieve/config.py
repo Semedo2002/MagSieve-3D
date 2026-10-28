@@ -195,6 +195,20 @@ class PhysicsConfig:
     fld_tol: float = 1e-11
     fld_maxit: int = 5000
     fld_picard: int = 4
+    # multigroup FLD (sieve/radiation_multigroup.py): fld_groups > 0 photon groups, edges in code temperature units
+    # (fld_group_edges, or log-spaced between fld_group_emin and fld_group_emax; the first group starts at 0, the
+    # last runs to infinity); opacities "grey" (the power laws in every group), "kramers" (free-free nu^-3 shape
+    # scaled to the grey Planck mean, times 1 + fld_edge_jump above a photo-ionization edge at fld_edge), or a
+    # group table (fld_mg_table, from tools/generate_sesame.py --groups)
+    fld_groups: int = 0
+    fld_group_edges: tuple = ()
+    fld_group_emin: float = 0.1
+    fld_group_emax: float = 100.0
+    fld_mg_opacity: str = "grey"
+    fld_edge: float = 0.0
+    fld_edge_jump: float = 0.0
+    fld_mg_table: str = ""
+    fld_mg_absorption: float = 1.0                   # scales every kP_g (0: groups only diffuse, no exchange)
     # magnetized electron conduction (physics.conduction_div), 0 = off: k_par = cond_kappa0 T^5/2,
     # k_perp = k_par/(1 + x^2), x = cond_x0 |B| T^3/2 / rho, T = p/rho; fuel only (tracer < cond_tracer_max).
     # Split step integrated with RKL2 super-time-stepping, so it does not limit the time step.
@@ -288,6 +302,10 @@ class PhysicsConfig:
         if self.fld and (self.fld_c <= 0 or (self.fld_kr0 <= 0 and not self.fld_opacity_table) or self.fld_a < 0
                          or self.fld_kp0 < 0):
             raise ValueError("fld needs fld_c > 0, fld_kr0 > 0, fld_a >= 0, fld_kp0 >= 0")
+        if self.fld_groups < 0 or (self.fld_groups > 0 and not self.fld) or self.fld_mg_opacity not in ("grey", "kramers"):
+            raise ValueError("fld_groups > 0 needs fld=True; fld_mg_opacity is grey or kramers")
+        if self.fld_group_edges and len(self.fld_group_edges) != self.fld_groups - 1:
+            raise ValueError("fld_group_edges holds the fld_groups - 1 inner edges")
         if self.fld and self.two_temp:
             raise ValueError("fld couples to a single gas temperature: not with two_temp")
         if min(self.hall_di, self.cond_kappa_i0, self.cond_x0_i, self.gyro_di) < 0 or self.eta_perp_ratio <= 0:

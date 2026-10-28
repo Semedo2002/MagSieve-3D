@@ -23,6 +23,7 @@ sieve/            solver package
   diagnostics.py  mixing, enstrophy, interface spectrum, div B, energy
   circuit.py      RLC drive circuit coupled to an r-z liner (magnetic piston, energy-consistent inductance)
   fld.py          grey flux-limited diffusion radiation (Levermore-Pomraning, implicit CG on the GPU)
+  radiation_multigroup.py  multigroup FLD: photon groups, group opacities, coupled implicit BiCGStab solve
   parallel.py     MPI slab domain decomposition of the 2D and 3D solvers (halo and CT edge exchange)
   io3d.py         3D snapshots: VTK ImageData (.vti/.pvd) and HDF5
   tabular.py      tabulated EOS / opacities (SESAME ASCII, .npz) with GPU inversion and analytic fallback
@@ -243,6 +244,35 @@ also in r-z) goes to a matrix-free Jacobi-preconditioned conjugate-gradient solv
 is written in face-flux form from the solution, so gas + radiation energy is conserved to round-off whatever
 the solver residual. 2D, r-z and 3D. Radiation pressure is left out (fine while E_r/3 << p), and FLD couples to
 a single gas temperature (not with `two_temp`).
+
+### Multigroup radiation diffusion
+
+`fld_groups > 0` splits the FLD radiation into photon groups (`sieve/radiation_multigroup.py`):
+
+    dE_g/dt + div(v E_g) = div(D_g grad E_g) + c rho kP_g (a T^4 b_g(T) - E_g),   D_g = c lambda(R_g) / (rho kR_g)
+
+- **Groups:** bands of photon energy in code temperature units (`fld_group_edges`, or log-spaced between
+  `fld_group_emin` and `fld_group_emax`). The first starts at 0 and the last runs to infinity, so the Planck
+  fractions b_g sum to 1.
+- **Group opacities (Planck and Rosseland means):**
+  - `grey`: the power laws in every group;
+  - `kramers`: a free-free nu^-3 (1 - e^-x) shape scaled to the grey Planck mean, times 1 + `fld_edge_jump`
+    above a photo-ionization edge at `fld_edge`, with group means by quadrature;
+  - a table (`fld_mg_table`): `python tools/generate_sesame.py --groups 10 100 1000` writes kR_g, kP_g from the
+    generator's free-free, screened-hydrogenic bound-free and Thomson model (bound-free edges included, no
+    lines).
+- **Implicit step:** backward Euler with a T^4 b_g linearised and the gas temperature eliminated. This couples
+  the groups per cell through one rank-one term, so the system is solved by BiCGStab on the GPU, preconditioned
+  with each cell's exact group-block inverse (Sherman-Morrison).
+- **Conservation:** the update is written in face-flux form plus the exchange the gas receives back, so gas +
+  radiation energy is conserved to round-off.
+- **Checks (`--test multigroup`):**
+  - one group equals grey FLD;
+  - grey groups sum to grey FLD in the thick limit;
+  - Kramers groups with an edge relax to the Planck spectrum;
+  - decoupled groups diffuse with their own D_g over three decades;
+  - a solver run with an Al group table conserves energy.
+- **Scope:** 2D (Cartesian, r-z) and 3D; not under AMR (grey FLD is).
 
 ### Tabulated EOS and opacities
 
@@ -481,6 +511,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | validation | analytic signals with known noise: chi^2_nu of the true model 1.001, RMS 1.000 sigma; a 37 ns delay recovered by the cross-correlation offset and the fitted shift to 0.5 ns; a 1-parameter scan recovers the amplitude with the Fisher sigma; CSV round trip |
 | amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a T-junction of three patches keeps div B at 6e-15 (each shared corner takes the lowest-index patch's EMF once; corrected twice, as before, div B grew to 7e-3); CUDA-graph replay equals the eager run exactly; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
 | cylindrical3d | 3D (r, theta, z) with d/dtheta = 0 vs the 2D r-z solver (swirl, B_phi, B_z, z-dependent flow, the axis): 1.6e-14 after 30 steps; an m = 1 blob carried onto the axis along a uniform field: centroid error 3.4e-2 -> 1.4e-2 and field error 2.7e-2 -> 1.2e-2 from 16 x 24 to 32 x 48 cells, energy 4e-14, div B 2e-14 |
+| multigroup | one group = grey FLD (1e-8 at the solver tolerance); 8 grey groups sum to grey FLD in the thick limit (within the per-group limiter), energy to round-off; 12 Kramers groups with an edge relax to the Planck spectrum; decoupled groups diffuse with D_g = c / (3 rho kR_g) over three decades of D (peak within 2% of the exact Gaussian); 2D solver with an Al group table: gas + radiation energy to round-off |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |

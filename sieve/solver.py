@@ -27,6 +27,7 @@ from .config import (
 from .diagnostics import diagnostics_for_solver
 from .eos import make_eos
 from . import fld
+from . import radiation_multigroup
 from . import ct
 from . import fused
 from . import hall
@@ -190,7 +191,8 @@ class MHDSolver:
         # radiated energy (split step after each RK step; removed from E, so it is a budget term)
         self._acc_rad = xp.zeros(())
         # grey FLD radiation energy density on interior cells, and the radiation energy that entered the domain
-        self.Er = xp.zeros((config.nx, config.ny)) if config.fld else None
+        self.Er = None if not config.fld else xp.zeros(((config.fld_groups,) if config.fld_groups else ())
+                                                       + (config.nx, config.ny))    # (groups, x, y) if multigroup
         self.fld_inflow = 0.0
         self._inflow_U = None
         self._inflow_superfast = None
@@ -983,9 +985,14 @@ class MHDSolver:
             Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
             radial = (self.rf[ng:ng + cfg.nx + 1], self.rc[ng:ng + cfg.nx]) if self.cyl else None
             faces = [] if self._records_fluxes else None
-            _, din, self.fld_iters = fld.step(self.Er, Ui, self.eos, cfg, (cfg.dx, cfg.dy), self._periodic(), dt,
-                                             radial=radial, advect=cfg.fld_advect, ghost=self._fld_ghosts(),
-                                             faces=faces)
+            if cfg.fld_groups:                       # multigroup (sieve/radiation_multigroup.py)
+                _, din, self.fld_iters = radiation_multigroup.step(self.Er, Ui, self.eos, cfg, (cfg.dx, cfg.dy),
+                                                                   self._periodic(), dt, radial=radial,
+                                                                   advect=cfg.fld_advect)
+            else:
+                _, din, self.fld_iters = fld.step(self.Er, Ui, self.eos, cfg, (cfg.dx, cfg.dy), self._periodic(), dt,
+                                                 radial=radial, advect=cfg.fld_advect, ghost=self._fld_ghosts(),
+                                                 faces=faces)
             self.fld_inflow += din
             if faces:
                 self._add_split_flux("Er", None, *faces)

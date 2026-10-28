@@ -2392,6 +2392,143 @@ def _cyl3d_blob(Nr, Nth, T=0.5, U=1.0, B0=0.5):
             "dE": abs(s.total_energy() - E0 - float(s._acc_boundary)) / E0, "div": div}
 
 
+def multigroup_test():
+    """Multigroup FLD (sieve/radiation_multigroup.py). (1) One group spanning all frequencies is grey FLD: equal to
+    fld.step to the solver tolerance. (2) Eight groups with frequency-independent opacity, optically thick: the sum
+    over groups follows grey FLD (to the per-group limiter, 2e-3), gas + radiation energy conserved to round-off.
+    (3) Kramers (nu^-3) opacity with a photo-ionization edge in a uniform box: the groups relax to the Planck
+    spectrum a T^4 b_g(T) at the common final temperature, energy to round-off. (4) Decoupled groups (no absorption)
+    in the diffusion limit: each Gaussian spreads with its own D_g = c / (3 rho kR_g), the group Rosseland means of
+    the Kramers shape spanning three decades. (5) In the 2D solver with a group-opacity table from
+    tools/generate_sesame.py (Al, bound-free edges): a hot spot radiates, total energy conserved to round-off."""
+    import tempfile
+    from sieve import fld, radiation_multigroup as mg
+    print("\n--- Multigroup flux-limited diffusion ---"); sys.stdout.flush()
+    ok = True
+
+    def cfg(**kw):
+        c = dict(nx=48, ny=48, x_max=1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=5 / 3, B_transverse=0.0,
+                 bc_x_type="periodic", bc_y_type="periodic", diag_interval=10**9, snapshot_times=[], fld=True,
+                 fld_c=10.0, fld_a=1.0, fld_advect=False, fld_tol=1e-12)
+        c.update(kw)
+        return Config(**c)
+
+    def gas(n, p):
+        x = (np.arange(n) + 0.5) / n
+        X, Y = np.meshgrid(x, x, indexing="ij")
+        W = xp.zeros((NVAR, n, n))
+        W[iRHO] = 1.0
+        W[iPR] = xp.asarray(p(X, Y))
+        return prim_to_cons(W, 5 / 3), X, Y
+    bump = lambda X, Y, w: np.exp(-((X - .5)**2 + (Y - .5)**2) / w)
+    h, per = (1 / 48, 1 / 48), (True, True)
+
+    # (1) one group = grey
+    U1, X, Y = gas(48, lambda X, Y: 1.0 + 2.0 * bump(X, Y, 0.01))
+    U2 = U1.copy()
+    E1 = xp.asarray(0.5 + 0.5 * bump(X, Y, 0.005))[None].copy()
+    E2 = E1[0].copy()
+    kw = dict(fld_kr0=5.0, fld_kp0=1.0)
+    for _ in range(10):
+        mg.step(E1, U1, 5 / 3, cfg(fld_groups=1, **kw), h, per, 2e-3, advect=False)
+        fld.step(E2, U2, 5 / 3, cfg(**kw), h, per, 2e-3, advect=False)
+    d1 = max(float(xp.max(xp.abs(E1[0] - E2)) / xp.max(E2)), float(xp.max(xp.abs(U1[EN] - U2[EN])) / xp.max(U2[EN])))
+    good = d1 < 1e-8
+    ok = ok and good
+    print(f"  one group vs grey FLD, 10 steps: {d1:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+    # (2) eight grey groups, thick: sum over groups vs grey
+    U1, X, Y = gas(48, lambda X, Y: 1.0 + 2.0 * bump(X, Y, 0.01))
+    U2 = U1.copy()
+    c8 = cfg(fld_groups=8, fld_kr0=50.0, fld_kp0=1.0)
+    W = cons_to_prim(U1, 5 / 3)
+    B, _ = mg.planck_groups(mg.edges_of(c8), W[iPR] / W[iRHO], 1.0)
+    Er0 = xp.asarray(0.5 + 0.5 * bump(X, Y, 0.005))
+    Eg = B / xp.sum(B, axis=0) * Er0[None]
+    Egrey = Er0.copy()
+    tot0 = float(xp.sum(U1[EN]) + xp.sum(Eg))
+    for _ in range(10):
+        mg.step(Eg, U1, 5 / 3, c8, h, per, 2e-3, advect=False)
+        fld.step(Egrey, U2, 5 / 3, cfg(fld_kr0=50.0, fld_kp0=1.0), h, per, 2e-3, advect=False)
+    d2 = float(xp.max(xp.abs(xp.sum(Eg, axis=0) - Egrey)) / xp.max(Egrey))
+    c2_ = abs(float(xp.sum(U1[EN]) + xp.sum(Eg)) - tot0) / tot0
+    good = d2 < 2e-3 and c2_ < 1e-14
+    ok = ok and good
+    print(f"  8 grey groups vs grey FLD (thick): sum of groups within {d2:.1e}, energy {c2_:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+    # (3) Kramers + edge, uniform box: relaxation to the Planck spectrum
+    ck = cfg(nx=8, ny=8, fld_groups=12, fld_mg_opacity="kramers", fld_kp0=50.0, fld_kr0=5.0, fld_edge=3.0,
+             fld_edge_jump=10.0, fld_group_emin=0.05, fld_group_emax=30.0)
+    U, _, _ = gas(8, lambda X, Y: 2.0 + 0 * X)
+    E = xp.zeros((12, 8, 8)) + 0.01
+    tot0 = float(xp.sum(U[EN]) + xp.sum(E))
+    for _ in range(300):
+        mg.step(E, U, 5 / 3, ck, (1 / 8, 1 / 8), per, 0.05, advect=False)
+    W = cons_to_prim(U, 5 / 3)
+    Bg, _ = mg.planck_groups(mg.edges_of(ck), W[iPR] / W[iRHO], 1.0)
+    d3 = float(xp.max(xp.abs(E - Bg)) / xp.max(Bg))
+    c3_ = abs(float(xp.sum(U[EN]) + xp.sum(E)) - tot0) / tot0
+    good = d3 < 1e-4 and c3_ < 1e-14
+    ok = ok and good
+    print(f"  Kramers + edge, 12 groups, uniform box: relaxed spectrum vs a T^4 b_g(T) {d3:.1e}, energy {c3_:.1e}  "
+          f"[{'PASS' if good else 'FAIL'}]")
+
+    # (4) decoupled groups in the diffusion limit vs analytic Gaussian spreading
+    n4 = 96
+    U, X, Y = gas(n4, lambda X, Y: 1.0 + 0 * X)
+    s0 = 0.004
+    E = xp.asarray(np.repeat((1e-8 + bump(X, Y, s0))[None], 4, 0))
+    th = xp.ones((n4, n4))
+    # the Kramers group opacities scale with the grey kP coefficient (1e4: every group optically thick);
+    # fld_mg_absorption = 0 removes the exchange with the gas, so the groups only diffuse
+    c4 = cfg(nx=n4, ny=n4, fld_groups=4, fld_mg_opacity="kramers", fld_kp0=1e4, fld_kr0=1.0,
+             fld_group_emin=0.5, fld_group_emax=4.0, fld_picard=1, fld_a=0.0, fld_mg_absorption=0.0)
+    _, kR = mg._kramers_means(mg.edges_of(c4), th, xp.full((n4, n4), 1e4), 0.0, 0.0)
+    T4, nst = 0.02, 20
+    for _ in range(nst):
+        mg.step(E, U, 5 / 3, c4, (1 / n4, 1 / n4), per, T4 / nst, advect=False)
+    errs, Ds = [], []
+    for g in range(4):
+        D = 10.0 / (3.0 * float(kR[g][0, 0]))
+        amp = float(xp.max(E[g]))
+        errs.append(abs(amp / (s0 / (s0 + 4 * D * T4)) - 1))
+        Ds.append(D)
+    good = max(errs) < 0.02 and Ds[-1] / Ds[0] > 100
+    ok = ok and good
+    print(f"  decoupled groups, diffusion limit: D_g = c/(3 rho kR_g) from {Ds[0]:.1e} to {Ds[-1]:.1e}; peak vs exact "
+          f"Gaussian within {max(errs):.1e}  [{'PASS' if good else 'FAIL'}]")
+
+    # (5) solver run with a generated group table
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
+    import generate_sesame as gs
+    with np.errstate(all="ignore"):
+        gt = gs.group_table("al", [0.0, 10.0, 100.0, 1000.0, np.inf], nr=24, nt=24, pts=48)
+    path = os.path.join(tempfile.mkdtemp(prefix="mg_"), "al_groups.npz")
+    np.savez(path, **gt)
+    # code units: rho in g/cc, theta in units of 1 eV, lengths in mm; opacity conversion via tab_* units
+    c5 = Config(nx=32, ny=32, x_max=1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=5 / 3, B_transverse=0.0,
+                bc_x_type="periodic", bc_y_type="periodic", diag_interval=10**9, snapshot_times=[], fld=True,
+                fld_c=50.0, fld_a=1e-3, fld_kr0=1.0, fld_advect=True, fld_groups=4, fld_mg_table=path, tab_rho_unit=1000.0,
+                tab_L_unit=1e-3, tab_T_unit=11604.518, fld_tol=1e-10)
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(c5)
+    W = xp.zeros((NVAR,) + s.U.shape[1:])
+    W[iRHO] = 0.01
+    W[iPR] = 0.01 * (5.0 + 200.0 * xp.exp(-((s.X - 0.5)**2 + (s.Y - 0.5)**2) / 0.01))
+    W[iVX] = 0.5
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    E0 = _energy(s) + s.radiation_energy()
+    for _ in range(15):
+        s.dt = s.compute_dt(cons_to_prim(s.U, s.eos)); s.step_ssprk3(); s.t += s.dt; s.step += 1
+    c5_ = abs(_energy(s) + s.radiation_energy() - E0) / E0
+    erad = s.radiation_energy()
+    good = c5_ < 1e-13 and erad > 0 and bool(xp.all(xp.isfinite(s.Er)))
+    ok = ok and good
+    print(f"  2D solver, Al group table (4 groups, bound-free edges), hot spot, 15 steps: gas + radiation energy "
+          f"{c5_:.1e}, radiation now {erad / E0:.1e} of the total  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -2727,6 +2864,7 @@ VERIFICATION_TESTS = {
     "amr_physics": amr_physics_test,
     "amr_transport": amr_transport_test,
     "cylindrical3d": cylindrical3d_test,
+    "multigroup": multigroup_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

@@ -21,6 +21,7 @@ from . import twotemp
 from . import transport
 from . import strength as stren
 from . import fld
+from . import radiation_multigroup
 from .viscosity import viscous_step
 from .solver import MHDSolver, to_numpy
 
@@ -198,7 +199,7 @@ class MHDSolver3D:
         self._acc_boundary = xp.zeros(())
         self._acc_powell = xp.zeros(())
         self._acc_rad = xp.zeros(())
-        self.Er = xp.zeros((cfg.nx, cfg.ny, cfg.nz)) if cfg.fld else None
+        self.Er = None if not cfg.fld else xp.zeros(((cfg.fld_groups,) if cfg.fld_groups else ()) + (cfg.nx, cfg.ny, cfg.nz))
         self.fld_inflow = 0.0
         self._rate_boundary = xp.zeros(())
         self._rate_powell = xp.zeros(())
@@ -771,8 +772,9 @@ class MHDSolver3D:
                          electron_Z=cfg.z_ion if cfg.two_temp else None)
             self._acc_rad += xp.sum(dE) * cfg.dx * cfg.dy * cfg.dz
         if cfg.fld:
-            _, din, self.fld_iters = fld.step(self.Er, self.U[inner], self.eos, cfg, (cfg.dx, cfg.dy, cfg.dz),
-                                             self._periodic(), dt, advect=cfg.fld_advect)
+            step = radiation_multigroup.step if cfg.fld_groups else fld.step
+            _, din, self.fld_iters = step(self.Er, self.U[inner], self.eos, cfg, (cfg.dx, cfg.dy, cfg.dz),
+                                          self._periodic(), dt, advect=cfg.fld_advect)
             self.fld_inflow += din
         if cfg.cond_kappa0 > 0:
             per = (cfg.get_bc_x() == "periodic", True, True)

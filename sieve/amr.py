@@ -65,6 +65,8 @@ from . import ct
 def _check(cfg):
     if cfg.geometry != "cartesian" or cfg.div_b != "ct":
         raise NotImplementedError("AMR: 2D Cartesian with constrained transport")
+    if cfg.fld_groups:
+        raise NotImplementedError("AMR: multigroup FLD is not coupled across levels (grey FLD is)")
 
 
 # ------------------------------------------------------------------ kernels

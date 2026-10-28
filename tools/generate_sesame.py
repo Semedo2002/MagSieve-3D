@@ -269,14 +269,24 @@ def thermo(m, rho, T, h=1e-4):
 
 # ------------------------------------------------------------------ opacities
 
-def opacities(m, rho, T, nu_pts=300):
-    """(kappa_R, kappa_P) in m^2/kg: frequency-integrated Rosseland and Planck means"""
+def opacities(m, rho, T, nu_pts=300, band=None):
+    """(kappa_R, kappa_P) in m^2/kg: frequency-integrated Rosseland and Planck means; band = (E_lo, E_hi) photon
+    energies in eV restricts both means to that band (multigroup tables; E_hi may be inf)"""
     z = zbar(m, rho, T)
     ni = rho / (m["A"] * MU)
     ne = z * ni
-    u = np.geomspace(1e-3, 60.0, nu_pts)                            # h nu / k T
     shp = np.shape(rho * T)
-    U = u.reshape((1,) * len(shp) + (-1,))
+    if band is None:
+        u = np.geomspace(1e-3, 60.0, nu_pts)                        # h nu / k T
+        U = u.reshape((1,) * len(shp) + (-1,))
+    else:                                            # per-cell u range of the band (log-spaced)
+        kT = np.broadcast_to(T, shp)[..., None] / EV                # eV
+        lo = np.maximum(band[0] / kT, 1e-4)
+        hi = (band[1] / kT) if np.isfinite(band[1]) else lo + 60.0
+        hi = np.maximum(hi, lo * (1 + 1e-9))
+        s_ = np.linspace(0.0, 1.0, nu_pts)
+        U = np.exp(np.log(lo) + (np.log(hi) - np.log(lo)) * s_)
+        u = None
     Tc, rc, zc, nic, nec = (np.broadcast_to(a, shp)[..., None] for a in (T, rho, z, ni, ne))
     nu = U * KB * Tc / (2 * np.pi * HBAR)
     stim = -np.expm1(-U)
@@ -298,9 +308,27 @@ def opacities(m, rho, T, nu_pts=300):
     k_es = 6.6524587e-29 * nec / rc
     w_P = U**3 / np.expm1(U)                                        # Planck weight
     w_R = U**4 * np.exp(U) / np.expm1(U)**2                         # dB/dT weight
-    kP = np.trapz(a_abs * w_P, u, axis=-1) / np.trapz(w_P, u, axis=-1)
-    kR = np.trapz(w_R, u, axis=-1) / np.trapz(w_R / (a_abs + k_es), u, axis=-1)
+    X = u if u is not None else U
+    integ = (lambda f: np.trapz(f, u, axis=-1)) if u is not None else (lambda f: np.trapz(f, X, axis=-1))
+    kP = integ(a_abs * w_P) / np.maximum(integ(w_P), 1e-300)
+    kR = integ(w_R) / np.maximum(integ(w_R / (a_abs + k_es)), 1e-300)
     return kR, kP
+
+
+def group_table(name, edges_eV, nr=120, nt=110, pts=96):
+    """multigroup opacity table: kappa_R_g, kappa_P_g (G, nr, nt) in m^2/kg for the photon-energy groups between
+    edges_eV (first 0, last inf allowed), on the material's rho x T grid; with group_edges_eV for the solver"""
+    m = MATERIALS[name]
+    rho = m["rho0"] * np.geomspace(*m["rho"], nr)
+    T = np.geomspace(*m["T"], nt)
+    edges = np.asarray(edges_eV, float)
+    G = len(edges) - 1
+    kR, kP = np.zeros((G, nr, nt)), np.zeros((G, nr, nt))
+    for g in range(G):
+        for i in range(nr):
+            kR[g, i], kP[g, i] = opacities(m, np.full(nt, rho[i]), T, nu_pts=pts, band=(edges[g], edges[g + 1]))
+    return {"rho": rho, "T": T, "kappa_R_g": np.maximum(kR, 1e-300), "kappa_P_g": np.maximum(kP, 1e-300),
+            "group_edges_eV": edges}
 
 
 # ------------------------------------------------------------------ tables
@@ -400,6 +428,9 @@ def main():
     ap.add_argument("--nt", type=int, default=160)
     ap.add_argument("--no-opacity", action="store_true")
     ap.add_argument("--sesame", action="store_true", help="also write SESAME ASCII (301, 502, 505)")
+    ap.add_argument("--groups", type=float, nargs="+", default=None,
+                    help="also write <material>_groups.npz with multigroup opacities: inner group edges in eV "
+                         "(the first group starts at 0, the last runs to infinity)")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tables"))
     a = ap.parse_args()
     for name in a.materials:
@@ -407,6 +438,9 @@ def main():
         path = write(name, tab, a.out, a.sesame)
         m = MATERIALS[name]
         p0, e0 = eos(m, np.array([m["rho0"]]), np.array([300.0]))
+        if a.groups:
+            gt = group_table(name, [0.0] + sorted(a.groups) + [np.inf])
+            np.savez(os.path.join(a.out, f"{name}_groups.npz"), **gt)
         print(f"{name}: {path} ({a.nr} x {a.nt}); p(rho0, 300 K) = {p0[0] / 1e9:+.3f} GPa, "
               f"Z*(rho0, 1 eV) = {zbar(m, m['rho0'], EV):.2f}")
 
