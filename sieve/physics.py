@@ -380,12 +380,13 @@ def rkl2(y0, L, dt, dt_expl, s_max=60):
 
 
 def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5, radial=None, wall_T=None,
-            perp="braginskii", electron_Z=None, ghost_U=None, flux_out=None):
+            perp="braginskii", electron_Z=None, ghost_U=None, flux_out=None, ion_Z=None):
     """Split step: anisotropic conduction over dt on the interior conservative array U (in place on U[EN]),
     with density, momentum and B frozen, by RKL2. Returns the number of stages used (0 if nothing to do).
     ghost_U: the ghost-inclusive array U is the interior of; its first ghost ring is the neighbour data of the
     edge cells (held fixed over the step) and the domain faces conduct. flux_out: a list that receives the
-    time-integrated face fluxes (one array per axis, energy per area)."""
+    time-integrated face fluxes (one array per axis, energy per area). ion_Z: two-temperature ion conduction
+    instead, at theta_i = (1 + Z) p_i / rho with the electron pressure held (the electron entropy is untouched)."""
     rho = xp.maximum(U[RHO], FLOOR_RHO)
     vf = not _ideal(gamma) and gamma.volume_fraction
     a = xp.clip(U[RHOC] if vf else U[RHOC] / rho, 0.0, 1.0)
@@ -404,6 +405,12 @@ def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5, radial=N
 
         def theta_of(E):
             return (1 + Z) / Z * xp.maximum(p_of(E) - p_ion, 0.0) / rho
+    elif ion_Z is not None:
+        from . import twotemp
+        _, _, pe_fixed = twotemp.pressures(U, gamma)
+
+        def theta_of(E):
+            return (1 + ion_Z) * xp.maximum(p_of(E) - pe_fixed, 0.0) / rho
     else:
         def theta_of(E):
             return xp.maximum(p_of(E), 0.0) / rho
@@ -425,6 +432,8 @@ def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5, radial=N
     phi1 = 1.0 / (gamma - 1) if _ideal(gamma) else gamma.coeffs(rho, a)[0]
     if electron_Z is not None:
         phi1 = electron_Z / ((1 + electron_Z) * (gamma - 1))
+    elif ion_Z is not None:                      # d eps / d theta_i = rho / ((1 + Z)(gamma - 1))
+        phi1 = 1.0 / ((1 + ion_Z) * (gamma - 1))
     D = xp.where(a < tracer_max, kappa0 * theta_of(U[EN])**2.5 / (rho * phi1), 0.0)
     D_max = float(xp.max(D))
     if D_max <= 0:

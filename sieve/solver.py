@@ -30,6 +30,7 @@ from . import fld
 from . import ct
 from . import fused
 from . import hall
+from . import ions
 from . import transport
 from . import twotemp
 from .viscosity import viscous_step
@@ -485,6 +486,11 @@ class MHDSolver:
             if dt_par < dt:
                 dt = dt_par
                 self._dt_limiter = "parabolic"
+        if cfg.gyro_di > 0:
+            dt_g = ions.dt_limit(W, self.U, cfg, cfg.dx, cfg.dy)
+            if dt_g < dt:
+                dt = dt_g
+                self._dt_limiter = "gyroviscous"
         if cfg.hall_di > 0:
             dt_h = hall.dt_limit(W, cfg, cfg.dx, cfg.dy)
             if dt_h < dt:
@@ -816,6 +822,13 @@ class MHDSolver:
                 boundary_rate = boundary_rate + (
                     xp.sum(fx[2][0, ng:ng+ny] - fx[2][nx, ng:ng+ny]) * cfg.dy
                     + xp.sum(fy[2][ng:ng+nx, 0] - fy[2][ng:ng+nx, ny]) * cfg.dx)
+        if cfg.gyro_di > 0:                          # ion gyroviscosity (sieve/ions.py)
+            gfx, gfy = ions.gyroviscous_fluxes(W, U, cfg, cfg.dx, cfg.dy, nx, ny, ng)
+            for var, gx, gy in ((MX, gfx[0], gfy[0]), (MY, gfx[1], gfy[1]), (MZ, gfx[2], gfy[2]), (EN, gfx[3], gfy[3])):
+                R[var, ng:ng+nx, ng:ng+ny] -= ((gx[1:, ng:ng+ny] - gx[:-1, ng:ng+ny]) / cfg.dx
+                                               + (gy[ng:ng+nx, 1:] - gy[ng:ng+nx, :-1]) / cfg.dy)
+            boundary_rate = boundary_rate + (xp.sum(gfx[3][0, ng:ng+ny] - gfx[3][nx, ng:ng+ny]) * cfg.dy
+                                             + xp.sum(gfy[3][ng:ng+nx, 0] - gfy[3][ng:ng+nx, ny]) * cfg.dx)
         self._stage_boundary_rate = boundary_rate
         self._stage_powell_rate = powell_rate
         self._stage_ohmic_rate = ohmic_rate
@@ -961,6 +974,11 @@ class MHDSolver:
             if faces:
                 self._add_split_flux("F", EN, *faces)
         cfg, ng = self.cfg, self.ng
+        if cfg.cond_kappa_i0 > 0:                    # ion conduction on T_i (two-temperature)
+            Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
+            per = (cfg.get_bc_x() == "periodic", cfg.bc_y_type == "periodic")
+            self.cond_i_stages = conduct(Ui, self.eos, cfg.cond_kappa_i0, cfg.cond_x0_i, cfg.cond_tracer_max,
+                                         (cfg.dx, cfg.dy), per, dt, perp="simple", ion_Z=cfg.z_ion)
         if cfg.two_temp and cfg.te_eq_coeff > 0:
             Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
             fuel = xp.clip(cons_to_prim(Ui, self.eos)[iCLR], 0, 1) < cfg.cond_tracer_max

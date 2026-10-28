@@ -9,7 +9,7 @@ import contextlib
 import numpy as np
 from typing import Dict, List, Tuple
 
-from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iCLR
+from sieve.config import Config, NVAR, EN, RHOSE, iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iCLR
 from sieve.physics import xp, cp, cons_to_prim, prim_to_cons, mhd_rankine_hugoniot, sound_speed2
 from sieve.solver import MHDSolver, PostProcessor, save_figure, to_numpy, OUTPUT_DIR
 
@@ -2240,6 +2240,100 @@ def hall_test():
     return ok
 
 
+def ion_transport_test():
+    """Ion Braginskii transport (sieve/ions.py). (1) Gyroviscosity: a fast magnetosonic wave across B = B_z has the
+    finite-Larmor-radius dispersion omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2, eta_3 = p_i d_i / (2 B) (here
+    the FLR term doubles omega^2), converging at second order; without it omega = k c_f. (2) Ion conduction
+    (two-temperature): a T_i ripple decays at D k^2, D = k_i (1 + Z)(gamma - 1) / rho, and at D k^2 / (1 + x_i^2) across
+    a field, with the electron entropy untouched and the energy conserved; (3) both on in a full run: energy to
+    round-off."""
+    from sieve.physics import conduct
+    from sieve import twotemp
+    print("\n--- Ion gyroviscosity and ion conduction ---"); sys.stdout.flush()
+    ok = True
+    k, g = 2 * np.pi, 5 / 3
+    base = dict(ny=4, x_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=g, B_transverse=1.0, bc_x_type="periodic",
+                bc_y_type="periodic", powell_source=False, diag_interval=10**9, snapshot_times=[])
+    rho, p, B0 = 1.0, 1.0, 1.0
+    cs2, cf2 = g * p / rho, g * p / rho + B0**2 / rho
+    for di in (0.0, 1.04):
+        eta3 = (p / 2) * di / (2 * B0)                       # p_i = p / (1 + Z) at T_e = T_i
+        w = k * np.sqrt(cf2 + (eta3 * k / rho)**2)
+        errs = []
+        for N in (32, 64):
+            def init(W, X, w=w, eta3=eta3):
+                e = 1e-4
+                W[iVX] = e * xp.cos(k * X)
+                W[iVY] = -(eta3 * k * k / (w * rho)) * e * xp.sin(k * X)
+                drho = rho * (k / w) * e * xp.cos(k * X)
+                W[iRHO], W[iPR], W[iBZ] = rho + drho, p + cs2 * drho, B0 * (1 + drho / rho)
+            cfg = Config(nx=N, y_max=4.0 / N, gyro_di=di, **base)
+            wm, amp, n, lim, _ = _mode_run(cfg, init, 2 * np.pi / w, lambda W: W[iVX], k)
+            errs.append(abs(wm - w) / w)
+        good = errs[1] < 5e-3 and (di == 0 or errs[0] / errs[1] > 3.0)
+        ok = ok and good
+        print(f"  fast wave across B, gyro d_i = {di:.2f}: omega exact {w:.4f} (no FLR {k * np.sqrt(cf2):.4f}); relative "
+              f"error N=32 {errs[0]:.1e}, N=64 {errs[1]:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+    kap, Z = 0.01, 1.0
+    rates, ent, econs = {}, 0.0, 0.0
+    for name, x0, Bkey in (("unmagnetized", 0.0, None), ("across B (x_i = 3)", 3.0, iBY)):
+        cfg = Config(nx=64, y_max=4.0 / 64, two_temp=True, z_ion=Z, cond_kappa_i0=kap, cond_x0_i=x0, **base)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        W = xp.zeros((NVAR,) + s.U.shape[1:])
+        W[iRHO], W[iPR] = 1.0, 0.5 * (1.0 + 1.0)            # p_e = 0.5 (theta_e = 1) set below, p_i = 0.5
+        if Bkey is not None:
+            W[Bkey] = 1.0
+        U = prim_to_cons(W, s.eos)
+        twotemp.set_pe(U, xp.full(U[0].shape, 0.5), g)
+        W[iPR] = 1.0 + 0.5 * 1e-3 * xp.cos(k * s.X)          # theta_i = 1 + 1e-3 cos kx
+        U2 = prim_to_cons(W, s.eos)
+        U2[RHOSE] = U[RHOSE]
+        ng = s.ng
+        Ui = U2[:, ng:-ng, ng:-ng].copy()
+        x = to_numpy(s.x[ng:-ng])
+        se0, E0 = Ui[RHOSE].copy(), float(xp.sum(Ui[EN]))
+        ti = lambda: to_numpy(twotemp.temperatures(Ui, g, Z)[1][:, 0])
+        a0 = abs(np.sum(ti() * np.exp(-1j * k * x)))
+        T, nsteps = 1.0, 50
+        for _ in range(nsteps):
+            conduct(Ui, g, kap, x0, cfg.cond_tracer_max, (cfg.dx, cfg.dy), (True, True), T / nsteps, perp="simple",
+                    ion_Z=Z)
+        rates[name] = -np.log(abs(np.sum(ti() * np.exp(-1j * k * x))) / a0) / T
+        ent = max(ent, float(xp.max(xp.abs(Ui[RHOSE] - se0))))
+        econs = max(econs, abs(float(xp.sum(Ui[EN])) - E0) / abs(E0))
+    D = kap * (1 + Z) * (g - 1) / 1.0
+    e1 = abs(rates["unmagnetized"] / (D * k * k) - 1)
+    e2 = abs(rates["across B (x_i = 3)"] / (D * k * k / 10.0) - 1)
+    good = e1 < 0.01 and e2 < 0.01 and ent == 0.0 and econs < 1e-14
+    ok = ok and good
+    print(f"  ion conduction: T_i ripple decay {rates['unmagnetized']:.4f} (D k^2 = {D * k * k:.4f}), across B with "
+          f"x_i = 3: {rates['across B (x_i = 3)']:.4f} (D k^2 / 10 = {D * k * k / 10:.4f}); electron entropy change "
+          f"{ent:.1e}, energy {econs:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+    cfg = Config(nx=48, ny=48, x_max=1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=g, B_transverse=1.0,
+                 bc_x_type="periodic", bc_y_type="periodic", powell_source=False, two_temp=True, cond_kappa_i0=2e-3,
+                 cond_x0_i=1.0, gyro_di=0.3, diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(cfg)
+    W = xp.zeros((NVAR,) + s.U.shape[1:])
+    X, Y = s.X, s.Y
+    W[iRHO], W[iPR] = 1.0 + 0.2 * xp.sin(2 * np.pi * X), 1.0 + 0.3 * xp.cos(2 * np.pi * Y)
+    W[iVX], W[iVY] = 0.2 * xp.sin(2 * np.pi * Y), 0.2 * xp.cos(2 * np.pi * X)
+    W[iBX], W[iBZ] = 0.3 * xp.sin(2 * np.pi * Y), 1.0
+    s.U = prim_to_cons(W, s.eos); s.t = 0.0; s.step = 0
+    E0 = _energy(s)
+    for _ in range(40):
+        s.dt = s.compute_dt(cons_to_prim(s.U, s.eos)); s.step_ssprk3(); s.t += s.dt; s.step += 1
+    dE = abs(_energy(s) - E0) / abs(E0)
+    good = dE < 1e-13 and s.div_b_max() < 1e-12
+    ok = ok and good
+    print(f"  gyroviscosity + ion conduction, two-temperature periodic box, 40 steps: energy {dE:.1e}, div B "
+          f"{s.div_b_max():.1e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 VERIFICATION_TESTS = {
     "brio_wu": brio_wu_test,
     "alfven": alfven_convergence_test,
@@ -2277,6 +2371,7 @@ VERIFICATION_TESTS = {
     "amr": amr_test,
     "amr_physics": amr_physics_test,
     "hall": hall_test,
+    "ion_transport": ion_transport_test,
 }
 
 

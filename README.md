@@ -31,6 +31,7 @@ sieve/            solver package
   validation.py   shot data vs simulation: chi^2, RMS, peak offset, timing shifts, calibration, report plot
   amr.py          block-structured adaptive mesh refinement (2D, CT, refluxing, touching patches)
   hall.py         generalized Ohm's law: Hall term, anisotropic (Spitzer) resistivity, on the CT staggering
+  ions.py         ion gyroviscosity (finite-Larmor-radius stress) and the ion pressure for ion transport
 main.py           CLI: verification tests, single cases, legacy campaign
 examples/         MTIF liner flux compression; synthetic magnetic probes (SI units); 3D target asymmetries;
                   MagLIF-style r-z implosion; metal-liner flux compression generator (FCG)
@@ -145,6 +146,21 @@ act on the electrons. `units.twotemp_kwargs` gives the Spitzer equilibration coe
 `visc_coeff` adds Braginskii parallel viscosity, Pi = -3 eta_0 (b b - I/3)(b b : grad v - div v/3), which
 reduces to isotropic Navier-Stokes where B = 0. Stresses are face fluxes of momentum and energy (energy
 conserved exactly), integrated as an RKL2 split step like conduction (`units.viscosity_kwargs`).
+
+### Ion conduction and gyroviscosity
+
+In two-temperature mode `cond_kappa_i0` adds ion heat conduction on theta_i = (1 + Z) p_i / rho, k_i,par =
+`cond_kappa_i0` theta_i^5/2, k_i,perp = k_i,par / (1 + x_i^2) with x_i = `cond_x0_i` |B| theta_i^3/2 / rho: the same
+RKL2 split step as the electrons, with the electron pressure held (the electron entropy is untouched) and the
+energy conserved. `gyro_di` adds the ion gyroviscous stress (Braginskii eta_3 / eta_4, the non-dissipative
+finite-Larmor-radius part) in its compact form
+
+    Pi = p_i / (4 Omega_i) [ (b x W) . (I + 3 b b) + transpose ],   Omega_i = |B| / gyro_di,
+
+(for b = z: Pi_xx = -Pi_yy = -eta_3 W_xy, Pi_xy = eta_3 (W_xx - W_yy) / 2, eta_3 = p_i / (2 Omega_i)), as face fluxes
+of momentum and energy, so both are conserved; it does no work (Pi : W = 0). A fast wave across B then has the
+FLR dispersion omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2. The dispersive waves set an explicit step like the Hall
+term. p_i is p - p_e in two-temperature mode and p / (1 + Z) otherwise. 2D Cartesian.
 
 ### Liner strength and spall
 
@@ -402,6 +418,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | validation | analytic signals with known noise: chi^2_nu of the true model 1.001, RMS 1.000 sigma; a 37 ns delay recovered by the cross-correlation offset and the fitted shift to 0.5 ns; a 1-parameter scan recovers the amplitude with the Fisher sigma; CSV round trip |
 | amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a T-junction of three patches keeps div B at 6e-15 (each shared corner takes the lowest-index patch's EMF once; corrected twice, as before, div B grew to 7e-3); CUDA-graph replay equals the eager run exactly; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
+| ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |
 | amr_physics | resistive, conduction, FLD and strength each with three touching patches moving every 4 steps: conservation 5e-16 to 8e-16 (1e-7 to 3e-4 with the new registers off), div B at round-off; a feature inside one patch matches a uniform fine run to 1e-3 to 1e-4 of the coarse run's L1 error |
 
 ## Reproducing the study
@@ -640,7 +657,7 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 
 ## Model and numerical limitations
 
-- Ideal gas (γ = 5/3) by default; liner strength is elastic-perfectly plastic (constant G and Y, no work or rate hardening, no thermal softening) with a threshold spall model, and there is no phase change. The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. Viscosity is the Braginskii parallel part only (no gyroviscosity or perpendicular terms); thermal conduction is electron-only (Braginskii k_perp fit, no Righi-Leduc term), the liner is treated as an isothermal heat sink, and at grid-oblique field angles the limited scheme adds numerical cross-field diffusion that falls at second order with resolution. Radiation is optically thin bremsstrahlung or grey flux-limited diffusion (one group, no radiation pressure, power-law opacities unless a table is supplied, single gas temperature), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
+- Ideal gas (γ = 5/3) by default; liner strength is elastic-perfectly plastic (constant G and Y, no work or rate hardening, no thermal softening) with a threshold spall model, and there is no phase change. The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. Viscosity is the Braginskii parallel part plus the gyroviscous (FLR) stress, without the dissipative perpendicular terms (eta_1, eta_2), and gyroviscosity is 2D Cartesian only; thermal conduction is electron (Braginskii k_perp fit, no Righi-Leduc term) and, in two-temperature mode, ion (1/(1 + x_i^2) cross-field form), the liner is treated as an isothermal heat sink, and at grid-oblique field angles the limited scheme adds numerical cross-field diffusion that falls at second order with resolution. Radiation is optically thin bremsstrahlung or grey flux-limited diffusion (one group, no radiation pressure, power-law opacities unless a table is supplied, single gas temperature), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
 - The Hall term and anisotropic resistivity are 2D Cartesian only (not r-z, 3D or AMR), without the electron pressure gradient term of Ohm's law; the cross-field resistivity uses the strongly magnetized ratio wherever B is nonzero. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
 - Constrained transport keeps div B at round-off; the cylindrical geometry is 2D (r, z) only, and the Cartesian 2D MTIF examples are still cross-sections with a four-fold grid imprint (use `examples/maglif_rz.py` for an axisymmetric implosion).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.
