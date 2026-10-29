@@ -126,6 +126,7 @@ class MHDSolver:
         self.cyl = config.geometry == "cylindrical"
         self.strength = config.strength
         self.pic = None                              # adaptive kinetic-fluid hybrid (sieve/hybrid_pic.py)
+        self.walls = None                            # immersed rigid walls (sieve/cad_importer.ImmersedWalls)
         if self.cyl and abs(config.x_min) > 0:
             raise ValueError("cylindrical geometry needs x_min = 0 (the axis)")
         self.ng = 2
@@ -699,12 +700,16 @@ class MHDSolver:
         Fx, _ = hlld_flux_x(xp.ascontiguousarray(WLx.reshape(NVAR, -1)),
                              xp.ascontiguousarray(WRx.reshape(NVAR, -1)), eos, ch)
         Fx = Fx.reshape(s)
+        if self.walls is not None:
+            self.walls.apply(Fx, WLx, WRx, 0)
         WLy, WRy = muscl_y(W, eos); s2 = WLy.shape
         if self.ct:
             WLy[iBY] = WRy[iBY] = Bf[1][:, 2:self.ny_tot - 1]
         Fy, _ = hlld_flux_y(xp.ascontiguousarray(WLy.reshape(NVAR, -1)),
                              xp.ascontiguousarray(WRy.reshape(NVAR, -1)), eos, ch)
         Fy = Fy.reshape(s2)
+        if self.walls is not None:
+            self.walls.apply(Fy, WLy, WRy, 1)
         self._flux_hook(Fx, Fy, WLx, WRx, WLy, WRy)
         if self.cyl:                                 # (1/r) d(r F)/dr with face radii
             rfx = self.rf[2:self.nx_tot - 1][None, :, None]
@@ -869,6 +874,8 @@ class MHDSolver:
         self._stage_boundary_rate = boundary_rate
         self._stage_powell_rate = powell_rate
         self._stage_ohmic_rate = ohmic_rate
+        if self.walls is not None:
+            self.walls.mask_rates(R)
         return R
 
     def _vf_rate(self, F, WL, WR, W, axis, h, radial=False):

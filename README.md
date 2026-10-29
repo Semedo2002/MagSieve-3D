@@ -24,6 +24,7 @@ sieve/            solver package
   circuit.py      RLC drive circuit coupled to an r-z liner (magnetic piston, energy-consistent inductance)
   fld.py          grey flux-limited diffusion radiation (Levermore-Pomraning, implicit CG on the GPU)
   radiation_multigroup.py  multigroup FLD: photon groups, group opacities, coupled implicit BiCGStab solve
+  cad_importer.py STL / STEP / IGES import, ray-column volume fractions and apertures, immersed walls
   fno_subgrid.py  Fourier neural operator (inference + training on the autodiff tape), guarded radiation predictor
   parallel.py     MPI slab domain decomposition of the 2D and 3D solvers (halo and CT edge exchange)
   io3d.py         3D snapshots: VTK ImageData (.vti/.pvd) and HDF5
@@ -567,6 +568,33 @@ total energy. Not decomposed yet: r-z geometry, conduction, viscosity and FLD (t
 been run here (one GPU, Windows, Intel MPI from `pip install impi-rt`); the NCCL path is written but untested,
 and the 512^3 scale is a memory estimate (about 1 GB per field copy), not a measured run.
 
+### CAD geometry on the grid (volume fractions, immersed walls)
+
+`sieve/cad_importer.py` puts CAD solids straight onto the solver grid, with no mesh generation:
+- **Formats:** `.stl` (ASCII or binary) is read natively. `.step` / `.stp` / `.iges` / `.igs` are triangulated
+  through gmsh's OpenCASCADE kernel (`pip install magsieve[cad]`).
+- **Volume fractions and apertures:** by ray columns. Each ray along a grid axis crosses the surface at exactly
+  computed points, and sorted crossings pair into inside intervals (parity, so orientation does not matter):
+  - this is exact along the ray and a sub x sub midpoint rule across it;
+  - a 32^3 grid reproduces a sphere's volume to 6e-4 / 1e-4 / 7e-5 / 2.5e-5 with 1 / 2 / 4 / 8 rays per cell
+    side;
+  - face apertures come from the same crossings, and wall area vectors follow by the discrete divergence theorem
+    (they close to round-off).
+- **Materials:** the solid fraction becomes an initial state (liner density, tracer, velocity).
+  `examples/cad_liner_implosion.py` loads `examples/data/corrugated_liner.stl` (an m = 4 x k = 1 corrugated shell)
+  onto a 64^2 x 32 grid in 0.1 s and runs the 3D MHD implosion. An optional central rod is a rigid immersed wall
+  (`results/cad_liner/`).
+- **Immersed rigid walls (`ImmersedWalls`, 2D and 3D Cartesian):** every HLLD face flux becomes
+  a_f F + (1 - a_f) F_wall:
+  - F_wall carries the pressure + Maxwell stress row of the fluid-side state and no mass, energy or induction
+    flux;
+  - cells with less than half fluid are solid (faces closed, no update);
+  - cell volumes stay whole (a porosity-type immersed boundary, no small-cell time-step limit). The wall's normal
+    and blockage are sub-cell; its position along an axis is resolved to a cell.
+  - Verified: uniform states at rest stay at rest, mass and energy are conserved to round-off, div B at round-off,
+    and a Mach 2 shock reflecting off walls inclined at 45 and 30 degrees reaches the exact reflected pressure
+    within 0.4% at 256^2.
+
 ### 3D rendering
 
 `sieve.io3d.Recorder` writes 3D snapshots (density, pressure, temperature, liner fraction, v, B, E_r) as VTK
@@ -634,6 +662,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | autodiff | the differentiable twin matches MHDSolver after 20 steps (Orszag-Tang 2e-15, r-z shell with B_phi and B_z 4e-13); twin energy 1e-15 and div B 1e-14; the adjoint carries the gradient of the conserved energy back unchanged (2e-16); adjoint vs central finite differences in r-z for an initial-shape parameter, an amplitude and a boundary-drive current (6e-10, 4e-10, 3e-8) |
 | hybrid_pic | free streaming of a density mode in a collisionless gas follows exp(-k^2 theta t^2/2) (0.816 / 0.444 / 0.163 vs 0.821 / 0.454 / 0.169; fluid would ring as a sound wave), totals 6e-15; Boris: \|v\| to 1e-15, r_L Omega / v = 1.001; Orszag-Tang with a kinetic low-density channel: 13% of cells kinetic, cells switching both ways, mass 1e-14, momentum 6e-14 (absolute), energy 1e-14, div B 4e-15 |
 | fno | spectral layer with identity weights = FFT low-pass (2e-15); network gradients vs central differences (2e-6); guard with an untrained network: forced acceptance keeps gas + radiation energy at round-off, forced fallback reproduces the exact solve with the same iteration count |
+| cad | STL round trip; sphere volume fractions converge with the ray sampling (6e-4 to 2.5e-5), wall area vectors close; STEP cylinder through gmsh / OpenCASCADE reads back its volume; ring wall in 2D: rest exact with B_z, a sealed blast keeps cavity mass, total mass and energy to ~1e-14; Mach 2 shock reflection off walls inclined at 45 and 30 degrees within 0.4% of the exact pressure; 3D sphere wall: rest to 2e-16, mass and energy 1.6e-15, div B 2e-15 |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |

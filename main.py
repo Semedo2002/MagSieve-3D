@@ -2895,6 +2895,184 @@ def fno_test():
     return ok
 
 
+def cad_test():
+    """CAD ingestion and immersed walls (sieve/cad_importer.py). (1) STL: binary and ASCII round trip; volume
+    fractions of a triangulated sphere converge to its enclosed volume with the ray sampling, along each ray axis,
+    and the wall area vectors from the apertures close (sum to zero). (2) STEP through gmsh / OpenCASCADE (if
+    installed): a cylinder written as STEP reads back with its volume. (3) 2D walls: a magnetized gas at rest
+    around a ring-shaped wall stays at rest exactly; a blast sealed inside the ring keeps the cavity mass, the
+    total mass and energy to round-off, div B 0; a planar shock reflecting off a wall at 45 and 30 degrees to the
+    grid reaches the exact reflected pressure (first order near the wall). (4) 3D walls: a sphere in
+    MHDSolver3D (B normal to some wall faces), rest preserved to round-off, a blast beside it conserves mass and energy, div B at round-off."""
+    import tempfile
+    from sieve import cad_importer as ci
+    from sieve.solver3d import MHDSolver3D
+    from sieve.config import RHO
+    print("\n--- CAD ingestion and immersed walls ---"); sys.stdout.flush()
+    ok = True
+    tmp = tempfile.mkdtemp(prefix="cad_")
+
+    # (1) STL and volume fractions
+    tr = ci.sphere_mesh(0.37, (0.5, 0.5, 0.5), n=96)
+    V = ci.mesh_volume(tr)
+    ci.write_stl(os.path.join(tmp, "b.stl"), tr)
+    ci.write_stl(os.path.join(tmp, "a.stl"), tr, binary=False)
+    rb = float(np.abs(ci.read_stl(os.path.join(tmp, "b.stl")) - tr).max())
+    ra = float(np.abs(ci.read_stl(os.path.join(tmp, "a.stl")) - tr).max())
+    e = [ci.grid_edges(0, 1, 32)] * 3
+    errs = []
+    for sub in (1, 2, 4, 8):
+        g = ci.Geometry(tr, e, sub)
+        errs.append(max(abs(g.volume_fraction(ax).sum() / 32**3 - V) / V for ax in range(3)))
+    closure = float(np.abs(ci.Geometry(tr, e, 4).wall_area_vectors().sum(axis=(1, 2, 3))).max())
+    good = rb < 1e-6 and ra < 1e-12 and errs[-1] < 5e-5 and errs[0] > errs[1] > errs[2] and closure < 1e-12
+    ok = ok and good
+    print(f"  STL round trip binary {rb:.0e} (float32), ASCII {ra:.0e}; sphere volume on a 32^3 grid with 1, 2, 4, 8 "
+          f"rays per cell side: " + ", ".join(f"{x:.1e}" for x in errs) + f"; wall area vectors close to {closure:.0e}"
+          f"  [{'PASS' if good else 'FAIL'}]")
+
+    # (2) STEP through gmsh
+    try:
+        import gmsh
+        gmsh.initialize(interruptible=False)
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("c")
+        gmsh.model.occ.addCylinder(0.5, 0.5, 0.2, 0, 0, 0.6, 0.3)
+        gmsh.model.occ.synchronize()
+        step = os.path.join(tmp, "cyl.step")
+        gmsh.write(step)
+        gmsh.finalize()
+        tc = ci.read_cad(step, mesh_size=0.03)
+        Vc = ci.mesh_volume(tc)
+        ac = ci.Geometry(tc, e, 4).volume_fraction().sum() / 32**3
+        exact = np.pi * 0.3**2 * 0.6
+        good = abs(Vc - exact) / exact < 1e-2 and abs(ac - Vc) / Vc < 2e-3
+        print(f"  STEP cylinder via gmsh/OpenCASCADE: {len(tc)} triangles, volume {Vc:.5f} (exact {exact:.5f}), on the "
+              f"grid {ac:.5f}  [{'PASS' if good else 'FAIL'}]")
+    except ImportError:
+        good = True
+        print("  STEP / IGES: gmsh not installed, skipped (pip install gmsh)  [SKIP]")
+    ok = ok and good
+
+    def solver2d(n, bc, L):
+        cfg = Config(nx=n, ny=n, x_min=0, x_max=L, y_min=0, y_max=L, cfl=0.3, gamma=5 / 3, bc_x_type=bc, bc_y_type=bc,
+                     diag_interval=10**9, snapshot_times=[])
+        with contextlib.redirect_stdout(io.StringIO()):
+            return MHDSolver(cfg)
+
+    def march(s, T):
+        t = 0.0
+        while t < T - 1e-12:
+            s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), T - t)
+            s.step_ssprk3()
+            t += s.dt
+
+    # (3) 2D walls: rest and a sealed blast in a ring
+    ring = ci.corrugated_liner_mesh(r_in=0.25, thickness=0.12, length=1.0, eps=0.0, center=(0.5, 0.5), z0=-0.5,
+                                    overhang=0.1)
+    s = solver2d(64, "periodic", 1.0)
+    g = ci.Geometry(ring, ci.solver_edges(s), sub=4)
+    s.walls = ci.ImmersedWalls.from_geometry(s, g)
+    W = xp.zeros_like(s.U)
+    W[iRHO], W[iPR], W[iBZ] = 1.0, 1.0, 0.7
+    s.U[...] = prim_to_cons(W, 5 / 3)
+    march(s, 0.3)
+    vrest = float(xp.max(xp.abs(s.U[1:3])))
+    s = solver2d(64, "periodic", 1.0)
+    s.walls = ci.ImmersedWalls.from_geometry(s, g)
+    r = xp.sqrt((s.X - 0.5)**2 + (s.Y - 0.5)**2)
+    W = xp.zeros_like(s.U)
+    W[iRHO], W[iBZ] = 1.0, 0.3
+    W[iPR] = xp.where(r < 0.1, 10.0, 0.1)
+    s.U[...] = prim_to_cons(W, 5 / 3)
+    ng = s.ng
+    I = (slice(ng, -ng), slice(ng, -ng))
+    cav = (r < 0.31)[I]
+    q0 = [float(xp.sum(s.U[RHO][I][cav])), float(xp.sum(s.U[RHO][I])), float(xp.sum(s.U[EN][I]))]
+    march(s, 0.3)
+    q1 = [float(xp.sum(s.U[RHO][I][cav])), float(xp.sum(s.U[RHO][I])), float(xp.sum(s.U[EN][I]))]
+    dq = [abs(a - b) / b for a, b in zip(q1, q0)]
+    pout = float(xp.max(cons_to_prim(s.U, 5 / 3)[iPR][I][(r > 0.4)[I]]))
+    good = vrest == 0.0 and max(dq) < 1e-13 and float(s.div_b_max()) < 1e-12 and abs(pout - 0.1) < 1e-12
+    ok = ok and good
+    print(f"  ring wall: gas at rest with B_z keeps max |rho v| = {vrest:.0e}; sealed blast: cavity mass {dq[0]:.1e}, total "
+          f"mass {dq[1]:.1e}, energy {dq[2]:.1e}, outside untouched, div B {float(s.div_b_max()):.0e}  [{'PASS' if good else 'FAIL'}]")
+
+    # oblique shock reflection
+    g_, M = 5 / 3, 2.0
+    p2 = 1 + 2 * g_ / (g_ + 1) * (M * M - 1)
+    rho2 = (g_ + 1) * M * M / ((g_ - 1) * M * M + 2)
+    us = M * np.sqrt(g_)
+    u2 = us * (1 - 1 / rho2)
+    ur = lambda p3: (p3 - p2) * np.sqrt(2 / ((g_ + 1) * rho2) / (p3 + (g_ - 1) / (g_ + 1) * p2))
+    lo, hi = p2, 100 * p2
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if ur(mid) < u2 else (lo, mid)
+    p3 = 0.5 * (lo + hi)
+    res = {}
+    for th_deg in (45.0, 30.0):
+        n = 256
+        s = solver2d(n, "extrapolation", 4.0)
+        th = np.radians(th_deg)
+        c = 2.4 + 0.37 / n
+        Lb = 6.0
+        box = np.array([[c, -Lb, -1], [c + Lb, -Lb, -1], [c + Lb, Lb, -1], [c, Lb, -1], [c, -Lb, 1], [c + Lb, -Lb, 1],
+                        [c + Lb, Lb, 1], [c, Lb, 1]])
+        F = [[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6], [0, 4, 5], [0, 5, 1], [1, 5, 6], [1, 6, 2], [2, 6, 7],
+             [2, 7, 3], [3, 7, 4], [3, 4, 0]]
+        Rm = np.array([[np.cos(th), -np.sin(th), 0], [np.sin(th), np.cos(th), 0], [0, 0, 1]])
+        o = np.array([2.0, 2.0, 0.0])
+        s.walls = ci.ImmersedWalls.from_geometry(s, ci.Geometry(((box - o) @ Rm.T + o)[np.array(F)], ci.solver_edges(s), 4))
+        xi = (s.X - 2) * np.cos(th) + (s.Y - 2) * np.sin(th)
+        eta = -(s.X - 2) * np.sin(th) + (s.Y - 2) * np.cos(th)
+        W = xp.zeros_like(s.U)
+        sh = xi < 0.0
+        W[iRHO] = xp.where(sh, rho2, 1.0)
+        W[iPR] = xp.where(sh, p2, 1.0)
+        W[iVX] = xp.where(sh, u2 * np.cos(th), 0.0)
+        W[iVY] = xp.where(sh, u2 * np.sin(th), 0.0)
+        s.U[...] = prim_to_cons(W, 5 / 3)
+        wall = c - 2.0
+        march(s, wall / us + 0.12)
+        band = (xi > wall - 0.12) & (xi < wall - 0.05) & (xp.abs(eta) < 0.3)
+        res[th_deg] = abs(float(xp.mean(cons_to_prim(s.U, 5 / 3)[iPR][band])) - p3) / p3
+    good = res[45.0] < 0.03 and res[30.0] < 0.1
+    ok = ok and good
+    print(f"  shock (M = 2) reflecting off an inclined wall, 256^2: pressure behind the reflected shock within "
+          f"{100 * res[45.0]:.1f}% (45 deg) and {100 * res[30.0]:.1f}% (30 deg) of the exact {p3:.3f}  [{'PASS' if good else 'FAIL'}]")
+
+    # (4) 3D: sphere wall
+    cfg = Config(nx=24, ny=24, nz=24, x_max=1.0, y_max=1.0, z_max=1.0, cfl=0.3, gamma=5 / 3, bc_x_type="periodic",
+                 bc_y_type="periodic", powell_source=False, diag_interval=10**9, snapshot_times=[])
+    q = []
+    for blast in (False, True):
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver3D(cfg)
+        s.walls = ci.ImmersedWalls.from_geometry(s, ci.Geometry(ci.sphere_mesh(0.2, (0.5, 0.5, 0.5), 48), ci.solver_edges(s), 4))
+        W = xp.zeros((NVAR, s.nx_tot, s.ny_tot, s.nz_tot))
+        W[iRHO], W[iPR], W[iBZ] = 1.0, 1.0, 0.5
+        if blast:
+            X = s.x[:, None, None]
+            W[iPR] = 1.0 + 9.0 * xp.exp(-((X - 0.15)**2) / 0.003) * xp.ones_like(W[iPR])
+        s.U = prim_to_cons(W, 5 / 3)
+        ng = s.ng
+        I3 = (slice(ng, -ng),) * 3
+        m0, E0 = float(xp.sum(s.U[RHO][I3])), float(xp.sum(s.U[EN][I3]))
+        t = 0.0
+        while t < 0.15 - 1e-12:
+            s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), 0.15 - t)
+            s.step_ssprk3()
+            t += s.dt
+        q.append((float(xp.max(xp.abs(s.U[1:4]))), abs(float(xp.sum(s.U[RHO][I3])) - m0) / m0,
+                  abs(float(xp.sum(s.U[EN][I3])) - E0) / E0, float(s.div_b_max())))
+    good = q[0][0] < 1e-13 and q[1][1] < 1e-13 and q[1][2] < 1e-13 and q[1][3] < 1e-12
+    ok = ok and good
+    print(f"  3D sphere wall: rest kept (max |rho v| = {q[0][0]:.0e}); blast beside it: mass {q[1][1]:.1e}, energy "
+          f"{q[1][2]:.1e}, div B {q[1][3]:.1e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3235,6 +3413,7 @@ VERIFICATION_TESTS = {
     "autodiff": autodiff_test,
     "hybrid_pic": hybrid_pic_test,
     "fno": fno_test,
+    "cad": cad_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

@@ -150,6 +150,7 @@ class MHDSolver3D:
         cfg = config
         if cfg.nz < 4:
             raise ValueError("solver3d needs nz >= 4")
+        self.walls = None                            # immersed rigid walls (sieve/cad_importer.ImmersedWalls)
         self.cyl = cfg.geometry == "cylindrical"
         if self.cyl:
             if cfg.div_b != "ct" or cfg.x_min < 0:
@@ -601,6 +602,8 @@ class MHDSolver3D:
                 sel[ax - 1] = slice(2, N - 1)
                 WL[iBX + ax - 1] = WR[iBX + ax - 1] = Bf[ax - 1][tuple(sel)]
             F = hlld_flux(WL, WR, ax, g, ch)
+            if self.walls is not None:               # immersed rigid walls (sieve/cad_importer.ImmersedWalls)
+                self.walls.apply(F, WL, WR, ax - 1)
             Fs[ax - 1] = F
             WLs[ax - 1], WRs[ax - 1] = WL, WR
             m = n[ax - 1]
@@ -701,6 +704,8 @@ class MHDSolver3D:
         if self.ct:
             out[BX:BZ + 1] = 0.0                     # B lives on the faces
             self._ct_face_rates(Fs, W, Bf, dBf, eta, vN)
+        if self.walls is not None:
+            self.walls.mask_rates(out)
         return out
 
     def total_energy(self):
