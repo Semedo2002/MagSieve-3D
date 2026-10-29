@@ -32,6 +32,7 @@ sieve/            solver package
   validation.py   shot data vs simulation: chi^2, RMS, peak offset, timing shifts, calibration, report plot
   experimental_suite.py  bundled open data (Marsh 1980 Cu / Ni Hugoniots) and the plate-impact benchmark
   amr.py          block-structured adaptive mesh refinement (2D, CT, refluxing, touching patches)
+  autodiff.py     reverse-mode tape and DiffMHD, the differentiable ideal-MHD twin (adjoint gradients)
   hall.py         generalized Ohm's law: Hall term, anisotropic (Spitzer) resistivity, on the CT staggering
   ions.py         ion gyroviscosity (finite-Larmor-radius stress) and the ion pressure for ion transport
 main.py           CLI: verification tests, single cases, legacy campaign
@@ -389,6 +390,35 @@ velocity at the surface.
   citable form were found, so none ship with the code. Your own traces load with `load_shot()` (CSV: t, value,
   sigma) and compare with FCG / MagLIF runs through `sieve/validation.py` (`examples/experimental_shot_fitting.py`).
 
+### Differentiable solver and inverse design
+
+`sieve/autodiff.py` computes exact gradients of objectives of a simulation with respect to its inputs by a
+discrete adjoint (reverse mode):
+- **Tape:** a small reverse-mode tape for NumPy / CuPy arrays (`Tensor`, `record()`, `backward()`): each operation
+  stores its vector-Jacobian product.
+- **Twin:** `DiffMHD`, a twin of `MHDSolver`'s ideal-MHD step written with those operations, following
+  `hlld_kernel.cu` and the fused MUSCL / CT-EMF kernels line by line: van Leer MUSCL, HLLD, Gardiner-Stone
+  corner EMF, SSP-RK3, the same boundary conditions, Cartesian or r-z. A forward run reproduces the CUDA solver
+  to round-off.
+- **Adjoint:** checkpointed. The forward pass stores the state after every step; the backward pass re-runs one
+  step at a time under the tape and carries the adjoint state back. One backward pass gives dJ/dp for every
+  parameter at about 3-4x the forward cost.
+- **What can depend on parameters:**
+  - the initial state, built from Tensor operations (`cells_to_state`);
+  - a boundary drive (B_phi on the outer radial boundary, a magnetic piston for a current I(t));
+  - a running objective (summed over steps with weight dt) and a final objective.
+  Time steps come from the forward run's CFL condition and are held fixed.
+- **Differentiability:** the scheme is piecewise smooth (limiter, HLLD branches, floors); the gradient is that of
+  the branch taken. Exactly symmetric states sit on a kink. With z-uniform data the van Leer limiter sees zero
+  slopes, so the one-sided derivatives differ there; start designs slightly off symmetry. Finite differences
+  agree with the adjoint only where their step stays inside one smooth piece.
+- **Scope:** ideal gas, ideal MHD with `div_b='ct'`, 2D. It refuses resistivity, EOS tables, transport,
+  radiation, strength and 3D.
+- **Inverse design:** `examples/optimize_liner_shape.py` optimises the axial shape R(z) = R0 + sum a_k cos(2 pi k z / L)
+  of an imploding liner (fixed mass and kinetic energy) to maximise the peak axial field on the axis at the
+  mid-plane, by projected Adam on adjoint gradients; `--drive` adds a magnetic piston and reports dB_peak/dI.
+  The design is axisymmetric (a fully 3D liner is outside the 2D twin).
+
 ### Adaptive mesh refinement
 
 `sieve/amr.py` is a two-level, block-structured AMR for the 2D Cartesian solver (Berger-Colella style):
@@ -535,6 +565,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | cylindrical3d | 3D (r, theta, z) with d/dtheta = 0 vs the 2D r-z solver (swirl, B_phi, B_z, z-dependent flow, the axis): 1.6e-14 after 30 steps; an m = 1 blob carried onto the axis along a uniform field: centroid error 3.4e-2 -> 1.4e-2 and field error 2.7e-2 -> 1.2e-2 from 16 x 24 to 32 x 48 cells, energy 4e-14, div B 2e-14 |
 | multigroup | one group = grey FLD (1e-8 at the solver tolerance); 8 grey groups sum to grey FLD in the thick limit (within the per-group limiter), energy to round-off; 12 Kramers groups with an edge relax to the Planck spectrum; decoupled groups diffuse with D_g = c / (3 rho kR_g) over three decades of D (peak within 2% of the exact Gaussian); 2D solver with an Al group table: gas + radiation energy to round-off |
 | experimental | Cu and Ni Hugoniot data load with verified checksums, a tampered file is refused; shot-trace CSV round trip; Cu plate impacts at 5 particle velocities follow the table's own Hugoniot to 0.3% (the flow solver adds no bias) and 143 Marsh shots (Up <= 3 km/s) to 1.8% RMS, chi^2_nu 0.82 for an assumed 2% error |
+| autodiff | the differentiable twin matches MHDSolver after 20 steps (Orszag-Tang 2e-15, r-z shell with B_phi and B_z 4e-13); twin energy 1e-15 and div B 1e-14; the adjoint carries the gradient of the conserved energy back unchanged (2e-16); adjoint vs central finite differences in r-z for an initial-shape parameter, an amplitude and a boundary-drive current (6e-10, 4e-10, 3e-8) |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |

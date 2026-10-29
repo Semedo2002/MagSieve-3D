@@ -2579,6 +2579,125 @@ def experimental_test():
     return ok
 
 
+def autodiff_test():
+    """Reverse-mode differentiable twin of the ideal-MHD step (sieve/autodiff.py).
+    (1) Forward parity: 20 steps of an Orszag-Tang state (periodic, Cartesian) and of an imploding r-z shell
+    with B_phi and B_z match MHDSolver (CUDA HLLD, fused MUSCL / EMF kernels) to round-off. (2) Conservation in
+    the twin: periodic total energy to round-off, face div B at round-off, and the adjoint of the conserved
+    energy carries its gradient back unchanged (dE_final/dp = dE_initial/dp). (3) Adjoint gradients against
+    central finite differences with the same step sequence, for a shape parameter of the initial state, an
+    amplitude and a boundary-drive current (r-z, 30 steps, objective: core B_z^2 plus a running B_phi^2)."""
+    from sieve import autodiff as ad
+    from sieve.config import iVZ, iBZ
+    print("\n--- Differentiable MHD (adjoint) ---"); sys.stdout.flush()
+    ok = True
+
+    def solver(cyl):
+        if cyl:
+            cfg = Config(nx=24, ny=16, x_min=0.0, x_max=2.0, y_min=0.0, y_max=1.0, cfl=0.3, gamma=5 / 3,
+                         geometry="cylindrical", bc_x_type="extrapolation", bc_y_type="periodic",
+                         diag_interval=10**9, snapshot_times=[])
+        else:
+            cfg = Config(nx=24, ny=20, x_min=0.0, x_max=1.0, y_min=0.0, y_max=1.0, cfl=0.3, gamma=5 / 3,
+                         bc_x_type="periodic", bc_y_type="periodic", diag_interval=10**9, snapshot_times=[])
+        with contextlib.redirect_stdout(io.StringIO()):
+            return MHDSolver(cfg)
+
+    # (1) forward parity
+    for cyl in (False, True):
+        s = solver(cyl)
+        X, Y = s.X, s.Y
+        W = xp.zeros_like(s.U)
+        B0 = 1 / np.sqrt(4 * np.pi)
+        if cyl:
+            shell = xp.exp(-((X - 1.2)**2) / 0.02)
+            W[iRHO] = 1.0 + 4.0 * shell * (1 + 0.2 * xp.cos(2 * np.pi * Y))
+            W[iVX] = -shell
+            W[iPR] = 0.2
+            W[iBZ] = 0.1 * X
+            W[iBY] = 0.5
+            W[iCLR] = (X > 1.1).astype(float)
+        else:
+            W[iRHO] = 25 / (36 * np.pi); W[iPR] = 5 / (12 * np.pi)
+            W[iVX] = -xp.sin(2 * np.pi * Y); W[iVY] = xp.sin(2 * np.pi * X); W[iVZ] = 0.1 * xp.cos(2 * np.pi * Y)
+            W[iCLR] = 0.5 + 0.5 * xp.sin(2 * np.pi * X)
+        s.U[...] = prim_to_cons(W, s.cfg.gamma)
+        if not cyl:
+            s.set_vector_potential(lambda x, y: B0 * (np.cos(4 * np.pi * x) / (4 * np.pi) + np.cos(2 * np.pi * y) / (2 * np.pi)))
+        s._ct_sync(); s.apply_bc(s.U); s._ghost_faces(s.Bf, s.U)
+        sim = ad.DiffMHD(s, xp=np)
+        st = sim.state_from_solver()
+        E0 = float(ad.total_energy(sim, st).v)
+        t = 0.0
+        for n in range(20):
+            s.dt = s.compute_dt(cons_to_prim(s.U, s.eos))
+            s.step_ssprk3()
+            st = sim.step(st, s.dt, t)
+            t += s.dt
+        ng, nx, ny = s.ng, s.cfg.nx, s.cfg.ny
+        Uc = to_numpy(s.U)[:, ng:ng + nx, ng:ng + ny]
+        Ut = np.array([a.v for a in st[:NVAR]])[:, ng:ng + nx, ng:ng + ny]
+        scale = np.abs(Uc).max(axis=(1, 2), keepdims=True) + 1e-300
+        cell = float(np.max(np.abs(Uc - Ut) / scale))
+        face = max(float(np.max(np.abs(to_numpy(f) - b.v))) for f, b in zip(s.Bf, st[NVAR:]))
+        good = cell < 1e-11 and face < 1e-12
+        if cyl:
+            print(f"  r-z shell, 20 steps: twin vs MHDSolver max relative cell difference {cell:.1e}, faces {face:.1e}"
+                  f"  [{'PASS' if good else 'FAIL'}]")
+        else:
+            Bf = [b.v for b in st[NVAR:]]
+            divb = float(np.max(np.abs((Bf[0][ng + 1:ng + nx + 1, ng:ng + ny] - Bf[0][ng:ng + nx, ng:ng + ny]) / s.cfg.dx
+                                       + (Bf[1][ng:ng + nx, ng + 1:ng + ny + 1] - Bf[1][ng:ng + nx, ng:ng + ny]) / s.cfg.dy)))
+            dE = abs(float(ad.total_energy(sim, st).v) - E0) / E0
+            good = good and dE < 1e-13 and divb < 1e-11
+            print(f"  Orszag-Tang, 20 steps: twin vs MHDSolver max relative cell difference {cell:.1e}, faces {face:.1e};"
+                  f" twin energy change {dE:.1e}, max |div B| {divb:.1e}  [{'PASS' if good else 'FAIL'}]")
+            ok = ok and good
+            # (2) the adjoint of a conserved quantity: dE(T)/dp = dE(0)/dp
+            def init_ot(p):
+                def Wf(p):
+                    Xn, Yn = to_numpy(s.X), to_numpy(s.Y)
+                    return [25 / (36 * np.pi) * (1 + p[0] * ad.const(np.cos(2 * np.pi * Xn))),
+                            -p[1] * ad.const(np.sin(2 * np.pi * Yn)), ad.const(np.sin(2 * np.pi * Xn)), 0.0,
+                            0.0, 0.0, 0.2, 5 / (12 * np.pi), 0.0, 0.5, 0.0]
+                return ad.cells_to_state(sim, Wf, p)
+            Efin = lambda st_, t_, p_: ad.total_energy(sim, st_)
+            pq = np.array([0.1, 1.0])
+            _, gT, _ = sim.value_and_grad(init_ot, pq, n_steps=10, final_objective=Efin)
+            with ad.record():
+                pl = ad.leaf(pq)
+                ad.backward(ad.total_energy(sim, init_ot(pl)))
+            dg = float(np.max(np.abs(gT - pl.g)) / np.max(np.abs(pl.g)))
+            good = dg < 1e-12
+            print(f"  adjoint of the conserved energy over 10 steps: dE(T)/dp vs dE(0)/dp {dg:.1e}  [{'PASS' if good else 'FAIL'}]")
+        ok = ok and good
+
+    # (3) gradients against finite differences
+    s = solver(True)
+    sim = ad.DiffMHD(s, drive=lambda t, p: p[2] * (1.0 - np.exp(-t / 0.05)), xp=np)
+    R = to_numpy(s.rc)[:, None] * np.ones((1, s.ny_tot))
+    Z = np.ones((s.nx_tot, 1)) * to_numpy(s.y)[None, :]
+
+    def Wf(p):
+        prof = ad.exp(-((ad.const(R) - (1.2 + p[0] * ad.const(np.cos(2 * np.pi * Z))))**2) / 0.02)
+        return [0.2 + 4.0 * prof, -p[1] * prof, 0.0, 0.0, 0.0, 0.5, 0.0, 0.2, 0.0, prof, 0.0]
+    init = lambda p: ad.cells_to_state(sim, Wf, p)
+    core = np.exp(-(R / 0.5)**2)[2:-2, 2:-2]
+    final = lambda st_, t_, p_: ad.tsum(ad.interior(sim, st_[iBY])**2 * core)
+    running = lambda st_, t_, p_: ad.tsum(ad.interior(sim, st_[iBZ])**2)
+    p0 = np.array([0.05, 1.0, 0.3])
+    J, g, info = sim.value_and_grad(init, p0, n_steps=30, final_objective=final, step_objective=running)
+    errs = []
+    for k in range(3):
+        fd = ad.finite_difference(sim, init, p0, k, 1e-6, dts=info["dts"], final_objective=final, step_objective=running)
+        errs.append(abs(fd - g[k]) / abs(g[k]))
+    good = max(errs) < 1e-6
+    ok = ok and good
+    print(f"  r-z adjoint vs finite differences (30 steps): shape {errs[0]:.1e}, velocity {errs[1]:.1e}, drive current "
+          f"{errs[2]:.1e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -2916,6 +3035,7 @@ VERIFICATION_TESTS = {
     "cylindrical3d": cylindrical3d_test,
     "multigroup": multigroup_test,
     "experimental": experimental_test,
+    "autodiff": autodiff_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,
