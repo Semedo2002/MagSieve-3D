@@ -245,6 +245,20 @@ class PhysicsConfig:
     cond_kappa_i0: float = 0.0
     cond_x0_i: float = 0.0
     gyro_di: float = 0.0
+    # adaptive kinetic-fluid hybrid (sieve/hybrid_pic.py), 2D Cartesian, ideal gas gamma = 5/3: cells with a local
+    # Knudsen number lambda / L > pic_kn_on (lambda = pic_mfp0 theta^2 / rho, L the density / pressure gradient
+    # length) or an ion Larmor radius r_L > pic_rl_on dx (r_L = pic_di sqrt(theta) / |B|, pic_di the ion inertial
+    # length at unit density, which also sets q/m = 1 / pic_di) carry their ions as particles; they return to the
+    # fluid when both fall below pic_hysteresis times the threshold. pic_mfp0 = 0 or pic_di = 0 switches that
+    # criterion off (pic_di = 0: neutral particles, no Lorentz force).
+    pic: bool = False
+    pic_kn_on: float = 0.1
+    pic_rl_on: float = 1.0
+    pic_hysteresis: float = 0.5
+    pic_mfp0: float = 0.0
+    pic_di: float = 0.0
+    pic_ppc: int = 64
+    pic_seed: int = 0
     # liner strength (sieve/strength.py): elastic-perfectly-plastic, von Mises yield, spall damage; code units
     # (units.strength_kwargs); scaled by the liner fraction. 2D solver.
     strength: bool = False
@@ -313,6 +327,11 @@ class PhysicsConfig:
         if (self.hall_di > 0 or self.eta_perp_ratio != 1.0 or self.gyro_di > 0) and                 (self.div_b != "ct" or self.geometry != "cartesian"):
             raise ValueError("the Hall term, anisotropic resistivity and gyroviscosity need div_b='ct' and Cartesian "
                              "geometry")
+        if self.pic and (self.geometry != "cartesian" or abs(self.gamma - 5.0 / 3.0) > 1e-12 or self.two_temp
+                         or self.eos_fuel != "ideal" or self.eos_liner != "ideal" or self.pic_ppc < 8
+                         or not 0 < self.pic_hysteresis <= 1 or min(self.pic_mfp0, self.pic_di) < 0):
+            raise ValueError("pic needs Cartesian geometry, an ideal gas with gamma = 5/3 (monatomic particles), no "
+                             "two_temp, pic_ppc >= 8, 0 < pic_hysteresis <= 1, pic_mfp0 and pic_di >= 0")
         if self.cond_kappa_i0 > 0 and not self.two_temp:
             raise ValueError("ion conduction (cond_kappa_i0) acts on T_i: it needs two_temp")
         if self.eos_liner == "mie_gruneisen" and min(self.mg_rho0, self.mg_c0, self.mg_s, self.mg_gamma0) <= 0:

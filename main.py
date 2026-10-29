@@ -2698,6 +2698,117 @@ def autodiff_test():
     return ok
 
 
+def hybrid_pic_test():
+    """Adaptive kinetic-fluid hybrid (sieve/hybrid_pic.py). (1) Free streaming: a density mode in a collisionless
+    gas (every cell kinetic by its Knudsen number) decays as exp(-k^2 theta t^2 / 2), where the fluid would ring as
+    a sound wave; the domain totals stay at round-off. (2) Boris push: one ion in a uniform field keeps |v| to
+    round-off and gyrates at r_L = v / Omega. (3) Mixed run: Orszag-Tang with a low-density channel; cells switch
+    to particles by Kn and r_L / dx and back (hysteresis), mass, momentum and energy of the domain conserved to
+    round-off through every exchange, div B at round-off."""
+    from sieve.hybrid_pic import HybridPIC
+    from sieve.config import RHO, MX, MY, MZ
+    print("\n--- Kinetic-fluid hybrid (PIC) ---"); sys.stdout.flush()
+    ok = True
+
+    def run(cfg, init, T, times=None):
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        init(s)
+        t, out = 0.0, []
+        for Tk in (times or [T]):
+            while t < Tk - 1e-12:
+                s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), Tk - t)
+                s.step_ssprk3()
+                t += s.dt
+            out.append(to_numpy(s.U))
+        return s, out
+
+    def totals(s, U):
+        ng = s.ng
+        return np.array([U[v, ng:-ng, ng:-ng].sum() for v in (RHO, MX, MY, MZ, EN)])
+
+    # (1) free streaming
+    th, A, k = 1.0, 0.1, 2 * np.pi
+    cfg = Config(nx=64, ny=4, x_min=0, x_max=1, y_min=0, y_max=1 / 16, cfl=0.3, gamma=5 / 3, bc_x_type="periodic",
+                 bc_y_type="periodic", pic=True, pic_mfp0=1e3, pic_ppc=1024, diag_interval=10**9, snapshot_times=[])
+
+    def init1(s):
+        W = xp.zeros_like(s.U)
+        W[iRHO] = 1 + A * xp.cos(k * s.X)
+        W[iPR] = th * W[iRHO]
+        s.U[...] = prim_to_cons(W, s.cfg.gamma)
+        s._U0 = to_numpy(s.U)
+    times = [0.1, 0.2, 0.3]
+    s, Us = run(cfg, init1, None, times)
+    ng = s.ng
+    x = to_numpy(s.x[ng:-ng])
+    amps = [2 * np.mean(U[RHO, ng:-ng, ng:-ng].mean(axis=1) * np.cos(k * x)) / A for U in Us]
+    exact = [np.exp(-k * k * th * T * T / 2) for T in times]
+    fluid = [np.cos(k * np.sqrt(5 / 3 * th) * T) for T in times]
+    t0, t1 = totals(s, s._U0), totals(s, Us[-1])
+    cons = float(np.max(np.abs(t1 - t0) / np.maximum(np.abs(t0), 1.0)))
+    err = max(abs(a - e) for a, e in zip(amps, exact))
+    good = err < 0.03 and cons < 1e-13 and int(s.pic.report()["kinetic_cells"]) == 64 * 4
+    ok = ok and good
+    print("  free streaming, mode amplitude / A at t = " + ", ".join(f"{T}: {a:+.3f} (exact {e:+.3f}, fluid {f:+.3f})"
+          for T, a, e, f in zip(times, amps, exact, fluid)) + f"; totals {cons:.1e}  [{'PASS' if good else 'FAIL'}]")
+
+    # (2) Boris gyration
+    cfg2 = Config(nx=8, ny=8, x_min=0, x_max=10, y_min=0, y_max=10, gamma=5 / 3, bc_x_type="periodic",
+                  bc_y_type="periodic", pic=True, pic_di=1.0, diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s2 = MHDSolver(cfg2)
+    W2 = xp.zeros_like(s2.U)
+    W2[iRHO], W2[iPR], W2[iBZ] = 1.0, 1.0, 2.0
+    s2.U[...] = prim_to_cons(W2, 5 / 3)
+    s2.apply_bc(s2.U)
+    pc = HybridPIC(s2)
+    pc.P = dict(x=xp.array([5.0]), y=xp.array([5.0]), vx=xp.array([1.0]), vy=xp.array([0.0]), vz=xp.array([0.3]),
+                w=xp.array([1.0]))
+    Om, dt = 2.0, 0.05
+    xs = []
+    for _ in range(int(round(2 * np.pi / Om / dt)) * 10):
+        pc.push(dt, s2.U)
+        xs.append((float(pc.P["x"][0]), float(pc.P["y"][0])))
+    xs = np.array(xs)
+    r = np.hypot(xs[:, 0] - xs[:, 0].mean(), xs[:, 1] - xs[:, 1].mean())
+    dv = abs(float(pc.P["vx"][0]**2 + pc.P["vy"][0]**2) - 1.0)
+    good = dv < 1e-13 and abs(r.mean() * Om - 1.0) < 3e-3
+    ok = ok and good
+    print(f"  Boris gyration, 10 orbits at Omega dt = 0.1: |v| change {dv:.1e}, r_L Omega / v = {r.mean() * Om:.4f}"
+          f"  [{'PASS' if good else 'FAIL'}]")
+
+    # (3) mixed fluid / kinetic run with switching
+    cfg3 = Config(nx=48, ny=48, x_min=0, x_max=1, y_min=0, y_max=1, cfl=0.3, gamma=5 / 3, bc_x_type="periodic",
+                  bc_y_type="periodic", pic=True, pic_mfp0=2e-4, pic_di=0.002, pic_ppc=64, diag_interval=10**9,
+                  snapshot_times=[])
+    B0 = 1 / np.sqrt(4 * np.pi)
+
+    def init3(s):
+        W = xp.zeros_like(s.U)
+        W[iRHO] = 25 / (36 * np.pi) * (1 - 0.97 * xp.exp(-((s.X - 0.5)**2) / 0.004))
+        W[iPR] = 5 / (12 * np.pi)
+        W[iVX] = -xp.sin(2 * np.pi * s.Y)
+        W[iVY] = xp.sin(2 * np.pi * s.X)
+        s.U[...] = prim_to_cons(W, s.cfg.gamma)
+        s.set_vector_potential(lambda x, y: B0 * (np.cos(4 * np.pi * x) / (4 * np.pi) + np.cos(2 * np.pi * y) / (2 * np.pi)))
+        s._U0 = to_numpy(s.U)
+    s, Us = run(cfg3, init3, 0.15)
+    t0, t1 = totals(s, s._U0), totals(s, Us[-1])
+    dm, de = abs(t1[0] - t0[0]) / t0[0], abs(t1[4] - t0[4]) / t0[4]
+    dp = float(np.max(np.abs(t1[1:4] - t0[1:4])))
+    divb = float(s.div_b_max())
+    rep = s.pic.report()
+    frac = rep["kinetic_cells"] / (48 * 48)
+    good = (dm < 1e-13 and de < 1e-13 and dp < 1e-12 and divb < 1e-12 and rep["switched_on"] > 0
+            and rep["switched_off"] > 0 and 0.02 < frac < 0.5)
+    ok = ok and good
+    print(f"  Orszag-Tang with a kinetic channel to t = 0.15: {100 * frac:.0f}% of cells kinetic ({rep['particles']} "
+          f"particles), {rep['switched_on']} switches to particles, {rep['switched_off']} back; mass {dm:.1e}, "
+          f"momentum {dp:.1e} (absolute), energy {de:.1e}, max |div B| {divb:.1e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3036,6 +3147,7 @@ VERIFICATION_TESTS = {
     "multigroup": multigroup_test,
     "experimental": experimental_test,
     "autodiff": autodiff_test,
+    "hybrid_pic": hybrid_pic_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

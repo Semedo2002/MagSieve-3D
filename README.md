@@ -33,6 +33,7 @@ sieve/            solver package
   experimental_suite.py  bundled open data (Marsh 1980 Cu / Ni Hugoniots) and the plate-impact benchmark
   amr.py          block-structured adaptive mesh refinement (2D, CT, refluxing, touching patches)
   autodiff.py     reverse-mode tape and DiffMHD, the differentiable ideal-MHD twin (adjoint gradients)
+  hybrid_pic.py   adaptive kinetic-fluid hybrid: Kn / Larmor-radius classification, particle ions, exact exchange
   hall.py         generalized Ohm's law: Hall term, anisotropic (Spitzer) resistivity, on the CT staggering
   ions.py         ion gyroviscosity (finite-Larmor-radius stress) and the ion pressure for ion transport
 main.py           CLI: verification tests, single cases, legacy campaign
@@ -419,6 +420,37 @@ discrete adjoint (reverse mode):
   mid-plane, by projected Adam on adjoint gradients; `--drive` adds a magnetic piston and reports dB_peak/dI.
   The design is axisymmetric (a fully 3D liner is outside the 2D twin).
 
+### Adaptive kinetic-fluid hybrid (particles where MHD breaks down)
+
+`pic=True` lets cells switch from fluid MHD to particle ions where the continuum description fails
+(`sieve/hybrid_pic.py`, 2D Cartesian, gamma = 5/3):
+- **Classification (every step, on the GPU):** local Knudsen number Kn = lambda / L, with
+  lambda = `pic_mfp0` theta^2 / rho and L the density / pressure gradient length. A cell turns kinetic when
+  Kn > `pic_kn_on` or the ion Larmor radius r_L = `pic_di` sqrt(theta) / |B| exceeds `pic_rl_on` cells. It
+  returns to the fluid when both fall below `pic_hysteresis` times their thresholds.
+- **Conversion:** a new kinetic cell gets `pic_ppc` particles sampled from a drifting Maxwellian, with the
+  cell's mass, momentum and thermal energy matched exactly. A cell returning to the fluid keeps the particle
+  moments as its state.
+- **Kinetic step (a split step after the MHD stages):**
+  - particles move with the Boris pusher in B and E = -u x B (q/m = 1 / `pic_di`), bilinear in the cell-centred
+    fields;
+  - those that leave the kinetic region are dropped, and sparse cells are resampled;
+  - their NGP moments replace rho, rho u and E - B^2/2 in the kinetic cells; B is untouched (CT, div B at
+    round-off);
+  - an extra time-step limit keeps Omega_i dt <= 0.5.
+- **Conservation:**
+  - cells on the edge of the kinetic region, which exchange HLLD fluxes with the fluid, are matched cell by cell
+    to the conservative fluid step;
+  - every connected interior region is matched as a whole (weight scale, velocity shift, peculiar-velocity
+    scale), and the round-off of the particle sums is put back through ordered device sums;
+  - so mass, momentum and total energy equal those of the conservative fluid step to round-off, while inside a
+    region the particles decide where mass, momentum and heat go.
+- **Model limits:**
+  - the particles carry the whole thermal energy (cold-electron hybrid);
+  - E has no Hall or electron-pressure term;
+  - the fluid sees only the particles' scalar pressure;
+  - a kinetic region needs to be a few cells wide to matter, because its edge cells follow the fluid.
+
 ### Adaptive mesh refinement
 
 `sieve/amr.py` is a two-level, block-structured AMR for the 2D Cartesian solver (Berger-Colella style):
@@ -566,6 +598,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | multigroup | one group = grey FLD (1e-8 at the solver tolerance); 8 grey groups sum to grey FLD in the thick limit (within the per-group limiter), energy to round-off; 12 Kramers groups with an edge relax to the Planck spectrum; decoupled groups diffuse with D_g = c / (3 rho kR_g) over three decades of D (peak within 2% of the exact Gaussian); 2D solver with an Al group table: gas + radiation energy to round-off |
 | experimental | Cu and Ni Hugoniot data load with verified checksums, a tampered file is refused; shot-trace CSV round trip; Cu plate impacts at 5 particle velocities follow the table's own Hugoniot to 0.3% (the flow solver adds no bias) and 143 Marsh shots (Up <= 3 km/s) to 1.8% RMS, chi^2_nu 0.82 for an assumed 2% error |
 | autodiff | the differentiable twin matches MHDSolver after 20 steps (Orszag-Tang 2e-15, r-z shell with B_phi and B_z 4e-13); twin energy 1e-15 and div B 1e-14; the adjoint carries the gradient of the conserved energy back unchanged (2e-16); adjoint vs central finite differences in r-z for an initial-shape parameter, an amplitude and a boundary-drive current (6e-10, 4e-10, 3e-8) |
+| hybrid_pic | free streaming of a density mode in a collisionless gas follows exp(-k^2 theta t^2/2) (0.816 / 0.444 / 0.163 vs 0.821 / 0.454 / 0.169; fluid would ring as a sound wave), totals 6e-15; Boris: \|v\| to 1e-15, r_L Omega / v = 1.001; Orszag-Tang with a kinetic low-density channel: 13% of cells kinetic, cells switching both ways, mass 1e-14, momentum 6e-14 (absolute), energy 1e-14, div B 4e-15 |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |

@@ -67,6 +67,8 @@ def _check(cfg):
         raise NotImplementedError("AMR: 2D Cartesian with constrained transport")
     if cfg.fld_groups:
         raise NotImplementedError("AMR: multigroup FLD is not coupled across levels (grey FLD is)")
+    if cfg.pic:
+        raise NotImplementedError("AMR: the kinetic-fluid hybrid (pic) runs on a single level")
 
 
 # ------------------------------------------------------------------ kernels

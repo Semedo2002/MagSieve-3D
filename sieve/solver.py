@@ -125,6 +125,7 @@ class MHDSolver:
         self._faces_owner = None
         self.cyl = config.geometry == "cylindrical"
         self.strength = config.strength
+        self.pic = None                              # adaptive kinetic-fluid hybrid (sieve/hybrid_pic.py)
         if self.cyl and abs(config.x_min) > 0:
             raise ValueError("cylindrical geometry needs x_min = 0 (the axis)")
         self.ng = 2
@@ -493,6 +494,11 @@ class MHDSolver:
             if dt_g < dt:
                 dt = dt_g
                 self._dt_limiter = "gyroviscous"
+        if self.pic is not None:
+            dt_p = self.pic.dt_limit()
+            if dt_p < dt:
+                dt = dt_p
+                self._dt_limiter = "gyration"
         if cfg.hall_di > 0:
             dt_h = hall.dt_limit(W, cfg, cfg.dx, cfg.dy)
             if dt_h < dt:
@@ -967,7 +973,12 @@ class MHDSolver:
                                                   slice(self.ng, self.ng + self.cfg.ny)))
 
     def _post_step(self, dt):
-        """split steps after the RK stages: plasticity, radiation, conduction, equilibration, viscosity"""
+        """split steps after the RK stages: kinetic cells, plasticity, radiation, conduction, equilibration, viscosity"""
+        if self.cfg.pic:                             # particles replace the fluid ions in the kinetic cells
+            if self.pic is None:
+                from .hybrid_pic import HybridPIC
+                self.pic = HybridPIC(self)
+            self.pic.step(dt)
         if self.strength:                            # radial return to the yield surface, spall damage
             Wn = cons_to_prim(self.U, self.eos)
             stren.plastic(self.S, xp.clip(Wn[iCLR], 0, 1), Wn[iPR], self.cfg.yield_strength,
