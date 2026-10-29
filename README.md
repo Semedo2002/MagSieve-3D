@@ -419,6 +419,11 @@ discrete adjoint (reverse mode):
   of an imploding liner (fixed mass and kinetic energy) to maximise the peak axial field on the axis at the
   mid-plane, by projected Adam on adjoint gradients; `--drive` adds a magnetic piston and reports dB_peak/dI.
   The design is axisymmetric (a fully 3D liner is outside the 2D twin).
+  Default run (56 x 32, 3 modes, 12 iterations, ~30 min on one CPU core): the peak window field rises
+  steadily from 7.4 B0 to 11.7 B0 (smooth time maximum; the instantaneous peak goes from 9.3 to 14.8 B0). The
+  optimiser pulls the liner inward at the mid-plane, with the first mode at its bound |a_1| = 0.15. The adjoint
+  dB_peak/da_1 agrees with a central difference (h = 1e-8) to 4e-9
+  (`results/liner_optimization/`).
 
 ### Adaptive kinetic-fluid hybrid (particles where MHD breaks down)
 
