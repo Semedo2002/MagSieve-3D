@@ -25,6 +25,7 @@ sieve/            solver package
   fld.py          grey flux-limited diffusion radiation (Levermore-Pomraning, implicit CG on the GPU)
   radiation_multigroup.py  multigroup FLD: photon groups, group opacities, coupled implicit BiCGStab solve
   cad_importer.py STL / STEP / IGES import, ray-column volume fractions and apertures, immersed walls
+  agent_monitor.py  automatic run diagnostics: interface mode growth, flux / insulation loss, numerical health
   fno_subgrid.py  Fourier neural operator (inference + training on the autodiff tape), guarded radiation predictor
   parallel.py     MPI slab domain decomposition of the 2D and 3D solvers (halo and CT edge exchange)
   io3d.py         3D snapshots: VTK ImageData (.vti/.pvd) and HDF5
@@ -595,6 +596,31 @@ and the 512^3 scale is a memory estimate (about 1 GB per field copy), not a meas
     and a Mach 2 shock reflecting off walls inclined at 45 and 30 degrees reaches the exact reflected pressure
     within 0.4% at 256^2.
 
+### Live viewer and automatic run monitor
+
+`sieve/agent_monitor.py` watches a run and logs alerts with suggested design changes. It is rule-based
+(statistics and physics thresholds), not a learned or language model:
+- **Interface modes:** the inner liner radius R(theta) on chosen slices is Fourier analysed. Each mode's growth
+  rate is a least-squares fit of log|a_m| over a sliding window, using only amplitudes above 0.5% of the radius
+  and fits with R^2 >= 0.7. A mode growing faster than `growth_alert` or past `amp_alert` is reported; modes not
+  declared as seeded are flagged as unexpected (e.g. an m = 3 wall mode from a drive asymmetry).
+- **Magnetic insulation:** axial flux through the fuel (loss beyond `flux_loss_alert`) and the fuel fraction with
+  Hall parameter below 1.
+- **Numerical health:** energy drift in closed domains, and max |div B| dx / |B|.
+- **Log:** alerts go to a JSON-lines file, once per kind / mode until they clear.
+
+`scripts/server.py` runs a simulation in a background thread and streams it to a browser (standard-library HTTP,
+Server-Sent Events, no web framework):
+- **Each frame:** density and temperature on a slice, temperature contours and in-plane field lines traced on the
+  server, and the monitor's mode table and alerts.
+- **Rendering:** the page draws the slice as a colour-mapped texture with WebGPU (WGSL shader), or a 2D canvas when
+  the browser has no WebGPU.
+- **Presets:** `liner2d`, a liner cross-section with a seeded m = 4 corrugation and a hidden 3% m = 3 drive
+  asymmetry; `cad3d`, the CAD liner of `examples/cad_liner_implosion.py`.
+
+    python scripts/server.py                  # then open http://127.0.0.1:8765
+    python scripts/server.py --preset cad3d
+
 ### 3D rendering
 
 `sieve.io3d.Recorder` writes 3D snapshots (density, pressure, temperature, liner fraction, v, B, E_r) as VTK
@@ -663,6 +689,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | hybrid_pic | free streaming of a density mode in a collisionless gas follows exp(-k^2 theta t^2/2) (0.816 / 0.444 / 0.163 vs 0.821 / 0.454 / 0.169; fluid would ring as a sound wave), totals 6e-15; Boris: \|v\| to 1e-15, r_L Omega / v = 1.001; Orszag-Tang with a kinetic low-density channel: 13% of cells kinetic, cells switching both ways, mass 1e-14, momentum 6e-14 (absolute), energy 1e-14, div B 4e-15 |
 | fno | spectral layer with identity weights = FFT low-pass (2e-15); network gradients vs central differences (2e-6); guard with an untrained network: forced acceptance keeps gas + radiation energy at round-off, forced fallback reproduces the exact solve with the same iteration count |
 | cad | STL round trip; sphere volume fractions converge with the ray sampling (6e-4 to 2.5e-5), wall area vectors close; STEP cylinder through gmsh / OpenCASCADE reads back its volume; ring wall in 2D: rest exact with B_z, a sealed blast keeps cavity mass, total mass and energy to ~1e-14; Mach 2 shock reflection off walls inclined at 45 and 30 degrees within 0.4% of the exact pressure; 3D sphere wall: rest to 2e-16, mass and energy 1.6e-15, div B 2e-15 |
+| monitor | synthetic interface: m = 3 growth rate recovered exactly, flux loss flagged; 2D liner implosion: an undeclared 3% m = 3 drive asymmetry is reported as an unexpected mode (growth 5.3 per unit time), none without it; the server serves the WebGPU page, frames (slice, contours, monitor data), the SSE stream and its status |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |

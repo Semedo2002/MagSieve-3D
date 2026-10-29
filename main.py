@@ -3073,6 +3073,80 @@ def cad_test():
     return ok
 
 
+def monitor_test():
+    """Run monitor (sieve/agent_monitor.py) and live viewer server (scripts/server.py). (1) Mode analysis: a
+    synthetic interface with an m = 3 mode growing at a known rate is decomposed and the rate recovered; a flux
+    history losing 30% raises flux_loss. (2) A 2D liner cross-section implosion with a seeded m = 4 corrugation and
+    an undeclared 3% m = 3 drive asymmetry: the monitor reports the unexpected m = 3 growth; without the asymmetry
+    it reports no unexpected mode. (3) The server on a free local port: the viewer page (WebGPU path), a frame with
+    the density / temperature slices, contours and monitor data, the Server-Sent-Events stream, /status."""
+    import importlib.util
+    import json
+    import urllib.request
+    from sieve.agent_monitor import AgentMonitor, interface_modes
+    print("\n--- Run monitor and live server ---"); sys.stdout.flush()
+    ok = True
+    # (1) synthetic
+    th = np.linspace(0, 2 * np.pi, 128, endpoint=False)
+    mon = AgentMonitor(seeded_modes=(4,), growth_alert=1.5)
+    g_true = 2.0
+    for t in np.linspace(0, 1, 11):
+        r = 1.0 + 0.01 * np.cos(4 * th) + 0.006 * np.exp(g_true * t) * np.cos(3 * th + 0.4)
+        a = np.abs(interface_modes(r))
+        mon.t.append(t); mon.modes.append(a / a[0]); mon.flux.append(1.0 - 0.3 * t); mon.unmag.append(np.nan)
+        mon.energy.append(1.0); mon.divb.append(0.0)
+        mon.check()
+    g3 = mon.growth_rates()[3]
+    kinds = {(a["kind"], a["mode"]) for a in mon.alerts}
+    good = abs(g3 - g_true) / g_true < 1e-6 and ("unexpected_mode", 3) in kinds and ("flux_loss", 0) in kinds \
+        and not any(k == "unexpected_mode" and m != 3 for k, m in kinds)
+    ok = ok and good
+    print(f"  synthetic interface: m = 3 growth rate {g3:.6f} (exact {g_true}); alerts {sorted(kinds)}"
+          f"  [{'PASS' if good else 'FAIL'}]")
+    # (2) the 2D preset, with and without the m = 3 drive asymmetry
+    spec = importlib.util.spec_from_file_location("sieve_server", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                               "scripts", "server.py"))
+    srv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(srv)
+    found = {}
+    for m3 in (0.03, 0.0):
+        S = srv.Session("liner2d", every=10, n=96, drive_m3=m3)
+        S.run()
+        found[m3] = [(a["kind"], a["mode"], a["values"]["g"]) for a in S.mon.alerts if a["kind"] == "unexpected_mode"]
+    hit = [x for x in found[0.03] if x[1] == 3]
+    good = bool(hit) and not found[0.0] and S.error is None
+    ok = ok and good
+    print(f"  liner cross-section with a 3% m = 3 drive asymmetry: unexpected m = 3 reported (growth "
+          f"{hit[0][2]:.1f} per unit time) " if hit else "  m = 3 not reported ", end="")
+    print(f"; without it: {len(found[0.0])} unexpected-mode alerts  [{'PASS' if good else 'FAIL'}]")
+    # (3) server
+    S = srv.Session("liner2d", every=5, n=48)
+    httpd = srv.serve(S, "127.0.0.1", 0)
+    port = httpd.server_address[1]
+    import threading
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    S.start(max_steps=20).join(timeout=300)
+    base = f"http://127.0.0.1:{port}"
+    page = urllib.request.urlopen(base + "/", timeout=30).read().decode()
+    fr = json.loads(urllib.request.urlopen(base + "/frame", timeout=30).read())
+    st = json.loads(urllib.request.urlopen(base + "/status", timeout=30).read())
+    ev = urllib.request.urlopen(base + "/events", timeout=30)
+    first = b""
+    while not first.startswith(b"data: "):
+        first = ev.readline()
+    evf = json.loads(first[6:])
+    ev.close()
+    httpd.shutdown()
+    import base64
+    npx = len(base64.b64decode(fr["rho"]["data"]))
+    good = ("navigator.gpu" in page and "@fragment" in page and npx == 48 * 48 and len(fr["contours"]) > 0
+            and "modes" in fr["monitor"] and st["error"] is None and st["step"] == 20 and evf["step"] == fr["step"])
+    ok = ok and good
+    print(f"  server on port {port}: page with the WebGPU renderer, frame at step {fr['step']} ({npx} px slice, "
+          f"{len(fr['contours'])} contour lines), SSE frame at step {evf['step']}, status {st}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3414,6 +3488,7 @@ VERIFICATION_TESTS = {
     "hybrid_pic": hybrid_pic_test,
     "fno": fno_test,
     "cad": cad_test,
+    "monitor": monitor_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,
