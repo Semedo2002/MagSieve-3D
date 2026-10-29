@@ -175,6 +175,9 @@ def _bicgstab(op, b, x0, prec, tol, maxit):
     return x, maxit
 
 
+RECORD = None                                        # a list here collects (E^n, theta, rho, B_g, dt, E^{n+1})
+
+
 def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True):
     """one multigroup step on interior arrays, in place on Er (G, ...) and U[EN]. Returns (energy the gas gained,
     energy that entered through the domain faces, Krylov iterations)."""
@@ -216,7 +219,7 @@ def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True):
             tb = theta[tuple(idx)]
             Bb, _ = planck_groups(edges, tb, 1.0)
             bfrac[key] = Bb / xp.maximum(xp.sum(Bb, axis=0), 1e-300) * val
-    E1, its = Er.copy(), 0
+    E1, its, first = Er.copy(), 0, True
     for _ in range(max(cfg.fld_picard, 1)):
         K, dg = [], []
         for g in range(G):
@@ -244,8 +247,28 @@ def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True):
             Di = r / D
             den = 1.0 - cpl * xp.sum(w * u / D, axis=0)
             return Di + (u / D) * (cpl * xp.sum(w * Di, axis=0) / den)
-        E1, it = _bicgstab(op, rhs, E1, prec, cfg.fld_tol, cfg.fld_maxit)
+        if cfg.fld_fno_model and first and geo.nd == 2:
+            # learned predictor (sieve/fno_subgrid.py), guarded by the residual of this linear system
+            from . import fno_subgrid as fs
+            x0 = fs.radiation_guess(cfg, E0, theta, rho, B, dt)
+            bn = max(float(xp.sqrt(xp.sum(rhs * rhs))), 1e-300)
+            res = lambda x: float(xp.sqrt(xp.sum((rhs - op(x))**2))) / bn
+            rel, rel0 = res(x0), res(E1)
+            fs.Stats.residuals.append(rel)
+            fs.Stats.default_residuals.append(rel0)
+            if rel <= cfg.fld_fno_tol:
+                E1, it = x0, 0
+                fs.Stats.accepted += 1
+            else:                                    # exact solve, from the prediction only if clearly better
+                E1, it = _bicgstab(op, rhs, x0 if rel < 0.5 * rel0 else E1, prec, cfg.fld_tol, cfg.fld_maxit)
+                fs.Stats.fallback += 1
+            fs.Stats.iterations += it
+        else:
+            E1, it = _bicgstab(op, rhs, E1, prec, cfg.fld_tol, cfg.fld_maxit)
         its += it
+        first = False
+        if RECORD is not None and not cfg.fld_fno_model:   # training data for the predictor: exact solutions
+            RECORD.append(tuple(a.copy() for a in (E0, theta, rho, B)) + (dt, E1.copy()))
     # conservative update from the solution: face fluxes telescope per group, the gas gets the exchange back
     dT = xp.sum(w * (E1 - B), axis=0) / Gam
     exch_tot = 0.0

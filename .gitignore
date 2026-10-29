@@ -15,3 +15,6 @@ results/shot_fitting/runs/
 
 # generated material tables (python tools/generate_sesame.py)
 tables/
+
+# trained neural-operator weights (python tools/train_fno_radiation.py)
+results/fno/*.npz

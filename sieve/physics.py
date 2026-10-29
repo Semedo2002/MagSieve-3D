@@ -23,7 +23,7 @@ def _configure_cuda_dll_search_path():
             candidates.append(Path(base))
 
     for base in candidates:
-        for wheel_root in ('nvidia/cuda_runtime', 'nvidia/cuda_nvrtc'):
+        for wheel_root in ('nvidia/cuda_runtime', 'nvidia/cuda_nvrtc', 'nvidia/cublas'):
             wheel_dir = base / wheel_root
             bin_dir = wheel_dir / 'bin'
             if not bin_dir.exists():

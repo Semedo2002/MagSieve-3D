@@ -2809,6 +2809,92 @@ def hybrid_pic_test():
     return ok
 
 
+def fno_test():
+    """Fourier neural operator predictor (sieve/fno_subgrid.py) and its guard in the multigroup step.
+    (1) The spectral convolution with identity weights is the FFT low-pass of the kept modes. (2) Gradients of a
+    loss through the whole network (tape of sieve/autodiff.py) agree with central differences. (3) Guard, with an
+    untrained (random) network: forcing acceptance (huge tolerance) still conserves gas + radiation energy to
+    round-off, because the step ends with the conservative update built from whatever solution it has; forcing
+    the fallback (tiny tolerance) gives the exact solver's answer to its tolerance, and a prediction no better
+    than E^n costs no extra Krylov iterations (the solve then starts from E^n)."""
+    import tempfile
+    from sieve import fno_subgrid as fs, autodiff as ad, radiation_multigroup as mg
+    print("\n--- Fourier neural operator predictor ---"); sys.stdout.flush()
+    ok = True
+    rng = np.random.default_rng(0)
+    m = fs.FNO(3, 2, width=4, modes=5, layers=2, xp=np)
+    nx, ny = 16, 12
+    x = rng.normal(size=(2, 4, nx, ny))
+    wr = np.zeros((4, 4, 9, 5))
+    for c in range(4):
+        wr[c, c] = 1.0
+    y = m._spectral(ad.const(x), ad.const(wr), ad.const(np.zeros_like(wr))).v
+    kx, ky = np.fft.fftfreq(nx, 1 / nx), np.fft.fftfreq(ny, 1 / ny)
+    yref = np.real(np.fft.ifft2(np.fft.fft2(x) * ((np.abs(kx)[:, None] <= 4) & (np.abs(ky)[None, :] <= 4))))
+    d1 = float(np.abs(y - yref).max())
+    xin, tgt = rng.normal(size=(2, 3, nx, ny)), rng.normal(size=(2, 2, nx, ny))
+
+    def loss(P):
+        d = m.forward(ad.const(xin), P) - ad.const(tgt)
+        return ad.tsum(d * d)
+    with ad.record():
+        P = {k: ad.leaf(v) for k, v in m.params.items()}
+        ad.backward(loss(P))
+    gerr = 0.0
+    for k in ("sr0", "si1", "pw0", "lift_w", "proj1_w", "proj2_b"):
+        idx = tuple(int(rng.integers(0, n)) for n in m.params[k].shape)
+        p0, h = m.params[k][idx], 1e-6
+        m.params[k][idx] = p0 + h
+        Lp = float(loss({q: ad.const(v) for q, v in m.params.items()}).v)
+        m.params[k][idx] = p0 - h
+        Lm = float(loss({q: ad.const(v) for q, v in m.params.items()}).v)
+        m.params[k][idx] = p0
+        fd = (Lp - Lm) / (2 * h)
+        gerr = max(gerr, abs(fd - P[k].g[idx]) / max(abs(fd), 1e-3))
+    good = d1 < 1e-13 and gerr < 1e-5
+    ok = ok and good
+    print(f"  spectral layer vs FFT low-pass {d1:.0e}; network gradients vs central differences {gerr:.0e}"
+          f"  [{'PASS' if good else 'FAIL'}]")
+
+    # (3) the guard in the multigroup step
+    G, n = 4, 24
+    path = os.path.join(tempfile.mkdtemp(prefix="fno_"), "random.npz")
+    fs.FNO(2 * G + 3, G, width=8, modes=6, layers=2, xp=xp).save(path)
+
+    def cfg(**kw):
+        c = dict(nx=n, ny=n, x_max=1.0, y_max=1.0, gamma=5 / 3, bc_x_type="periodic", bc_y_type="periodic",
+                 diag_interval=10**9, snapshot_times=[], fld=True, fld_c=10.0, fld_a=1.0, fld_advect=False, fld_tol=1e-10,
+                 fld_groups=G, fld_mg_opacity="kramers", fld_kp0=20.0, fld_kr0=2.0, fld_edge=3.0, fld_edge_jump=10.0,
+                 fld_group_emin=0.1, fld_group_emax=20.0)
+        c.update(kw)
+        return Config(**c)
+    xg = (np.arange(n) + 0.5) / n
+    X, Y = np.meshgrid(xg, xg, indexing="ij")
+    W = xp.zeros((NVAR, n, n))
+    W[iRHO] = xp.asarray(1.0 + 0.3 * np.cos(2 * np.pi * X))
+    W[iPR] = W[iRHO] * xp.asarray(1.0 + 0.8 * np.exp(-((X - .5)**2 + (Y - .5)**2) / 0.02))
+    U0 = prim_to_cons(W, 5 / 3)
+    E0 = xp.full((G, n, n), 0.2)
+    h, per, dt = (1 / n, 1 / n), (True, True), 0.01
+    out = {}
+    for name, c in (("exact", cfg()), ("accept", cfg(fld_fno_model=path, fld_fno_tol=1e300)),
+                    ("fallback", cfg(fld_fno_model=path, fld_fno_tol=1e-300))):
+        fs.Stats.reset()
+        U, E = U0.copy(), E0.copy()
+        tot0 = float(xp.sum(U[EN]) + xp.sum(E))
+        _, _, its = mg.step(E, U, 5 / 3, c, h, per, dt, advect=False)
+        out[name] = (E, abs(float(xp.sum(U[EN]) + xp.sum(E)) - tot0) / tot0, its, fs.Stats.accepted, fs.Stats.fallback)
+    dfb = float(xp.max(xp.abs(out["fallback"][0] - out["exact"][0])) / xp.max(out["exact"][0]))
+    good = (out["accept"][1] < 1e-14 and out["accept"][3] == 1 and out["fallback"][4] == 1
+            and dfb < 1e-7 and out["fallback"][2] <= out["exact"][2] and out["exact"][1] < 1e-14)
+    ok = ok and good
+    print(f"  guard with a random network: forced acceptance (first Picard pass, no Krylov solve) keeps energy to "
+          f"{out['accept'][1]:.0e}; forced fallback -> "
+          f"{out['fallback'][2]} iterations (exact solve {out['exact'][2]}), differs from it by {dfb:.0e}, energy "
+          f"{out['fallback'][1]:.0e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3148,6 +3234,7 @@ VERIFICATION_TESTS = {
     "experimental": experimental_test,
     "autodiff": autodiff_test,
     "hybrid_pic": hybrid_pic_test,
+    "fno": fno_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

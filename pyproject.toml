@@ -24,6 +24,7 @@ Repository = "https://github.com/Semedo2002/MagSieve-3D"
 paper = ["python-docx>=1.1"]
 viz = ["pyvista>=0.44", "imageio>=2.31", "imageio-ffmpeg>=0.5", "h5py>=3.9"]
 mpi = ["mpi4py>=4.0"]
+fno = ["nvidia-cublas-cu12>=12"]     # GPU matrix products for the neural-operator predictor
 
 [tool.setuptools]
 packages = ["sieve", "sieve.problems"]

@@ -209,6 +209,10 @@ class PhysicsConfig:
     fld_edge_jump: float = 0.0
     fld_mg_table: str = ""
     fld_mg_absorption: float = 1.0                   # scales every kP_g (0: groups only diffuse, no exchange)
+    # learned predictor for the multigroup implicit solve (sieve/fno_subgrid.py, a .npz model; 2D): accepted when
+    # the relative residual of the linear system is <= fld_fno_tol, otherwise BiCGStab starts from it
+    fld_fno_model: str = ""
+    fld_fno_tol: float = 1e-3
     # magnetized electron conduction (physics.conduction_div), 0 = off: k_par = cond_kappa0 T^5/2,
     # k_perp = k_par/(1 + x^2), x = cond_x0 |B| T^3/2 / rho, T = p/rho; fuel only (tracer < cond_tracer_max).
     # Split step integrated with RKL2 super-time-stepping, so it does not limit the time step.
@@ -320,6 +324,8 @@ class PhysicsConfig:
             raise ValueError("fld_groups > 0 needs fld=True; fld_mg_opacity is grey or kramers")
         if self.fld_group_edges and len(self.fld_group_edges) != self.fld_groups - 1:
             raise ValueError("fld_group_edges holds the fld_groups - 1 inner edges")
+        if self.fld_fno_model and (self.fld_groups < 1 or self.fld_fno_tol <= 0):
+            raise ValueError("fld_fno_model needs fld_groups >= 1 and fld_fno_tol > 0")
         if self.fld and self.two_temp:
             raise ValueError("fld couples to a single gas temperature: not with two_temp")
         if min(self.hall_di, self.cond_kappa_i0, self.cond_x0_i, self.gyro_di) < 0 or self.eta_perp_ratio <= 0:

@@ -24,6 +24,7 @@ sieve/            solver package
   circuit.py      RLC drive circuit coupled to an r-z liner (magnetic piston, energy-consistent inductance)
   fld.py          grey flux-limited diffusion radiation (Levermore-Pomraning, implicit CG on the GPU)
   radiation_multigroup.py  multigroup FLD: photon groups, group opacities, coupled implicit BiCGStab solve
+  fno_subgrid.py  Fourier neural operator (inference + training on the autodiff tape), guarded radiation predictor
   parallel.py     MPI slab domain decomposition of the 2D and 3D solvers (halo and CT edge exchange)
   io3d.py         3D snapshots: VTK ImageData (.vti/.pvd) and HDF5
   tabular.py      tabulated EOS / opacities (SESAME ASCII, .npz) with GPU inversion and analytic fallback
@@ -276,6 +277,34 @@ a single gas temperature (not with `two_temp`).
   - decoupled groups diffuse with their own D_g over three decades;
   - a solver run with an Al group table conserves energy.
 - **Scope:** 2D (Cartesian, r-z) and 3D; not under AMR (grey FLD is).
+
+### Neural-operator predictor for the multigroup solve
+
+`sieve/fno_subgrid.py` is a small Fourier neural operator (FNO) that runs inside the time step as a
+predictor for the implicit multigroup radiation solve:
+- **Model:** lift, then L Fourier layers (lowest modes mixed by learned complex weights, plus a 1x1 path, GELU),
+  then a projection. The truncated transforms are cosine / sine matrix products, so the model runs on CuPy or
+  NumPy at any resolution. It is trained with the reverse-mode tape of `sieve/autodiff.py`, with no ML framework.
+  GPU matrix products need cuBLAS (`pip install magsieve[fno]`).
+- **Use:** with `fld_fno_model`, `radiation_multigroup.step` asks the model for E^{n+1} of every group before the
+  Krylov solve. The guard is the relative residual of that linear system:
+  - at or below `fld_fno_tol`, the prediction is accepted and the first Picard pass skips BiCGStab;
+  - otherwise BiCGStab runs, from the prediction only if its residual is under half that of E^n.
+  Either way the step ends with the conservative face-flux + exchange update built from the solution, so gas +
+  radiation energy stays at round-off whatever the network predicts.
+- **Training:** `tools/train_fno_radiation.py` generates data with the exact solver, trains, and benchmarks:
+  - data: random smooth T, rho, E_g fields on 32^2, 6 Kramers groups with an edge;
+  - training: 720 samples, 150 epochs, ~54 min on a P1000.
+- **Measured result (`results/fno/radiation_fno_report.json`), negative:**
+  - validation loss 0.16 (normalised MSE) against 0.018 on the training set;
+  - the predictor's linear-system residual is worse than E^n's (median 3.1 against 0.26), because the system is
+    stiff (D dt / dx^2 ~ 20) and a 1% field error is amplified by the operator;
+  - so it is never accepted, the solve starts from E^n, and the iteration count (219 per step) is unchanged;
+  - inference costs 64 ms against 6.6 s for an exact solve, so the speed-up would only appear for a predictor
+    accurate to ~1e-5.
+  The engine and the guard work (`--test fno`), but this predictor does not pay off. A better preconditioner
+  (multigrid) is the more promising route for this solve.
+- **Not done:** no learned sub-grid turbulence closure.
 
 ### Tabulated EOS and opacities
 
@@ -604,6 +633,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | experimental | Cu and Ni Hugoniot data load with verified checksums, a tampered file is refused; shot-trace CSV round trip; Cu plate impacts at 5 particle velocities follow the table's own Hugoniot to 0.3% (the flow solver adds no bias) and 143 Marsh shots (Up <= 3 km/s) to 1.8% RMS, chi^2_nu 0.82 for an assumed 2% error |
 | autodiff | the differentiable twin matches MHDSolver after 20 steps (Orszag-Tang 2e-15, r-z shell with B_phi and B_z 4e-13); twin energy 1e-15 and div B 1e-14; the adjoint carries the gradient of the conserved energy back unchanged (2e-16); adjoint vs central finite differences in r-z for an initial-shape parameter, an amplitude and a boundary-drive current (6e-10, 4e-10, 3e-8) |
 | hybrid_pic | free streaming of a density mode in a collisionless gas follows exp(-k^2 theta t^2/2) (0.816 / 0.444 / 0.163 vs 0.821 / 0.454 / 0.169; fluid would ring as a sound wave), totals 6e-15; Boris: \|v\| to 1e-15, r_L Omega / v = 1.001; Orszag-Tang with a kinetic low-density channel: 13% of cells kinetic, cells switching both ways, mass 1e-14, momentum 6e-14 (absolute), energy 1e-14, div B 4e-15 |
+| fno | spectral layer with identity weights = FFT low-pass (2e-15); network gradients vs central differences (2e-6); guard with an untrained network: forced acceptance keeps gas + radiation energy at round-off, forced fallback reproduces the exact solve with the same iteration count |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |
