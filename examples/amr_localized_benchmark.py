@@ -1,4 +1,4 @@
-"""AMR against a uniform grid at the fine resolution on localized shock / interface problems (sieve/amr.py).
+"""AMR against a uniform grid at the fine resolution on localized shock / interface problems (aegis/amr.py).
 
     bubble  a Mach-3 shock (B_x = 0.3) runs into a dense cylinder (radius 0.12, density 10) in a 2 x 1 box:
             256 x 128 coarse cells + ratio-4 patches on the shock, the bubble and its wake, against 1024 x 512
@@ -25,11 +25,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "examples"))
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, iRHO, iVX, iPR, iCLR, iBX
-    from sieve.physics import xp, cons_to_prim, prim_to_cons
-    from sieve.solver import MHDSolver, to_numpy
-    from sieve.amr import AMR, AMRParams
-    from sieve.diagnostics import enclosed_by_tracer
+    from aegis.config import Config, NVAR, iRHO, iVX, iPR, iCLR, iBX
+    from aegis.physics import xp, cons_to_prim, prim_to_cons
+    from aegis.solver import MHDSolver, to_numpy
+    from aegis.amr import AMR, AMRParams
+    from aegis.diagnostics import enclosed_by_tracer
     import amr_implosion_demo as imp
 
 G = 5.0 / 3.0

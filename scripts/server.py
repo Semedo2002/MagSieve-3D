@@ -1,4 +1,4 @@
-"""Live viewer: runs a simulation and streams it to a browser, with the automatic run monitor (sieve/agent_monitor.py).
+"""Live viewer: runs a simulation and streams it to a browser, with the automatic run monitor (aegis/agent_monitor.py).
 
 A background thread advances the solver; every few steps it publishes a frame: density and temperature on a slice
 (z = mid-plane in 3D), temperature contours and in-plane magnetic field lines (traced on the server), the run
@@ -28,10 +28,10 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, iRHO, iVX, iVY, iPR, iBX, iBY, iBZ, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim
-    from sieve.solver import MHDSolver
-from sieve.agent_monitor import AgentMonitor
+    from aegis.config import Config, NVAR, iRHO, iVX, iVY, iPR, iBX, iBY, iBZ, iCLR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim
+    from aegis.solver import MHDSolver
+from aegis.agent_monitor import AgentMonitor
 
 
 # ============================================================
@@ -63,8 +63,8 @@ def preset_liner2d(n=128, seed_m=4, drive_m3=0.03):
 
 
 def preset_cad3d(n=48, nz=24):
-    from sieve.solver3d import MHDSolver3D
-    from sieve import cad_importer as ci
+    from aegis.solver3d import MHDSolver3D
+    from aegis import cad_importer as ci
     stl = os.path.join(ROOT, "examples", "data", "corrugated_liner.stl")
     tris = ci.read_cad(stl)
     cfg = Config(nx=n, ny=n, nz=nz, x_min=-1.6, x_max=1.6, y_min=-1.6, y_max=1.6, z_min=0.0, z_max=2.0, cfl=0.3,
@@ -226,7 +226,7 @@ class Session:
 # ============================================================
 # HTTP
 # ============================================================
-PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>MagSieve live</title>
+PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>AEGIS-MHD live</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root{--bg:#0f1115;--fg:#e6e6e6;--mut:#9aa0a6;--acc:#f0a35e;--warn:#ff6b6b}
@@ -241,7 +241,7 @@ select{background:#1b1e24;color:var(--fg);border:1px solid #333;padding:2px 6px}
 .alert{border-left:3px solid var(--warn);padding:4px 8px;margin:6px 0;background:#1b1e24}
 table{border-collapse:collapse}td{padding:1px 8px;color:var(--mut)}
 </style></head><body>
-<header><h1>MagSieve live</h1><span id="info">connecting...</span>
+<header><h1>AEGIS-MHD live</h1><span id="info">connecting...</span>
 <label>field <select id="fld"><option value="rho">log10 density</option><option value="T">temperature</option></select></label>
 <span id="gpu"></span></header>
 <main><div class="view"><canvas id="gl" width="512" height="512"></canvas><canvas id="ov" width="512" height="512"></canvas></div>

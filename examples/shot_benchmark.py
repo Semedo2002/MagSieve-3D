@@ -1,4 +1,4 @@
-"""Benchmark against open experimental data (sieve/experimental_suite.py).
+"""Benchmark against open experimental data (aegis/experimental_suite.py).
 
 Runs copper plate impacts with the solver (tabulated EOS from tools/generate_sesame.py) at a set of particle
 velocities and compares the shock velocities with the 145 Marsh (1980) LASL Hugoniot shots bundled with the code;
@@ -6,7 +6,7 @@ writes results/shot_benchmark/shot_benchmark_comparison.png and summary.json (RM
 measurement error, the data's own linear fit).
 
 Your own shot traces (VISAR, B-dot, radiography; CSV columns t, value, sigma) can be compared with an FCG or MagLIF
-run through sieve/validation.py: see examples/experimental_shot_fitting.py.
+run through aegis/validation.py: see examples/experimental_shot_fitting.py.
 
     python examples/shot_benchmark.py                      # 10 impacts, Up 0.2-3 km/s
     python examples/shot_benchmark.py --n-up 6 --cells 400
@@ -23,7 +23,7 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve import experimental_suite as ex
+    from aegis import experimental_suite as ex
 
 
 def main():

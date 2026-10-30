@@ -22,7 +22,7 @@ an illustrative, not a design, value.
     python examples/mtif_3d_asymmetry.py --tilts 2 --modes --vtk-case "tilt 2 deg"   # + 3D frames and renders
     python examples/mtif_3d_asymmetry.py --plot-only
 
-Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
+Needs the AEGIS-MHD solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
 import os
 import sys
@@ -38,12 +38,12 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)  # run from a repo checkout without installing
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iBX, iBY, iBZ, iPR, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim, pressure_margin
-    from sieve.solver import MHDSolver, to_numpy
-    from sieve.solver3d import MHDSolver3D
-    from sieve.diagnostics import enclosed_by_tracer, cavitation_split, hotspot_conduction
-    from sieve.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
+    from aegis.config import Config, NVAR, EN, iRHO, iVX, iVY, iBX, iBY, iBZ, iPR, iCLR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim, pressure_margin
+    from aegis.solver import MHDSolver, to_numpy
+    from aegis.solver3d import MHDSolver3D
+    from aegis.diagnostics import enclosed_by_tracer, cavitation_split, hotspot_conduction
+    from aegis.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
                              add_radiation_args, radiation_from_args, add_conduction_args, conduction_from_args)
 
 GAMMA = 5.0 / 3.0
@@ -175,7 +175,7 @@ def run_case(a, name, dims, tilt=0.0, m=0):
     rows.append(diag(s, a, state))
     rec = None
     if dims == 3 and getattr(a, "vtk_case", None) == name:      # 3D snapshots for scripts/render_3d.py
-        from sieve.io3d import Recorder
+        from aegis.io3d import Recorder
         rec = Recorder(os.path.join(a.out, "vtk_" + name.replace(" ", "_").replace("=", "")), fmt=("vti",))
         rec(s)
         next_rec = a.t_end / a.vtk_frames

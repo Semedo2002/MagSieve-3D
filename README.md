@@ -1,4 +1,6 @@
-# MagSieve-3D: striped magnetic fields and the Richtmyer-Meshkov instability
+# AEGIS-MHD: GPU MHD solver platform, and the magnetic sieve study of striped fields and the Richtmyer-Meshkov instability
+
+The solver package is `aegis` (`pip install aegis-mhd`; the platform was called MagSieve-3D / `sieve` before, and the GitHub repository keeps that name).
 
 A 2D and 3D compressible MHD solver (CuPy + a custom CUDA HLLD kernel) and the parameter study built on it. The study asks whether a spatially striped magnetic field can suppress ("lock") the Richtmyer-Meshkov instability of a shocked density interface while channelling the flow through the weak-field gaps.
 
@@ -7,7 +9,7 @@ A 2D and 3D compressible MHD solver (CuPy + a custom CUDA HLLD kernel) and the p
 ## Layout
 
 ```
-sieve/            solver package
+aegis/            solver package
   config.py       typed configuration (unknown keys raise ValueError)
   physics.py      CUDA HLLD wrapper, MUSCL, jump conditions, resistive terms, stripe equilibrium
   eos.py          two-material EOS: ideal gas, stiffened gas, Mie-Gruneisen (linear Us-Up)
@@ -144,7 +146,7 @@ face fluxes, so total energy is conserved exactly. 2D solver (Cartesian and r-z)
 
 ### Hall term and anisotropic resistivity
 
-`sieve/hall.py` adds to the induction and energy equations the part of the generalized Ohm's law beyond eta J,
+`aegis/hall.py` adds to the induction and energy equations the part of the generalized Ohm's law beyond eta J,
 
     E' = d_i (J x B) / rho + (eta_perp - eta_par) J_perp,     J_perp = J - (b . J) b,
 
@@ -226,7 +228,7 @@ python examples/nearstar_mtif3_validation.py --eta-model spitzer --sigma-liner 3
 
 ### RLC drive circuit
 
-`sieve/circuit.py` replaces a prescribed liner velocity with a capacitor bank (C, V0, series L0 and R) whose
+`aegis/circuit.py` replaces a prescribed liner velocity with a capacitor bank (C, V0, series L0 and R) whose
 current runs up an r-z liner and back through a return can at r_return. The circuit is d(LI)/dt = V - RI with
 L = L0 + (mu0 l / 2 pi) <ln(r_return / r_out)>, i.e. dI/dt = (V - RI - I dL/dt) / L, integrated by the
 trapezoid rule in flux form (exact energy identity for a fixed load). The liner feels the J x B of its surface
@@ -253,7 +255,7 @@ a single gas temperature (not with `two_temp`).
 
 ### Multigroup radiation diffusion
 
-`fld_groups > 0` splits the FLD radiation into photon groups (`sieve/radiation_multigroup.py`):
+`fld_groups > 0` splits the FLD radiation into photon groups (`aegis/radiation_multigroup.py`):
 
     dE_g/dt + div(v E_g) = div(D_g grad E_g) + c rho kP_g (a T^4 b_g(T) - E_g),   D_g = c lambda(R_g) / (rho kR_g)
 
@@ -282,12 +284,12 @@ a single gas temperature (not with `two_temp`).
 
 ### Neural-operator predictor for the multigroup solve
 
-`sieve/fno_subgrid.py` is a small Fourier neural operator (FNO) that runs inside the time step as a
+`aegis/fno_subgrid.py` is a small Fourier neural operator (FNO) that runs inside the time step as a
 predictor for the implicit multigroup radiation solve:
 - **Model:** lift, then L Fourier layers (lowest modes mixed by learned complex weights, plus a 1x1 path, GELU),
   then a projection. The truncated transforms are cosine / sine matrix products, so the model runs on CuPy or
-  NumPy at any resolution. It is trained with the reverse-mode tape of `sieve/autodiff.py`, with no ML framework.
-  GPU matrix products need cuBLAS (`pip install magsieve[fno]`).
+  NumPy at any resolution. It is trained with the reverse-mode tape of `aegis/autodiff.py`, with no ML framework.
+  GPU matrix products need cuBLAS (`pip install aegis-mhd[fno]`).
 - **Use:** with `fld_fno_model`, `radiation_multigroup.step` asks the model for E^{n+1} of every group before the
   Krylov solve. The guard is the relative residual of that linear system:
   - at or below `fld_fno_tol`, the prediction is accepted and the first Picard pass skips BiCGStab;
@@ -310,7 +312,7 @@ predictor for the implicit multigroup radiation solve:
 
 ### Tabulated EOS and opacities
 
-`sieve/tabular.py` reads SESAME ASCII files (EOS table 301; opacity tables 502 Rosseland and 505 Planck, taken
+`aegis/tabular.py` reads SESAME ASCII files (EOS table 301; opacity tables 502 Rosseland and 505 Planck, taken
 as log10 kappa in cm^2/g against log10 rho in g/cc and log10 T in eV, so check your library's convention) or an
 SI `.npz` table (rho, T, p, e, optional cs, kappa_R, kappa_P). Tables are resampled onto a uniform log rho x log
 T grid; positive quantities are interpolated in log space, so power laws are reproduced exactly. The lookup
@@ -324,11 +326,11 @@ cells; mixed cells keep the tangent stiffened gas of the volume-fraction closure
 tabulated kappa_R and kappa_P). No SESAME data ship with the code (LANL distributes them under licence):
 `tabular.mie_gruneisen_table` and `tabular.ideal_gas_table` write synthetic tables, which is how this is tested.
 
-The two-material EOS, analytic or tabulated, runs as device functions (`sieve/eos_fused.cu`): the conversions,
+The two-material EOS, analytic or tabulated, runs as device functions (`aegis/eos_fused.cu`): the conversions,
 the face floors and the HLLD kernel evaluate p(rho, eps), eps(rho, p) and c^2 per cell or face inline (table
 search, bilinear interpolation, fallback blend and the blend-band secant all in the thread), and every
 `EOS` / `TabularEOS` method on device arrays is one launch. They reproduce the array implementation to
-round-off (1e-14 over a run; `SIEVE_ARRAY_EOS=1` switches back to it). `scripts/bench_tabular.py`, a 2D Al
+round-off (1e-14 over a run; `AEGIS_ARRAY_EOS=1` switches back to it). `scripts/bench_tabular.py`, a 2D Al
 impact on a Quadro P1000:
 
 | grid | analytic MG, array EOS | table, array EOS | analytic MG, device EOS | table, device EOS | table / analytic |
@@ -377,7 +379,7 @@ python examples/fcg_flux_compression.py --eos-table tables/al.npz --opacity-tabl
 
 ### Shot calibration against diagnostics
 
-`sieve/validation.py` compares simulated observables with measured traces (VISAR free-surface velocity, B-dot
+`aegis/validation.py` compares simulated observables with measured traces (VISAR free-surface velocity, B-dot
 probe voltage, radiography radii; CSV with time, value, sigma): RMS error, reduced chi^2, and the peak alignment
 offset (the delay maximising the cross-correlation of simulation and data). Timing shifts can be fitted as
 nuisance parameters with a Gaussian prior from the fiducial uncertainty, and simulated signals pass through the
@@ -403,11 +405,11 @@ velocity at the surface.
 
 ### Open experimental data and benchmarks
 
-`sieve/experimental_suite.py` bundles open, citable experimental data and runs the solver against it:
+`aegis/experimental_suite.py` bundles open, citable experimental data and runs the solver against it:
 - **Bundled data:** copper (145 shots) and nickel (19 shots) shock Hugoniots, shock velocity against particle
   velocity from plate impacts. They come from Marsh (ed.), *LASL Shock Hugoniot Data* (University of
   California Press, 1980), as transcribed in LLNL's [BALSCD](https://github.com/llnl/BALSCD) repository (MIT
-  licence; its notice files sit next to the data in `sieve/data/experimental/`). Each file's SHA-256 is checked
+  licence; its notice files sit next to the data in `aegis/data/experimental/`). Each file's SHA-256 is checked
   on load.
 - **Benchmark:** `hugoniot_benchmark()` runs symmetric plate impacts with the solver and the generated Cu table
   at a set of particle velocities, measures the shock speed from the front's motion, and reports RMS and
@@ -420,11 +422,11 @@ velocity at the surface.
 ![Cu Hugoniot benchmark](results/shot_benchmark/shot_benchmark_comparison.png)
 - **Not bundled:** no open pulsed-power shot data (B-dot, VISAR traces, x-ray core radii) in a machine-readable,
   citable form were found, so none ship with the code. Your own traces load with `load_shot()` (CSV: t, value,
-  sigma) and compare with FCG / MagLIF runs through `sieve/validation.py` (`examples/experimental_shot_fitting.py`).
+  sigma) and compare with FCG / MagLIF runs through `aegis/validation.py` (`examples/experimental_shot_fitting.py`).
 
 ### Differentiable solver and inverse design
 
-`sieve/autodiff.py` computes exact gradients of objectives of a simulation with respect to its inputs by a
+`aegis/autodiff.py` computes exact gradients of objectives of a simulation with respect to its inputs by a
 discrete adjoint (reverse mode):
 - **Tape:** a small reverse-mode tape for NumPy / CuPy arrays (`Tensor`, `record()`, `backward()`): each operation
   stores its vector-Jacobian product.
@@ -459,7 +461,7 @@ discrete adjoint (reverse mode):
 ### Adaptive kinetic-fluid hybrid (particles where MHD breaks down)
 
 `pic=True` lets cells switch from fluid MHD to particle ions where the continuum description fails
-(`sieve/hybrid_pic.py`, 2D Cartesian, gamma = 5/3):
+(`aegis/hybrid_pic.py`, 2D Cartesian, gamma = 5/3):
 - **Classification (every step, on the GPU):** local Knudsen number Kn = lambda / L, with
   lambda = `pic_mfp0` theta^2 / rho and L the density / pressure gradient length. A cell turns kinetic when
   Kn > `pic_kn_on` or the ion Larmor radius r_L = `pic_di` sqrt(theta) / |B| exceeds `pic_rl_on` cells. It
@@ -489,7 +491,7 @@ discrete adjoint (reverse mode):
 
 ### Adaptive mesh refinement
 
-`sieve/amr.py` is a two-level, block-structured AMR for the 2D Cartesian solver (Berger-Colella style):
+`aegis/amr.py` is a two-level, block-structured AMR for the 2D Cartesian solver (Berger-Colella style):
 ratio-r patches (each an `MHDSolver` on a sub-rectangle) take r sub-steps per coarse step, all patches
 advancing stage by stage together. Ghost cells and faces come from touching patches (same stage) or from the
 coarse level (limited linear in space, linear in time). At each synchronisation the coarse cells next to a
@@ -558,7 +560,7 @@ is a modest fraction of the domain.
 
 ### Multi-GPU domain decomposition
 
-`sieve.parallel.distributed(MHDSolver3D, cfg)` (or `MHDSolver`) run under `mpiexec` splits the grid into x
+`aegis.parallel.distributed(MHDSolver3D, cfg)` (or `MHDSolver`) run under `mpiexec` splits the grid into x
 slabs, one per rank, each keeping the global dx to the last bit. Ghost layers of the cells, the CT face fields
 and the liner stress are swapped with the neighbours, the edge EMFs on a shared x-face are taken from the left
 rank on both sides (so both update the shared face identically and div B stays at round-off), and dt is the
@@ -571,9 +573,9 @@ and the 512^3 scale is a memory estimate (about 1 GB per field copy), not a meas
 
 ### CAD geometry on the grid (volume fractions, immersed walls)
 
-`sieve/cad_importer.py` puts CAD solids straight onto the solver grid, with no mesh generation:
+`aegis/cad_importer.py` puts CAD solids straight onto the solver grid, with no mesh generation:
 - **Formats:** `.stl` (ASCII or binary) is read natively. `.step` / `.stp` / `.iges` / `.igs` are triangulated
-  through gmsh's OpenCASCADE kernel (`pip install magsieve[cad]`).
+  through gmsh's OpenCASCADE kernel (`pip install aegis-mhd[cad]`).
 - **Volume fractions and apertures:** by ray columns. Each ray along a grid axis crosses the surface at exactly
   computed points, and sorted crossings pair into inside intervals (parity, so orientation does not matter):
   - this is exact along the ray and a sub x sub midpoint rule across it;
@@ -598,7 +600,7 @@ and the 512^3 scale is a memory estimate (about 1 GB per field copy), not a meas
 
 ### Live viewer and automatic run monitor
 
-`sieve/agent_monitor.py` watches a run and logs alerts with suggested design changes. It is rule-based
+`aegis/agent_monitor.py` watches a run and logs alerts with suggested design changes. It is rule-based
 (statistics and physics thresholds), not a learned or language model:
 - **Interface modes:** the inner liner radius R(theta) on chosen slices is Fourier analysed. Each mode's growth
   rate is a least-squares fit of log|a_m| over a sliding window, using only amplitudes above 0.5% of the radius
@@ -623,7 +625,7 @@ Server-Sent Events, no web framework):
 
 ### 3D rendering
 
-`sieve.io3d.Recorder` writes 3D snapshots (density, pressure, temperature, liner fraction, v, B, E_r) as VTK
+`aegis.io3d.Recorder` writes 3D snapshots (density, pressure, temperature, liner fraction, v, B, E_r) as VTK
 ImageData with a ParaView `.pvd` series and optionally HDF5. `scripts/render_3d.py` renders them off screen with
 PyVista: a ray-cast density volume, the liner isosurface with the quadrant facing the camera cut away, hot-spot
 temperature contours and field lines, one PNG per frame and an MP4. `examples/mtif_3d_asymmetry.py --vtk-case
@@ -725,7 +727,7 @@ python ../paper/make_paper.py
 
 ## Multi-physics MTIF capabilities
 
-MagSieve-3D includes physics modules for magnetized target inertial fusion (MTIF) and magnetically driven
+AEGIS-MHD includes physics modules for magnetized target inertial fusion (MTIF) and magnetically driven
 shock compression, each verified against an analytic solution in `python main.py --test all`:
 
 - **Shock capturing and exact div B:** HLLD Riemann solver, MUSCL reconstruction, constrained transport: the
@@ -922,7 +924,7 @@ python scripts/plot_rmi_mhd.py           # PNG/GIF into results/rmi_mhd
 python main.py --test rmi_mhd            # smoke test
 ```
 
-The set-up is in `sieve/problems/rmi_mhd.py`; the shock travels in +x and the interface is
+The set-up is in `aegis/problems/rmi_mhd.py`; the shock travels in +x and the interface is
 x(y) = x0 + eta0 cos(k y). Jumps come from the Rankine-Hugoniot conditions, and the shock-interface
 interaction is solved exactly in 1D for the Richtmyer and Meyer-Blewett reference growth rates. With B_x,
 the incident, reflected and transmitted shocks must all be fast MHD shocks, so B0 above ~3.4 is rejected at

@@ -17,7 +17,7 @@ the real shot values, and add the missing physics, before comparing amplitudes w
     python examples/nearstar_mtif3_validation.py --enable-rad --t-rad-min-ev 10              # bremsstrahlung
     python examples/nearstar_mtif3_validation.py --enable-conduction --braginskii             # conduction
 
-Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
+Needs the AEGIS-MHD solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
 import os
 import sys
@@ -33,13 +33,13 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)  # run from a repo checkout without installing
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iBZ, iPR, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim, pressure_margin
-    from sieve.solver import MHDSolver, to_numpy
-    from sieve.diagnostics import enclosed_by_tracer, cavitation_split, hotspot_conduction
-    from sieve.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
+    from aegis.config import Config, NVAR, EN, iRHO, iVX, iVY, iBZ, iPR, iCLR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim, pressure_margin
+    from aegis.solver import MHDSolver, to_numpy
+    from aegis.diagnostics import enclosed_by_tracer, cavitation_split, hotspot_conduction
+    from aegis.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
                              add_radiation_args, radiation_from_args, add_conduction_args, conduction_from_args)
-    from sieve.physics import internal_energy
+    from aegis.physics import internal_energy
 
 GAMMA = 5.0 / 3.0
 MU0 = 4e-7 * np.pi

@@ -180,7 +180,7 @@ def _kernel():
             c = w00 * C[k00] + w10 * C[k10] + w01 * C[k00 + 1] + w11 * C[k10 + 1];
             lt = jt + wt;
             out = dr > dt ? dr : dt;
-            """, "sieve_tab_lookup")
+            """, "aegis_tab_lookup")
     return _KERNEL
 
 

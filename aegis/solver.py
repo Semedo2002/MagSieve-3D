@@ -125,8 +125,8 @@ class MHDSolver:
         self._faces_owner = None
         self.cyl = config.geometry == "cylindrical"
         self.strength = config.strength
-        self.pic = None                              # adaptive kinetic-fluid hybrid (sieve/hybrid_pic.py)
-        self.walls = None                            # immersed rigid walls (sieve/cad_importer.ImmersedWalls)
+        self.pic = None                              # adaptive kinetic-fluid hybrid (aegis/hybrid_pic.py)
+        self.walls = None                            # immersed rigid walls (aegis/cad_importer.ImmersedWalls)
         if self.cyl and abs(config.x_min) > 0:
             raise ValueError("cylindrical geometry needs x_min = 0 (the axis)")
         self.ng = 2
@@ -608,7 +608,7 @@ class MHDSolver:
     def _periodic(self):
         return (self.cfg.get_bc_x() == "periodic", self.cfg.bc_y_type == "periodic")
 
-    # hooks a domain-decomposed subclass (sieve/parallel.py) overrides: ghost faces, edge EMFs, extra arrays
+    # hooks a domain-decomposed subclass (aegis/parallel.py) overrides: ghost faces, edge EMFs, extra arrays
     def _ghost_faces(self, Bf, U):
         ct.ghost_faces(Bf, U, self.ng, (self.cfg.nx, self.cfg.ny), self._periodic())
         if self.cyl:
@@ -623,7 +623,7 @@ class MHDSolver:
     def _halo(self, A):
         pass
 
-    # AMR (sieve/amr.py): non-ideal face fluxes on patch boundaries, ghost data for the split diffusion steps
+    # AMR (aegis/amr.py): non-ideal face fluxes on patch boundaries, ghost data for the split diffusion steps
     _records_fluxes = False
 
     def _add_flux(self, var, Gx, Gy):
@@ -813,7 +813,7 @@ class MHDSolver:
             if eta is not None:
                 J = ct.edge_current([f[..., None] for f in Bf], 0, 1, cfg.dx, cfg.dy, nx, ny)[..., 0]
                 E = E + ct.edge_eta(eta, nx, ny) * J
-            if hall.active(cfg):                     # Hall term, anisotropic resistivity (sieve/hall.py)
+            if hall.active(cfg):                     # Hall term, anisotropic resistivity (aegis/hall.py)
                 Ek, Fbx, Fby, Sx, Sy, qa = hall.ohm_extra(W, Bf, eta, cfg, cfg.dx, cfg.dy, nx, ny, ng)
                 E = E + Ek
                 R[BZ, ng:ng+nx, ng:ng+ny] -= (Fbx[1:] - Fbx[:-1]) / cfg.dx + (Fby[:, 1:] - Fby[:, :-1]) / cfg.dy
@@ -862,7 +862,7 @@ class MHDSolver:
                 boundary_rate = boundary_rate + (
                     xp.sum(fx[2][0, ng:ng+ny] - fx[2][nx, ng:ng+ny]) * cfg.dy
                     + xp.sum(fy[2][ng:ng+nx, 0] - fy[2][ng:ng+nx, ny]) * cfg.dx)
-        if cfg.gyro_di > 0:                          # ion gyroviscosity (sieve/ions.py)
+        if cfg.gyro_di > 0:                          # ion gyroviscosity (aegis/ions.py)
             gfx, gfy = ions.gyroviscous_fluxes(W, U, cfg, cfg.dx, cfg.dy, nx, ny, ng)
             for var, gx, gy in ((MX, gfx[0], gfy[0]), (MY, gfx[1], gfy[1]), (MZ, gfx[2], gfy[2]), (EN, gfx[3], gfy[3])):
                 R[var, ng:ng+nx, ng:ng+ny] -= ((gx[1:, ng:ng+ny] - gx[:-1, ng:ng+ny]) / cfg.dx
@@ -1003,7 +1003,7 @@ class MHDSolver:
             Ui = self.U[:, ng:ng + cfg.nx, ng:ng + cfg.ny]
             radial = (self.rf[ng:ng + cfg.nx + 1], self.rc[ng:ng + cfg.nx]) if self.cyl else None
             faces = [] if self._records_fluxes else None
-            if cfg.fld_groups:                       # multigroup (sieve/radiation_multigroup.py)
+            if cfg.fld_groups:                       # multigroup (aegis/radiation_multigroup.py)
                 _, din, self.fld_iters = radiation_multigroup.step(self.Er, Ui, self.eos, cfg, (cfg.dx, cfg.dy),
                                                                    self._periodic(), dt, radial=radial,
                                                                    advect=cfg.fld_advect)

@@ -11,9 +11,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, iRHO, iBX, iBY, iPR
-    from sieve.solver import MHDSolver
-    from sieve.physics import cons_to_prim
+    from aegis.config import Config, iRHO, iBX, iBY, iPR
+    from aegis.solver import MHDSolver
+    from aegis.physics import cons_to_prim
 
 from runner import BASE, DATA_DIR
 

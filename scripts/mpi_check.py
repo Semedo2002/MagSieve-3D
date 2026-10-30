@@ -20,12 +20,12 @@ sys.path.insert(0, ROOT)
 from mpi4py import MPI  # noqa: E402
 
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim
-    from sieve.solver import MHDSolver, to_numpy
-    from sieve.solver3d import MHDSolver3D
-    from sieve.parallel import distributed
-    from sieve.eos import stiffened_from_hugoniot
+    from aegis.config import Config, NVAR, EN, iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iCLR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim
+    from aegis.solver import MHDSolver, to_numpy
+    from aegis.solver3d import MHDSolver3D
+    from aegis.parallel import distributed
+    from aegis.eos import stiffened_from_hugoniot
 
 comm = MPI.COMM_WORLD
 TAU = 2 * np.pi

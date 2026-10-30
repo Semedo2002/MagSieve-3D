@@ -2,7 +2,7 @@ import sys, os, io, contextlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.physics import xp, parallel_stripe_state
+    from aegis.physics import xp, parallel_stripe_state
 
 # Gap/bar momentum flux rho*vx^2 of the post-shock inflow state alone,
 # using the same y-masks as the diagnostics (bar: |cos| > 0.5).

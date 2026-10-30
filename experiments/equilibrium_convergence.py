@@ -1,9 +1,9 @@
 import sys, os, io, contextlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
-from sieve.config import Config, iVX, iVY, iPR
-from sieve.solver import MHDSolver
-from sieve.physics import xp, cons_to_prim, prim_to_cons
+from aegis.config import Config, iVX, iVY, iPR
+from aegis.solver import MHDSolver
+from aegis.physics import xp, cons_to_prim, prim_to_cons
 
 def far_v(nx, balanced=True, B0=5.0, t_end=0.05):
     cfg = Config(div_b="glm", nx=nx, ny=nx // 2, t_end=t_end, mach=10.0, B_transverse=B0, B_field_type="striped",

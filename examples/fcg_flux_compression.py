@@ -9,7 +9,7 @@ the liner at its metal conductivity and Spitzer (capped) in the cavity gas, Ohmi
 on the liner seeds feedthrough of the deceleration instability near turnaround.
 
 With a capacitor bank (--capacitance-uf, --voltage-kv) the liner starts at rest and is driven instead by an RLC
-circuit (sieve/circuit.py): the bank current runs up the liner and back through a return can, and its B_theta
+circuit (aegis/circuit.py): the bank current runs up the liner and back through a return can, and its B_theta
 pushes on the liner's outer surface with P_B = mu0 I^2 / (8 pi^2 r^2) while the load inductance grows as the
 liner implodes.
 
@@ -36,12 +36,12 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iBY, iPR, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim
-    from sieve.solver import MHDSolver, to_numpy
-    from sieve.units import MU0, resistivity_kwargs, strength_kwargs, fld_kwargs, temperature_eV_per_code
-    from sieve import strength as st
-    from sieve.circuit import LinerDrive, add_circuit_args, circuit_from_args
+    from aegis.config import Config, NVAR, EN, iRHO, iVX, iVY, iBY, iPR, iCLR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim
+    from aegis.solver import MHDSolver, to_numpy
+    from aegis.units import MU0, resistivity_kwargs, strength_kwargs, fld_kwargs, temperature_eV_per_code
+    from aegis import strength as st
+    from aegis.circuit import LinerDrive, add_circuit_args, circuit_from_args
 
 RHO_U, V_U, L_U = 1000.0, 1000.0, 1e-3            # kg/m^3, m/s, m
 B_U = np.sqrt(MU0 * RHO_U * V_U**2)                # tesla per code unit (35.45 T)

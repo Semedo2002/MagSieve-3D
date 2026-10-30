@@ -59,7 +59,7 @@ def _ascii_vertices(tok):
     return out
 
 
-def write_stl(path, tris, binary=True, name="sieve"):
+def write_stl(path, tris, binary=True, name="aegis"):
     tris = np.asarray(tris, dtype=np.float64)
     nrm = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
     nrm /= np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-300)

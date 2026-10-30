@@ -228,7 +228,7 @@ def viscosity_kwargs(rho_unit, v_unit, L0, z=1.0, ion_mass_amu=2.0, coulomb_log=
 
 def fld_kwargs(rho_unit, v_unit, L0, ion_mass_amu=2.0, Z=1.0, kappa_R=(0.0, 0.0, 0.0), kappa_P=(0.0, 0.0, 0.0),
                preset=None, tracer_max=0.1):
-    """Config keywords for grey FLD radiation (sieve/fld.py) in code units.
+    """Config keywords for grey FLD radiation (aegis/fld.py) in code units.
 
     kappa_R, kappa_P: (k0, m, n) for kappa = k0 rho^m T^n in m^2/kg with rho in kg/m^3 and T in kelvin.
     preset="free-free": hydrogen-like bremsstrahlung (Kramers) opacity, kappa_R = 7.4e18 Z^2/A rho T^-3.5 and

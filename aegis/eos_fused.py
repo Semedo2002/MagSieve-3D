@@ -3,7 +3,7 @@
 #
 # Covered: a fuel that is an ideal or stiffened gas, with a liner that is ideal, stiffened, Mie-Gruneisen or a
 # table (with a stiffened or Mie-Gruneisen fallback). Anything else (a Mie-Gruneisen fuel) returns None from
-# device() and keeps the array implementation in eos.py / tabular.py, as does SIEVE_ARRAY_EOS=1 in the
+# device() and keeps the array implementation in eos.py / tabular.py, as does AEGIS_ARRAY_EOS=1 in the
 # environment (for comparisons and debugging).
 import os
 from pathlib import Path
@@ -72,7 +72,7 @@ def device(eos):
     """(P, T) device arrays of eos, cached on the object; None if the device EOS does not cover it"""
     d = getattr(eos, "_device_eos", False)
     if d is False:
-        d = None if os.environ.get("SIEVE_ARRAY_EOS") == "1" else _pack(eos)
+        d = None if os.environ.get("AEGIS_ARRAY_EOS") == "1" else _pack(eos)
         eos._device_eos = d
     return d
 

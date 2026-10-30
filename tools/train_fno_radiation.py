@@ -1,4 +1,4 @@
-"""Train the Fourier-neural-operator predictor for the multigroup radiation solve (sieve/fno_subgrid.py) and
+"""Train the Fourier-neural-operator predictor for the multigroup radiation solve (aegis/fno_subgrid.py) and
 benchmark it inside the solver step.
 
 Training data come from the exact solver: random smooth temperature, density and radiation fields (log-normal
@@ -27,9 +27,9 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, EN, iRHO, iPR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim
-from sieve import radiation_multigroup as mg, fno_subgrid as fs
+    from aegis.config import Config, NVAR, EN, iRHO, iPR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim
+from aegis import radiation_multigroup as mg, fno_subgrid as fs
 
 
 def config(a, **kw):

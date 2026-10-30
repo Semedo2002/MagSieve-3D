@@ -1,6 +1,6 @@
 """Shot calibration: fit a pulsed-power liner simulation (examples/fcg_flux_compression.py with the RLC drive) to
 diagnostic traces, VISAR free-surface velocity, a B-dot probe and radiography radii, by scanning one circuit
-parameter and minimising chi^2 (sieve/validation.py).
+parameter and minimising chi^2 (aegis/validation.py).
 
 Without data files the script makes a synthetic shot first, so that the whole chain can be run and checked:
 the "experiment" is a simulation at a hidden parameter value (16.2 nH series inductance), sampled like the
@@ -31,7 +31,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "examples"))
 with contextlib.redirect_stdout(io.StringIO()):
     import fcg_flux_compression as fcg
-    from sieve import validation as val
+    from aegis import validation as val
 
 PARAMS = {"inductance_nh": "series inductance (nH)", "voltage_kv": "charge voltage (kV)",
           "resistance_mohm": "series resistance (mOhm)", "capacitance_uf": "capacitance (uF)"}

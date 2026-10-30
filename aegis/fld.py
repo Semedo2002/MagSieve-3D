@@ -6,7 +6,7 @@
 # Levermore & Pomraning (1981): lambda -> 1/3 when optically thick (D = c / (3 rho kappa_R)), lambda -> 1/R when
 # thin, so the flux D |grad E_r| never exceeds c E_r. T is the code temperature theta = p/rho, a and c are in code
 # units (units.fld_kwargs), opacities are power laws kappa = k0 rho^m theta^n per unit mass, or a table
-# (fld_opacity_table: SESAME 502/505 or .npz, sieve/tabular.py).
+# (fld_opacity_table: SESAME 502/505 or .npz, aegis/tabular.py).
 #
 # Each step (split, after the hydro): upwind advection of E_r with the gas, then the stiff part by backward Euler
 # with the emission linearised, a (theta + dtheta)^4 = a theta^4 + 4 a theta^3 dtheta, and the limiter taken
@@ -18,7 +18,7 @@
 # Radiation pressure and its work are left out (fine while E_r / 3 << p). Radiation lives in the fuel only
 # (liner fraction below fld_tracer_max): faces touching the liner carry no radiation flux.
 #
-# An AMR patch (sieve/amr.py) passes `ghost`: E_r and the normal velocity in the cells just outside each of its
+# An AMR patch (aegis/amr.py) passes `ghost`: E_r and the normal velocity in the cells just outside each of its
 # edges, taken from the coarse level. Those faces then conduct to the ghost cell (a full cell away) and advect
 # across it; `faces` receives the time-integrated face fluxes for refluxing.
 import numpy as np
@@ -231,7 +231,7 @@ def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True, ghost=None,
             dirichlet[(0, "hi")] = cfg.fld_E_xmax
     for key in ghost:
         dirichlet.pop(key, None)
-    if cfg.fld_opacity_table:                        # tabulated kappa_R, kappa_P (sieve/tabular.py)
+    if cfg.fld_opacity_table:                        # tabulated kappa_R, kappa_P (aegis/tabular.py)
         kR, kP = _opacity_table(cfg)(rho, theta)
         kP = xp.where(open_, kP, 0.0)
         chiR = rho * kR

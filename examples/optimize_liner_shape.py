@@ -1,4 +1,4 @@
-"""Inverse design of an imploding liner with adjoint gradients (sieve/autodiff.py).
+"""Inverse design of an imploding liner with adjoint gradients (aegis/autodiff.py).
 
 An axisymmetric (r, z) liner of fixed mass and fixed kinetic energy implodes onto a uniform axial seed field
 B0 in a light gas fill (ideal MHD, constrained transport). Its inner radius is R(z) = R0 + sum_k a_k cos(2 pi k
@@ -32,9 +32,9 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, BY
-    from sieve.solver import MHDSolver
-from sieve import autodiff as ad
+    from aegis.config import Config, BY
+    from aegis.solver import MHDSolver
+from aegis import autodiff as ad
 
 
 def build(a):

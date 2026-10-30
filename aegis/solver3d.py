@@ -150,7 +150,7 @@ class MHDSolver3D:
         cfg = config
         if cfg.nz < 4:
             raise ValueError("solver3d needs nz >= 4")
-        self.walls = None                            # immersed rigid walls (sieve/cad_importer.ImmersedWalls)
+        self.walls = None                            # immersed rigid walls (aegis/cad_importer.ImmersedWalls)
         self.cyl = cfg.geometry == "cylindrical"
         if self.cyl:
             if cfg.div_b != "ct" or cfg.x_min < 0:
@@ -417,7 +417,7 @@ class MHDSolver3D:
     def _periodic(self):
         return (self.cfg.get_bc_x() == "periodic", True, True)
 
-    # hooks a domain-decomposed subclass (sieve/parallel.py) overrides: ghost faces, edge EMFs, extra arrays
+    # hooks a domain-decomposed subclass (aegis/parallel.py) overrides: ghost faces, edge EMFs, extra arrays
     def _ghost_faces(self, Bf, U):
         ct.ghost_faces(Bf, U, self.ng, (self.cfg.nx, self.cfg.ny, self.cfg.nz), self._periodic())
         if self.cyl and self.axis:                   # B_r odd (zero on the axis face), B_theta odd, B_z even
@@ -602,7 +602,7 @@ class MHDSolver3D:
                 sel[ax - 1] = slice(2, N - 1)
                 WL[iBX + ax - 1] = WR[iBX + ax - 1] = Bf[ax - 1][tuple(sel)]
             F = hlld_flux(WL, WR, ax, g, ch)
-            if self.walls is not None:               # immersed rigid walls (sieve/cad_importer.ImmersedWalls)
+            if self.walls is not None:               # immersed rigid walls (aegis/cad_importer.ImmersedWalls)
                 self.walls.apply(F, WL, WR, ax - 1)
             Fs[ax - 1] = F
             WLs[ax - 1], WRs[ax - 1] = WL, WR

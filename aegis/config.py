@@ -164,11 +164,11 @@ class PhysicsConfig:
     rad_coeff: float = 0.0
     rad_T_min: float = 0.0
     rad_tracer_max: float = 0.1
-    # grey flux-limited diffusion radiation (sieve/fld.py; units.fld_kwargs): radiation energy E_r with
+    # grey flux-limited diffusion radiation (aegis/fld.py; units.fld_kwargs): radiation energy E_r with
     # a theta^4 emission, speed of light fld_c, power-law opacities k0 rho^m theta^n (Planck kp, Rosseland kr)
     # per unit mass; fuel only (liner fraction < fld_tracer_max). fld_E_xmin / fld_E_xmax >= 0 hold E_r at
     # the non-periodic x faces (negative: zero flux there).
-    # tabulated liner EOS (sieve/tabular.py: SESAME ASCII or .npz, SI) in pure liner cells, eos_liner as the
+    # tabulated liner EOS (aegis/tabular.py: SESAME ASCII or .npz, SI) in pure liner cells, eos_liner as the
     # fallback beyond the table and the tangent closure in mixed cells; the table is converted with the code
     # units tab_rho_unit (kg/m^3) and tab_v_unit (m/s). fld_opacity_table: kappa_R / kappa_P for FLD instead of
     # the power laws (tab_L_unit m, tab_T_unit kelvin per code temperature).
@@ -195,7 +195,7 @@ class PhysicsConfig:
     fld_tol: float = 1e-11
     fld_maxit: int = 5000
     fld_picard: int = 4
-    # multigroup FLD (sieve/radiation_multigroup.py): fld_groups > 0 photon groups, edges in code temperature units
+    # multigroup FLD (aegis/radiation_multigroup.py): fld_groups > 0 photon groups, edges in code temperature units
     # (fld_group_edges, or log-spaced between fld_group_emin and fld_group_emax; the first group starts at 0, the
     # last runs to infinity); opacities "grey" (the power laws in every group), "kramers" (free-free nu^-3 shape
     # scaled to the grey Planck mean, times 1 + fld_edge_jump above a photo-ionization edge at fld_edge), or a
@@ -209,7 +209,7 @@ class PhysicsConfig:
     fld_edge_jump: float = 0.0
     fld_mg_table: str = ""
     fld_mg_absorption: float = 1.0                   # scales every kP_g (0: groups only diffuse, no exchange)
-    # learned predictor for the multigroup implicit solve (sieve/fno_subgrid.py, a .npz model; 2D): accepted when
+    # learned predictor for the multigroup implicit solve (aegis/fno_subgrid.py, a .npz model; 2D): accepted when
     # the relative residual of the linear system is <= fld_fno_tol, otherwise BiCGStab starts from it
     fld_fno_model: str = ""
     fld_fno_tol: float = 1e-3
@@ -225,10 +225,10 @@ class PhysicsConfig:
     cond_wall_T: float = 0.0
     # cross-field conductivity: "braginskii" (full Z = 1 fit, transport.kperp_ratio) or "simple" (1/(1 + x^2))
     cond_perp: str = "braginskii"
-    # Nernst field advection and Ettingshausen heat flux (sieve/transport.py), coefficient c_N in code units
+    # Nernst field advection and Ettingshausen heat flux (aegis/transport.py), coefficient c_N in code units
     # (units.braginskii_kwargs); 0 = off. Uses cond_x0 for the magnetization; 2D solver with CT.
     nernst_coeff: float = 0.0
-    # two-temperature fuel (sieve/twotemp.py): electron entropy carried as a passive scalar; electron conduction,
+    # two-temperature fuel (aegis/twotemp.py): electron entropy carried as a passive scalar; electron conduction,
     # bremsstrahlung, Ohmic and Ettingshausen heating act on the electrons; equilibration rate te_eq_coeff
     # (units.twotemp_kwargs). Needs an ideal-gas fuel with gamma = 5/3. z_ion: fuel ion charge.
     two_temp: bool = False
@@ -237,19 +237,19 @@ class PhysicsConfig:
     # Braginskii parallel ion viscosity, eta_0 = visc_coeff theta_i^2.5 (units.viscosity_kwargs); 0 = off.
     # Cartesian geometry; fuel only (tracer < cond_tracer_max).
     visc_coeff: float = 0.0
-    # generalized Ohm's law (sieve/hall.py), 2D Cartesian with CT: Hall term d_i (J x B)/rho with hall_di the ion
+    # generalized Ohm's law (aegis/hall.py), 2D Cartesian with CT: Hall term d_i (J x B)/rho with hall_di the ion
     # inertial length at unit density in code units (0 = off); anisotropic resistivity eta_perp = eta_perp_ratio
     # eta_par with eta (any eta_model) the parallel value (1.96 for a magnetized Z = 1 Spitzer plasma; 1 = isotropic)
     hall_di: float = 0.0
     eta_perp_ratio: float = 1.0
-    # ion Braginskii transport (sieve/ions.py): ion conduction on T_i in two-temperature mode, k_i,par =
+    # ion Braginskii transport (aegis/ions.py): ion conduction on T_i in two-temperature mode, k_i,par =
     # cond_kappa_i0 theta_i^5/2, k_i,perp = k_i,par / (1 + x_i^2), x_i = cond_x0_i |B| theta_i^3/2 / rho (0 = off);
     # ion gyroviscosity (the non-dissipative finite-Larmor-radius stress) with gyro_di the ion inertial length at
     # unit density (Omega_i = |B| / gyro_di; 0 = off), 2D Cartesian
     cond_kappa_i0: float = 0.0
     cond_x0_i: float = 0.0
     gyro_di: float = 0.0
-    # adaptive kinetic-fluid hybrid (sieve/hybrid_pic.py), 2D Cartesian, ideal gas gamma = 5/3: cells with a local
+    # adaptive kinetic-fluid hybrid (aegis/hybrid_pic.py), 2D Cartesian, ideal gas gamma = 5/3: cells with a local
     # Knudsen number lambda / L > pic_kn_on (lambda = pic_mfp0 theta^2 / rho, L the density / pressure gradient
     # length) or an ion Larmor radius r_L > pic_rl_on dx (r_L = pic_di sqrt(theta) / |B|, pic_di the ion inertial
     # length at unit density, which also sets q/m = 1 / pic_di) carry their ions as particles; they return to the
@@ -263,7 +263,7 @@ class PhysicsConfig:
     pic_di: float = 0.0
     pic_ppc: int = 64
     pic_seed: int = 0
-    # liner strength (sieve/strength.py): elastic-perfectly-plastic, von Mises yield, spall damage; code units
+    # liner strength (aegis/strength.py): elastic-perfectly-plastic, von Mises yield, spall damage; code units
     # (units.strength_kwargs); scaled by the liner fraction. 2D solver.
     strength: bool = False
     shear_modulus: float = 0.0

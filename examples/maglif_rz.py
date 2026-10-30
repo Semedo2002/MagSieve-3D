@@ -16,7 +16,7 @@ between rows and drift measure numerical reconnection), energy budget.
     python examples/maglif_rz.py --plot-only
     python examples/maglif_rz.py --capacitance-uf 2 --voltage-kv 40 --inductance-nh 20   # liner at rest, RLC drive
 
-Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
+Needs the AEGIS-MHD solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
 import os
 import sys
@@ -32,13 +32,13 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)  # run from a repo checkout without installing
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, EN, iRHO, iVX, iBZ, iBY, iPR, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim, pressure_margin
-    from sieve.solver import MHDSolver, to_numpy
-    from sieve.diagnostics import cavitation_split
-    from sieve.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
+    from aegis.config import Config, NVAR, EN, iRHO, iVX, iBZ, iBY, iPR, iCLR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim, pressure_margin
+    from aegis.solver import MHDSolver, to_numpy
+    from aegis.diagnostics import cavitation_split
+    from aegis.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
                              add_radiation_args, radiation_from_args, add_conduction_args, conduction_from_args)
-    from sieve.circuit import LinerDrive, add_circuit_args, circuit_from_args
+    from aegis.circuit import LinerDrive, add_circuit_args, circuit_from_args
 
 GAMMA = 5.0 / 3.0
 R0, R1 = 0.5, 0.7

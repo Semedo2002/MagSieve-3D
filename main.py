@@ -9,9 +9,9 @@ import contextlib
 import numpy as np
 from typing import Dict, List, Tuple
 
-from sieve.config import Config, NVAR, EN, RHOSE, iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iCLR
-from sieve.physics import xp, cp, cons_to_prim, prim_to_cons, mhd_rankine_hugoniot, sound_speed2
-from sieve.solver import MHDSolver, PostProcessor, save_figure, to_numpy, OUTPUT_DIR
+from aegis.config import Config, NVAR, EN, RHOSE, iRHO, iVX, iVY, iVZ, iBX, iBY, iBZ, iPR, iCLR
+from aegis.physics import xp, cp, cons_to_prim, prim_to_cons, mhd_rankine_hugoniot, sound_speed2
+from aegis.solver import MHDSolver, PostProcessor, save_figure, to_numpy, OUTPUT_DIR
 
 import matplotlib
 matplotlib.use('Agg')
@@ -227,7 +227,7 @@ def z_invariance_test(tol=1e-8):
 
 
 def _z_invariance_case(eta_kw, tol):
-    from sieve.solver3d import MHDSolver3D
+    from aegis.solver3d import MHDSolver3D
     nx, ny = 128, 32
     dx, dy = 6.0 / nx, 2.0 / ny
     common = dict(nx=nx, ny=ny, x_max=6.0, t_end=0.1, mach=10.0, B_transverse=3.0, B_field_type="striped",
@@ -254,7 +254,7 @@ def _z_invariance_case(eta_kw, tol):
 def alfven_z_test():
     """Alfven wave travelling along z: tests the z-face fluxes, expects ~2nd order."""
     print("\n--- 3D: Alfven wave along z ---"); sys.stdout.flush()
-    from sieve.solver3d import MHDSolver3D
+    from aegis.solver3d import MHDSolver3D
     errors, res = [], [16, 32, 64]
     for nz in res:
         cfg = Config(nx=4, ny=4, nz=nz, x_max=4.0 / nz, y_max=4.0 / nz, z_max=1.0, t_end=1.0, cfl=0.25,
@@ -283,7 +283,7 @@ def resistive_z_test(eta=0.01, tol=0.01):
     """Weak B_x = b sin(k z) in a static plasma decays as exp(-eta k^2 t); tests the z-face
     resistive fluxes and that Ohmic heating conserves total energy."""
     print("\n--- 3D: resistive diffusion along z ---"); sys.stdout.flush()
-    from sieve.solver3d import MHDSolver3D
+    from aegis.solver3d import MHDSolver3D
     nz, b, k, t_end = 64, 1e-3, 2 * np.pi, 1.0
     cfg = Config(nx=4, ny=4, nz=nz, x_max=4.0 / nz, y_max=4.0 / nz, z_max=1.0, t_end=t_end, cfl=0.3,
                  mach=1.0, powell_source=False, bc_x_type="periodic", eta_resistivity=eta, diag_interval=10**9)
@@ -460,7 +460,7 @@ def eos_impact_test(tol=0.02):
     (2) Mie-Gruneisen Al on Mie-Gruneisen Al: symmetric, u_p = V/2 and the state must lie on the reference
         Hugoniot Us = c0 + s u_p, p = rho0 Us u_p.
     Shock speeds are measured relative to the unshocked material ahead of each shock."""
-    from sieve.eos import stiffened_from_hugoniot, stiffened_hugoniot
+    from aegis.eos import stiffened_from_hugoniot, stiffened_hugoniot
     print("\n--- EOS: 10 km/s aluminium impact ---"); sys.stdout.flush()
     V, p0, nx, t_end = 10.0, 1e-4, 400, 0.035
     gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 5.0)
@@ -516,7 +516,7 @@ def eos_interface_test():
     The exact solution keeps p and u uniform. Volume-fraction tracer: must hold to round-off. Mass-fraction
     blending (the conserved tracer) is run for 20 steps for comparison and reported: its spurious pressures
     reach the cavitation floor within a few steps and the fake sound speeds collapse the time step."""
-    from sieve.eos import stiffened_from_hugoniot
+    from aegis.eos import stiffened_from_hugoniot
     print("\n--- EOS: material interface in pressure equilibrium ---"); sys.stdout.flush()
     gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 5.0)
     p0, u0 = 1e-4, 1.0
@@ -543,7 +543,7 @@ def eos_positivity_test():
     the exact centre state has P = p + p_inf = P0 (1 - (g-1) v/(2 c0))^(2g/(g-1)). At v = 8 km/s (beyond
     2 c0/(g-1)) the exact solution has a cavity. Checks p + p_inf > 0, c^2 > 0, finite state; also a gas /
     aluminium interface pulled apart."""
-    from sieve.eos import stiffened_from_hugoniot
+    from aegis.eos import stiffened_from_hugoniot
     print("\n--- EOS: positivity under extreme expansion ---"); sys.stdout.flush()
     gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 5.0)
     st = dict(eos_liner="stiffened", gamma_liner=gA, p_inf_liner=piA)
@@ -576,7 +576,7 @@ def radiation_decay_test():
     (SI, T in eV), so T(t) = (sqrt(T0) - K t/2)^2 with K = 1.69e-38 n/(3 e), until T reaches T_min = 10 eV,
     where cooling stops. K is computed here from the SI constants, independently of the code-unit
     conversion in units.py. Also: no cooling in liner material (tracer 1) or below T_min."""
-    from sieve.units import bremsstrahlung_kwargs, AMU, E_CHARGE
+    from aegis.units import bremsstrahlung_kwargs, AMU, E_CHARGE
     print("\n--- Radiation: bremsstrahlung decay of a uniform hot plasma ---"); sys.stdout.flush()
     mp, n0, T0, Tmin = 1.67262192e-27, 1e26, 500.0, 10.0
     v0 = np.sqrt(2 * E_CHARGE * T0 / mp)              # code temperature p/rho = 1 is 500 eV
@@ -656,9 +656,9 @@ def conduction_test():
     across B is compared with that. Field along x (grid-aligned: exact up to the 0.25% variation of k with
     T) and at 45 deg, where the limited transverse gradients add numerical perpendicular diffusion that must
     fall with resolution (64^2, 128^2). Also: no new extrema (to round-off), energy conserved."""
-    from sieve.physics import conduct
+    from aegis.physics import conduct
     print("\n--- Conduction: anisotropic hot spot ---"); sys.stdout.flush()
-    from sieve.transport import x_for_kappa_ratio
+    from aegis.transport import x_for_kappa_ratio
     g, D_par, ratio, t_end = 5.0 / 3.0, 0.01, 1e4, 2.0
     kappa0, x0 = D_par / (g - 1), x_for_kappa_ratio(ratio)       # Braginskii k_perp fit
     ok, out, leak = True, [], {}
@@ -705,9 +705,9 @@ def wall_conduction_test(tol=0.01):
     sum 8/((2n+1)^2 pi^2) exp(-D k_n^2 t), k_n = (2n+1) pi/(2L). With the field along the wall normal the wall
     sees k_par; with the field parallel to the wall it sees k_perp = k_par/10, so the same decay takes 10x
     longer: checks the wall flux and its magnetic insulation. Energy moved into the liner cells is conserved."""
-    from sieve.physics import conduct
+    from aegis.physics import conduct
     print("\n--- Conduction: fuel-liner wall exchange ---"); sys.stdout.flush()
-    from sieve.transport import x_for_kappa_ratio
+    from aegis.transport import x_for_kappa_ratio
     g, D, ratio, d, nx = 5.0 / 3.0, 0.01, 10.0, 1e-3, 64
     kappa0, x0, Lf = D / (g - 1), x_for_kappa_ratio(ratio), 0.5
     ok, out = True, []
@@ -743,7 +743,7 @@ def wall_conduction_test(tol=0.01):
                    f"energy {dE:.1e}  [{'PASS' if good else 'FAIL'}]")
     # second law at the wall: field 80 deg from the wall normal, k_par/k_perp = 1e4, fuel temperature varying strongly
     # along the wall; the cold (T = 0) liner may only gain heat
-    from sieve.physics import conduction_div
+    from aegis.physics import conduction_div
     n = 32
     X, Yg = xp.meshgrid(xp.arange(n) / n, xp.arange(n) / n, indexing="ij")
     a = xp.where(X >= 0.5, 1.0, 0.0)
@@ -762,14 +762,14 @@ def wall_conduction_test(tol=0.01):
 
 
 def transport_test():
-    """Magnetized transport (sieve/transport.py). (1) Braginskii Z = 1 fits: k_perp/k_par = 1 at x = 0 and
+    """Magnetized transport (aegis/transport.py). (1) Braginskii Z = 1 fits: k_perp/k_par = 1 at x = 0 and
     4.664/(3.1616 x^2) at large x; beta_wedge = 0.81 x and 1.5/x. (2) Nernst advection: an isobaric slab
     (p = 1, rho = 1/T) with T = 1 + 0.02 (x - 0.5) and weak field bumps in B_y (constrained-transport faces)
     and in the out-of-plane B_w (cell centred); both must travel down the temperature gradient along the exact
     path dX/dt = v_N(X), v_N = -c_N (beta_wedge/|B|) dT/dx, with div B at round-off. (3) Ettingshausen: a
     strong sheared field in a periodic box conserves total energy to round-off while its heat flux
     redistributes thermal energy."""
-    from sieve import transport as tr
+    from aegis import transport as tr
     print("\n--- Transport: Braginskii fits, Nernst, Ettingshausen ---"); sys.stdout.flush()
     fits = (abs(tr.kperp_ratio(0.0) - 1) < 1e-3 and abs(tr.kperp_ratio(1e3) * 3.1616 * 1e6 / 4.664 - 1) < 1e-3
             and abs(tr.beta_wedge_over_x(0.0) - 3.053 / 3.7703) < 1e-12 and abs(1e3 * 1e3 * tr.beta_wedge_over_x(1e3) / 1.5 - 1) < 1e-3)
@@ -833,7 +833,7 @@ def twotemp_test():
     the shock the electron entropy equals the upstream one (electrons only compressed adiabatically) and the
     ions take the shock heating (T_i > T_e). (3) Bremsstrahlung in two-temperature mode cools the electrons
     only: theta_i unchanged to round-off."""
-    from sieve import twotemp as tt
+    from aegis import twotemp as tt
     print("\n--- Two-temperature plasma ---"); sys.stdout.flush()
     g = 5.0 / 3.0
 
@@ -947,8 +947,8 @@ def strength_test():
     (S_xx = -2Y/3 in uniaxial strain) and the target stays there behind it. The flyer is long enough that the
     weak unloading wave its shock reflects off the zero-gradient left boundary stays out of the target. (3) A bar pulled apart at +-0.2 km/s (tension ~3 GPa): spall damage forms at the centre
     only and the intact metal never carries more tension than the spall strength."""
-    from sieve.eos import stiffened_from_hugoniot
-    from sieve import strength as st
+    from aegis.eos import stiffened_from_hugoniot
+    from aegis import strength as st
     print("\n--- Liner strength: elastic waves, Hugoniot elastic limit, spall ---"); sys.stdout.flush()
     gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 1.0)
     G, Y, sp = 26.0, 0.29, 1.2
@@ -1030,9 +1030,9 @@ def parity3d_test(tol=1e-12):
     comes from the explicit limit, which counts 1/dz^2, and equal stage counts are needed for round-off
     agreement (with dz = dx the 3D run takes more stages and differs by the RKL2 time error, 1e-4 of the
     hot-spot amplitude). The z faces still run and must contribute exactly zero."""
-    from sieve.solver3d import MHDSolver3D
-    from sieve.eos import stiffened_from_hugoniot
-    from sieve.units import bremsstrahlung_kwargs, AMU, E_CHARGE
+    from aegis.solver3d import MHDSolver3D
+    from aegis.eos import stiffened_from_hugoniot
+    from aegis.units import bremsstrahlung_kwargs, AMU, E_CHARGE
     print("\n--- 3D parity: EOS, radiation, conduction ---"); sys.stdout.flush()
     res = []
 
@@ -1157,7 +1157,7 @@ def ct_test():
     carried diagonally through a periodic box for one period; div B on the faces must stay at round-off,
     and the loop keeps a reported fraction of its magnetic energy (GLM shown for comparison). (2) A fully 3D
     field from a vector potential in a uniform 3D flow, periodic: div B at round-off after 40 steps."""
-    from sieve.solver3d import MHDSolver3D
+    from aegis.solver3d import MHDSolver3D
     print("\n--- Constrained transport: div B ---"); sys.stdout.flush()
     A0, R = 1e-3, 0.3
     loop = lambda X, Y: A0 * np.maximum(R - np.sqrt(X**2 + Y**2), 0.0)
@@ -1205,7 +1205,7 @@ def galilean_test(U=6.49):
     Galilean invariant, and advecting the interface across the grid in the lab frame adds numerical
     diffusion (measured 15-36% at h = 0.042-0.083)."""
     print("\n--- 3D: Galilean frame ---"); sys.stdout.flush()
-    from sieve.solver3d import MHDSolver3D
+    from aegis.solver3d import MHDSolver3D
     h = 10.0 / 120
     base = dict(nx=120, ny=24, nz=4, x_max=10.0, z_max=4 * h, t_end=0.4, mach=10.0, interface_x=4.0,
                 B_field_type="striped", B_transverse=6.0, eta_resistivity=0.02, B_modulation_mode=1,
@@ -1232,7 +1232,7 @@ def rmi_mhd_smoke_test():
     print("\n--- RMI-MHD benchmark smoke test ---"); sys.stdout.flush()
     import json
     import tempfile
-    from sieve.problems.rmi_mhd import RMIParams, run
+    from aegis.problems.rmi_mhd import RMIParams, run
     out = tempfile.mkdtemp(prefix="rmi_smoke_")
     res = {}
     for name, field, B0 in (("hydro", "none", 0.0), ("mhd_parallel", "parallel", 2.5)):
@@ -1277,7 +1277,7 @@ def fcg_smoke_test():
 
 
 def solid_nernst_3d_test(tol=1e-12):
-    """3D liner strength and Nernst transport (sieve/solver3d.py). Parity: z-invariant 3D slabs reproduce the
+    """3D liner strength and Nernst transport (aegis/solver3d.py). Parity: z-invariant 3D slabs reproduce the
     2D solver to round-off for (1) stiffened Al with strength, a velocity blob that drives the metal plastic, and
     (2) Nernst + Ettingshausen with a temperature varying in x and y and field on every face (1e-10: the 2D
     solver moves the out-of-plane field as a cell-centred upwind divergence, the 3D one through CT edges, the
@@ -1285,9 +1285,9 @@ def solid_nernst_3d_test(tol=1e-12):
     may flip a step apart on round-off, so the damaged regions are compared, not the fields. Genuinely 3D: (3) an elastic shear wave along z (S_xz, absent in 2D) oscillates at
     w = k sqrt(G/rho) (Jaumann/Hooke in the third direction); (4) a field bump in a temperature gradient along z
     travels down it on the exact Nernst path, div B at round-off."""
-    from sieve.solver3d import MHDSolver3D
-    from sieve.eos import stiffened_from_hugoniot
-    from sieve import strength as st
+    from aegis.solver3d import MHDSolver3D
+    from aegis.eos import stiffened_from_hugoniot
+    from aegis import strength as st
     print("\n--- 3D strength and Nernst ---"); sys.stdout.flush()
     gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 1.0)
     G, rho0 = 26.0, AL["rho0"]
@@ -1424,7 +1424,7 @@ def solid_nernst_3d_test(tol=1e-12):
 
 
 def mpi_test():
-    """Slab domain decomposition (sieve/parallel.py): scripts/mpi_check.py under mpiexec with 2 and 3 ranks
+    """Slab domain decomposition (aegis/parallel.py): scripts/mpi_check.py under mpiexec with 2 and 3 ranks
     (uneven slabs) must match the single-domain solver to round-off for 2D Orszag-Tang with resistivity, 2D
     aluminium with strength and spall, and a 3D Orszag-Tang-like box: same steps, same total energy, div B at
     round-off. Skipped (reported, not failed) when mpi4py or mpiexec is missing."""
@@ -1454,7 +1454,7 @@ def mpi_test():
 
 
 def fld_test():
-    """Grey flux-limited diffusion radiation (sieve/fld.py). (1) Uniform gas (theta = 1) and no radiation, Planck
+    """Grey flux-limited diffusion radiation (aegis/fld.py). (1) Uniform gas (theta = 1) and no radiation, Planck
     coupling: theta and E_r follow the exact ODE pair to 1% (backward Euler, rate x dt = 0.01) and settle on the
     equilibrium a theta^4 = E_r with gas + radiation energy conserved to round-off. (2) Optically thick (chi
     R << 1, so D = c/(3 chi)): a Gaussian E_r pulse spreads as <x^2> + 2 D t per direction, in 2D, in r-z
@@ -1462,8 +1462,8 @@ def fld_test():
     Pomraning limiter keeps the radiation front at or behind c t (without it diffusion would fill the slab at
     once). (4) Radiation carried by a uniform flow with the hydrodynamics running: the pulse moves with the gas
     and gas + radiation energy closes to round-off."""
-    from sieve import fld
-    from sieve.solver3d import MHDSolver3D
+    from aegis import fld
+    from aegis.solver3d import MHDSolver3D
     print("\n--- Grey FLD radiation ---"); sys.stdout.flush()
 
     def make(cls, n, L, **kw):
@@ -1582,7 +1582,7 @@ def fld_test():
 
 
 def render3d_test():
-    """3D output and rendering (sieve/io3d.py, scripts/render_3d.py): a 32^3 state with a liner shell, a hot core
+    """3D output and rendering (aegis/io3d.py, scripts/render_3d.py): a 32^3 state with a liner shell, a hot core
     and a twisted field is written as .vti (+ .pvd) and .h5, read back to the same arrays, and rendered off
     screen (volume, liner isosurface, hot-spot contours, field lines) to non-blank PNGs and an MP4. Skipped
     (reported, not failed) without pyvista."""
@@ -1593,8 +1593,8 @@ def render3d_test():
     except ImportError:
         print("  SKIPPED: pyvista not installed (pip install pyvista imageio imageio-ffmpeg h5py)")
         return True
-    from sieve.solver3d import MHDSolver3D
-    from sieve import io3d
+    from aegis.solver3d import MHDSolver3D
+    from aegis import io3d
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
     import render_3d
     cfg = Config(nx=32, ny=32, nz=32, x_min=-1, x_max=1, y_min=-1, y_max=1, z_max=2.0, t_end=1.0, cfl=0.3,
@@ -1633,14 +1633,14 @@ def render3d_test():
 
 
 def tabular_test():
-    """Tabulated EOS and opacities (sieve/tabular.py). (1) A Mie-Gruneisen aluminium table with power-law
+    """Tabulated EOS and opacities (aegis/tabular.py). (1) A Mie-Gruneisen aluminium table with power-law
     opacities written as SESAME ASCII (tables 301, 502, 505) reads back to the same arrays. (2) An ideal-gas
     table as the liner over the whole of a Sod shock tube reproduces the analytic ideal-gas run (log-log
     interpolation is exact for power laws). (3) The aluminium table reproduces the analytic Mie-Gruneisen
     liner in a 2 km/s impact, and p(rho, e) stays continuous where the states leave the table for the
     analytic fallback. (4) FLD with the opacities from a table matches FLD with the same power laws."""
     import tempfile
-    from sieve import tabular, fld
+    from aegis import tabular, fld
     print("\n--- Tabular EOS and opacities ---"); sys.stdout.flush()
     tmp = tempfile.mkdtemp(prefix="tab_")
     ok = True
@@ -1775,14 +1775,14 @@ def tabular_test():
 
 
 def validation_test():
-    """Goodness of fit and calibration (sieve/validation.py) on analytic signals with known noise:
+    """Goodness of fit and calibration (aegis/validation.py) on analytic signals with known noise:
     (1) data = model + Gaussian noise (sigma known): chi^2_nu of the true model within its statistical spread
     (|chi^2_nu - 1| < 4 sqrt(2/dof)), RMS within 10% of sigma; (2) a model delayed by 37 ns: the peak offset and
     the fitted timing shift recover the delay to 2 ns; (3) a 1-parameter scan: the parabola recovers the true
     amplitude within 3 sigma, and sigma matches the Fisher value sigma / sqrt(sum f^2) to 5%; (4) CSV round
     trip of a trace."""
     import tempfile
-    from sieve import validation as val
+    from aegis import validation as val
     print("\n--- Validation metrics and calibration ---"); sys.stdout.flush()
     rng = np.random.default_rng(3)
     t = np.linspace(0.0, 4.0, 801)
@@ -1813,13 +1813,13 @@ def validation_test():
 
 
 def amr_test():
-    """Adaptive mesh refinement (sieve/amr.py), refinement ratio 4. (1) Periodic magnetized box (Orszag-Tang
+    """Adaptive mesh refinement (aegis/amr.py), refinement ratio 4. (1) Periodic magnetized box (Orszag-Tang
     vortex plus a dense blob) with regridding every 4 steps: mass, momentum and energy conserved to round-off,
     div B at round-off on both levels, patches created and moved. (2) A gas / stiffened-gas interface carried at
     uniform velocity and pressure across fixed coarse-fine boundaries: p and u stay uniform (the volume-fraction
     equilibrium survives refluxing, prolongation and restriction). (3) A magnetized blast wave: the AMR density
     error against a uniform run at the fine resolution is under half the coarse run's, with fewer fine cells."""
-    from sieve.amr import AMR, AMRParams
+    from aegis.amr import AMR, AMRParams
     print("\n--- Adaptive mesh refinement ---"); sys.stdout.flush()
     ok = True
 
@@ -1983,7 +1983,7 @@ def amr_test():
 
 
 def circuit_test():
-    """RLC drive circuit (sieve/circuit.py). (1) Fixed load: the underdamped discharge I = V0/(w L) e^(-a t)
+    """RLC drive circuit (aegis/circuit.py). (1) Fixed load: the underdamped discharge I = V0/(w L) e^(-a t)
     sin(w t) to 1e-6 of the peak at 4000 steps, bank energy budget to round-off. (2) An Al liner (R 10-11 mm,
     10 mm long) at rest, driven by a 200 uF, 30 kV bank on a 64 x 4 r-z grid: bank + grid conserve energy
     to round-off, the hydro energy budget closes with the drive work, and at 5 us (drive below 1.5 GPa, so
@@ -1993,7 +1993,7 @@ def circuit_test():
     import argparse
     import csv as _csv
     import tempfile
-    from sieve.circuit import RLCCircuit, thick_shell
+    from aegis.circuit import RLCCircuit, thick_shell
     C, V, L, R, n, T = 100e-6, 40e3, 30e-9, 2e-3, 4000, 8e-6
     c = RLCCircuit(C, V, L, R)
     a_, w = R / (2 * L), np.sqrt(1 / (L * C) - (R / (2 * L))**2)
@@ -2036,16 +2036,16 @@ def circuit_test():
 
 
 def amr_physics_test():
-    """Non-ideal terms across AMR levels (sieve/amr.py), 32^2 coarse, ratio 2, for each of resistive MHD,
+    """Non-ideal terms across AMR levels (aegis/amr.py), 32^2 coarse, ratio 2, for each of resistive MHD,
     conduction, grey FLD and liner strength: (1) three touching patches (an edge and a corner shared) that move
     every 4 coarse steps: mass, momentum and total energy (gas + radiation) conserved to round-off and div B at
     round-off; with the new flux registers switched off the energy (or momentum) error is 1e-7 or more, so the
     refluxing of the resistive, conductive, radiative and stress fluxes is what closes the budget; (2) a feature
     inside one patch (initialised at the fine resolution): the AMR solution in the patch matches a uniform fine run
     to under 2% of the coarse run's error."""
-    from sieve.amr import AMR, AMRParams, _Recorder
-    from sieve.eos import stiffened_from_hugoniot
-    from sieve import ct as _ct
+    from aegis.amr import AMR, AMRParams, _Recorder
+    from aegis.eos import stiffened_from_hugoniot
+    from aegis import ct as _ct
     print("\n--- AMR with resistive, conduction, FLD and strength terms ---"); sys.stdout.flush()
     gA, piA = stiffened_from_hugoniot(AL["rho0"], AL["c0"], AL["s"], 1.0)
     g2 = lambda X, Y, w: xp.exp(-((X - 0.5)**2 + (Y - 0.5)**2) / w)
@@ -2142,7 +2142,7 @@ def amr_physics_test():
 
 
 def amr_transport_test():
-    """The remaining terms across AMR levels (sieve/amr.py), 32^2 coarse, ratio 2: Hall + anisotropic resistivity,
+    """The remaining terms across AMR levels (aegis/amr.py), 32^2 coarse, ratio 2: Hall + anisotropic resistivity,
     Nernst + Ettingshausen (two-temperature), two-temperature electron and ion conduction with equilibration,
     gyroviscosity, Braginskii viscosity and optically thin radiation. For each: (1) three touching patches moving
     every 4 steps conserve mass, momentum and total energy (radiated energy counted) to round-off with div B at
@@ -2152,8 +2152,8 @@ def amr_transport_test():
     the refluxed heat must stay with the electrons; without the register the coarse cells next to the patch heat
     their ions: the change of T_i over the run departs from the uniform fine run's (the change, so that the coarse
     sampling of the initial state cancels)."""
-    from sieve.amr import AMR, AMRParams, _Recorder
-    from sieve import ct as _ct, twotemp
+    from aegis.amr import AMR, AMRParams, _Recorder
+    from aegis import ct as _ct, twotemp
     print("\n--- AMR with Hall, Nernst, two-temperature, gyroviscosity, viscosity, radiation ---"); sys.stdout.flush()
     g2 = lambda X, Y, w: xp.exp(-((X - 0.5)**2 + (Y - 0.5)**2) / w)
 
@@ -2287,7 +2287,7 @@ def cylindrical3d_test():
     along a uniform Cartesian field (v_r = U cos theta, v_theta = -U sin theta, faces from A_z = B0 y), here onto the
     axis: the errors in the blob's centroid (exact: moves U t) and in the field (exact: uniform) fall with
     resolution, energy is conserved to round-off and the cylindrical face divergence stays at round-off."""
-    from sieve.solver3d import MHDSolver3D
+    from aegis.solver3d import MHDSolver3D
     print("\n--- 3D cylindrical geometry (r, theta, z) ---"); sys.stdout.flush()
     ok = True
     base = dict(cfl=0.3, gamma=5 / 3, mach=1.0, B_transverse=1.0, geometry="cylindrical", div_b="ct",
@@ -2344,8 +2344,8 @@ def cylindrical3d_test():
 
 def _cyl3d_blob(Nr, Nth, T=0.5, U=1.0, B0=0.5):
     """the m = 1 blob of cylindrical3d_test: returns centroid, field deviation, energy error, max div B"""
-    from sieve.solver3d import MHDSolver3D
-    from sieve import ct as _ct
+    from aegis.solver3d import MHDSolver3D
+    from aegis import ct as _ct
     c = Config(nx=Nr, ny=Nth, nz=4, x_min=0.0, x_max=1.0, y_min=0.0, y_max=2 * np.pi, z_min=0.0, z_max=4.0 / Nr,
                cfl=0.3, gamma=5 / 3, mach=1.0, B_transverse=1.0, geometry="cylindrical", div_b="ct",
                bc_x_type="extrapolation", bc_y_type="periodic", powell_source=False, diag_interval=10**9,
@@ -2393,7 +2393,7 @@ def _cyl3d_blob(Nr, Nth, T=0.5, U=1.0, B0=0.5):
 
 
 def multigroup_test():
-    """Multigroup FLD (sieve/radiation_multigroup.py). (1) One group spanning all frequencies is grey FLD: equal to
+    """Multigroup FLD (aegis/radiation_multigroup.py). (1) One group spanning all frequencies is grey FLD: equal to
     fld.step to the solver tolerance. (2) Eight groups with frequency-independent opacity, optically thick: the sum
     over groups follows grey FLD (to the per-group limiter, 2e-3), gas + radiation energy conserved to round-off.
     (3) Kramers (nu^-3) opacity with a photo-ionization edge in a uniform box: the groups relax to the Planck
@@ -2402,7 +2402,7 @@ def multigroup_test():
     the Kramers shape spanning three decades. (5) In the 2D solver with a group-opacity table from
     tools/generate_sesame.py (Al, bound-free edges): a hot spot radiates, total energy conserved to round-off."""
     import tempfile
-    from sieve import fld, radiation_multigroup as mg
+    from aegis import fld, radiation_multigroup as mg
     print("\n--- Multigroup flux-limited diffusion ---"); sys.stdout.flush()
     ok = True
 
@@ -2530,7 +2530,7 @@ def multigroup_test():
 
 
 def experimental_test():
-    """Bundled open data and the benchmark that runs the solver against it (sieve/experimental_suite.py).
+    """Bundled open data and the benchmark that runs the solver against it (aegis/experimental_suite.py).
     (1) The copper and nickel Hugoniot datasets (Marsh 1980, via LLNL BALSCD, MIT) load with their checksums; a
     tampered copy is refused. (2) A shot trace written as CSV loads back through load_shot. (3) Copper plate
     impacts at five particle velocities with the generated Cu table: the simulated shock speeds follow the table's
@@ -2538,7 +2538,7 @@ def experimental_test():
     reported for an assumed 2% measurement error."""
     import tempfile
     import shutil
-    from sieve import experimental_suite as ex, validation as val
+    from aegis import experimental_suite as ex, validation as val
     print("\n--- Experimental data suite ---"); sys.stdout.flush()
     ok = True
     cu, ni = ex.load_dataset("copper_hugoniot"), ex.load_dataset("nickel_hugoniot")
@@ -2580,15 +2580,15 @@ def experimental_test():
 
 
 def autodiff_test():
-    """Reverse-mode differentiable twin of the ideal-MHD step (sieve/autodiff.py).
+    """Reverse-mode differentiable twin of the ideal-MHD step (aegis/autodiff.py).
     (1) Forward parity: 20 steps of an Orszag-Tang state (periodic, Cartesian) and of an imploding r-z shell
     with B_phi and B_z match MHDSolver (CUDA HLLD, fused MUSCL / EMF kernels) to round-off. (2) Conservation in
     the twin: periodic total energy to round-off, face div B at round-off, and the adjoint of the conserved
     energy carries its gradient back unchanged (dE_final/dp = dE_initial/dp). (3) Adjoint gradients against
     central finite differences with the same step sequence, for a shape parameter of the initial state, an
     amplitude and a boundary-drive current (r-z, 30 steps, objective: core B_z^2 plus a running B_phi^2)."""
-    from sieve import autodiff as ad
-    from sieve.config import iVZ, iBZ
+    from aegis import autodiff as ad
+    from aegis.config import iVZ, iBZ
     print("\n--- Differentiable MHD (adjoint) ---"); sys.stdout.flush()
     ok = True
 
@@ -2699,14 +2699,14 @@ def autodiff_test():
 
 
 def hybrid_pic_test():
-    """Adaptive kinetic-fluid hybrid (sieve/hybrid_pic.py). (1) Free streaming: a density mode in a collisionless
+    """Adaptive kinetic-fluid hybrid (aegis/hybrid_pic.py). (1) Free streaming: a density mode in a collisionless
     gas (every cell kinetic by its Knudsen number) decays as exp(-k^2 theta t^2 / 2), where the fluid would ring as
     a sound wave; the domain totals stay at round-off. (2) Boris push: one ion in a uniform field keeps |v| to
     round-off and gyrates at r_L = v / Omega. (3) Mixed run: Orszag-Tang with a low-density channel; cells switch
     to particles by Kn and r_L / dx and back (hysteresis), mass, momentum and energy of the domain conserved to
     round-off through every exchange, div B at round-off."""
-    from sieve.hybrid_pic import HybridPIC
-    from sieve.config import RHO, MX, MY, MZ
+    from aegis.hybrid_pic import HybridPIC
+    from aegis.config import RHO, MX, MY, MZ
     print("\n--- Kinetic-fluid hybrid (PIC) ---"); sys.stdout.flush()
     ok = True
 
@@ -2810,15 +2810,15 @@ def hybrid_pic_test():
 
 
 def fno_test():
-    """Fourier neural operator predictor (sieve/fno_subgrid.py) and its guard in the multigroup step.
+    """Fourier neural operator predictor (aegis/fno_subgrid.py) and its guard in the multigroup step.
     (1) The spectral convolution with identity weights is the FFT low-pass of the kept modes. (2) Gradients of a
-    loss through the whole network (tape of sieve/autodiff.py) agree with central differences. (3) Guard, with an
+    loss through the whole network (tape of aegis/autodiff.py) agree with central differences. (3) Guard, with an
     untrained (random) network: forcing acceptance (huge tolerance) still conserves gas + radiation energy to
     round-off, because the step ends with the conservative update built from whatever solution it has; forcing
     the fallback (tiny tolerance) gives the exact solver's answer to its tolerance, and a prediction no better
     than E^n costs no extra Krylov iterations (the solve then starts from E^n)."""
     import tempfile
-    from sieve import fno_subgrid as fs, autodiff as ad, radiation_multigroup as mg
+    from aegis import fno_subgrid as fs, autodiff as ad, radiation_multigroup as mg
     print("\n--- Fourier neural operator predictor ---"); sys.stdout.flush()
     ok = True
     rng = np.random.default_rng(0)
@@ -2896,7 +2896,7 @@ def fno_test():
 
 
 def cad_test():
-    """CAD ingestion and immersed walls (sieve/cad_importer.py). (1) STL: binary and ASCII round trip; volume
+    """CAD ingestion and immersed walls (aegis/cad_importer.py). (1) STL: binary and ASCII round trip; volume
     fractions of a triangulated sphere converge to its enclosed volume with the ray sampling, along each ray axis,
     and the wall area vectors from the apertures close (sum to zero). (2) STEP through gmsh / OpenCASCADE (if
     installed): a cylinder written as STEP reads back with its volume. (3) 2D walls: a magnetized gas at rest
@@ -2905,9 +2905,9 @@ def cad_test():
     grid reaches the exact reflected pressure (first order near the wall). (4) 3D walls: a sphere in
     MHDSolver3D (B normal to some wall faces), rest preserved to round-off, a blast beside it conserves mass and energy, div B at round-off."""
     import tempfile
-    from sieve import cad_importer as ci
-    from sieve.solver3d import MHDSolver3D
-    from sieve.config import RHO
+    from aegis import cad_importer as ci
+    from aegis.solver3d import MHDSolver3D
+    from aegis.config import RHO
     print("\n--- CAD ingestion and immersed walls ---"); sys.stdout.flush()
     ok = True
     tmp = tempfile.mkdtemp(prefix="cad_")
@@ -3074,7 +3074,7 @@ def cad_test():
 
 
 def monitor_test():
-    """Run monitor (sieve/agent_monitor.py) and live viewer server (scripts/server.py). (1) Mode analysis: a
+    """Run monitor (aegis/agent_monitor.py) and live viewer server (scripts/server.py). (1) Mode analysis: a
     synthetic interface with an m = 3 mode growing at a known rate is decomposed and the rate recovered; a flux
     history losing 30% raises flux_loss. (2) A 2D liner cross-section implosion with a seeded m = 4 corrugation and
     an undeclared 3% m = 3 drive asymmetry: the monitor reports the unexpected m = 3 growth; without the asymmetry
@@ -3083,7 +3083,7 @@ def monitor_test():
     import importlib.util
     import json
     import urllib.request
-    from sieve.agent_monitor import AgentMonitor, interface_modes
+    from aegis.agent_monitor import AgentMonitor, interface_modes
     print("\n--- Run monitor and live server ---"); sys.stdout.flush()
     ok = True
     # (1) synthetic
@@ -3104,7 +3104,7 @@ def monitor_test():
     print(f"  synthetic interface: m = 3 growth rate {g3:.6f} (exact {g_true}); alerts {sorted(kinds)}"
           f"  [{'PASS' if good else 'FAIL'}]")
     # (2) the 2D preset, with and without the m = 3 drive asymmetry
-    spec = importlib.util.spec_from_file_location("sieve_server", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+    spec = importlib.util.spec_from_file_location("aegis_server", os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                                                "scripts", "server.py"))
     srv = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(srv)
@@ -3171,7 +3171,7 @@ def _mode_run(cfg, init, T, var_fn, k):
 
 
 def hall_test():
-    """Generalized Ohm's law (sieve/hall.py). (1) Circularly polarized waves along B_0 with the Hall term
+    """Generalized Ohm's law (aegis/hall.py). (1) Circularly polarized waves along B_0 with the Hall term
     (d_i k = 1): the whistler and ion-cyclotron branches, omega = k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2), measured from
     the phase of B_y + i B_z, converge at second order. (2) Anisotropic resistivity: a B_z ripple decays at
     eta_par k^2 when its current is along B_0 and at 1.96 eta_par k^2 when across it. (3) Hall + anisotropic
@@ -3247,14 +3247,14 @@ def hall_test():
 
 
 def ion_transport_test():
-    """Ion Braginskii transport (sieve/ions.py). (1) Gyroviscosity: a fast magnetosonic wave across B = B_z has the
+    """Ion Braginskii transport (aegis/ions.py). (1) Gyroviscosity: a fast magnetosonic wave across B = B_z has the
     finite-Larmor-radius dispersion omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2, eta_3 = p_i d_i / (2 B) (here
     the FLR term doubles omega^2), converging at second order; without it omega = k c_f. (2) Ion conduction
     (two-temperature): a T_i ripple decays at D k^2, D = k_i (1 + Z)(gamma - 1) / rho, and at D k^2 / (1 + x_i^2) across
     a field, with the electron entropy untouched and the energy conserved; (3) both on in a full run: energy to
     round-off."""
-    from sieve.physics import conduct
-    from sieve import twotemp
+    from aegis.physics import conduct
+    from aegis import twotemp
     print("\n--- Ion gyroviscosity and ion conduction ---"); sys.stdout.flush()
     ok = True
     k, g = 2 * np.pi, 5 / 3
@@ -3352,8 +3352,8 @@ def sesame_test():
     import tempfile
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
     import generate_sesame as gs
-    from sieve import tabular
-    from sieve.eos import Material
+    from aegis import tabular
+    from aegis.eos import Material
     print("\n--- Generated material tables (tools/generate_sesame.py) ---"); sys.stdout.flush()
     tmp = tempfile.mkdtemp(prefix="ses_")
     ok = True

@@ -1,8 +1,8 @@
-"""3D rendering of MagSieve-3D snapshots with PyVista (off screen): ray-cast volume rendering of density,
+"""3D rendering of AEGIS-MHD snapshots with PyVista (off screen): ray-cast volume rendering of density,
 liner / density isosurfaces, temperature hot-spot contours and magnetic field lines, one PNG per frame and an
 MP4 of the series.
 
-    python scripts/render_3d.py results/run/series.pvd               # ParaView series written by sieve.io3d
+    python scripts/render_3d.py results/run/series.pvd               # ParaView series written by aegis.io3d
     python scripts/render_3d.py results/run                          # a run directory (series.pvd, vtk/, h5/)
     python scripts/render_3d.py frame_0003.vti frame_0004.h5 --out renders --size 1920 1080 --fps 12
 
@@ -38,7 +38,7 @@ def frames_from(paths):
 
 
 def load(path):
-    """pyvista ImageData with cell arrays from a .vti or an .h5 written by sieve.io3d"""
+    """pyvista ImageData with cell arrays from a .vti or an .h5 written by aegis.io3d"""
     import pyvista as pv
     if path.endswith(".h5"):
         import h5py

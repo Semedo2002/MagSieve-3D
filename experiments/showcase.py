@@ -2,8 +2,8 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
-from sieve.config import Config
-from sieve.solver import MHDSolver, PostProcessor
+from aegis.config import Config
+from aegis.solver import MHDSolver, PostProcessor
 
 t_end = 0.8
 base = dict(div_b="glm", nx=400, ny=100, x_min=0.0, x_max=12.0, y_min=0.0, y_max=2.0, t_end=t_end, mach=10.0,

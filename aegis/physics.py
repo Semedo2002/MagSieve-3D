@@ -81,7 +81,7 @@ _hlld_kernel = _ef.hlld_kernel
 # ============================================================
 # GPU Vectorized Operations
 # ============================================================
-# fused single-launch kernels for the hot paths (sieve/fused.py); off on the NumPy fallback
+# fused single-launch kernels for the hot paths (aegis/fused.py); off on the NumPy fallback
 try:
     from . import fused as _fz
     _FUSED = xp.__name__ == "cupy"

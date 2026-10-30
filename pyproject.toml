@@ -3,9 +3,9 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "magsieve"
+name = "aegis-mhd"
 version = "0.1.0"
-description = "GPU finite-volume MHD solver (HLLD, CUDA via CuPy) and the magnetic sieve / Richtmyer-Meshkov study"
+description = "AEGIS-MHD: GPU finite-volume MHD solver platform (HLLD, CUDA via CuPy), with the magnetic sieve / Richtmyer-Meshkov study"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Abdelrahman Shaltout" }]
@@ -28,7 +28,7 @@ fno = ["nvidia-cublas-cu12>=12"]     # GPU matrix products for the neural-operat
 cad = ["gmsh>=4.11"]                 # STEP / IGES import (OpenCASCADE); STL needs nothing
 
 [tool.setuptools]
-packages = ["sieve", "sieve.problems"]
+packages = ["aegis", "aegis.problems"]
 
 [tool.setuptools.package-data]
-sieve = ["hlld_kernel.cu", "eos_fused.cu", "data/experimental/*"]
+aegis = ["hlld_kernel.cu", "eos_fused.cu", "data/experimental/*"]

@@ -1,4 +1,4 @@
-"""Adaptive mesh refinement on a magnetized liner implosion (2D cross-section, sieve/amr.py).
+"""Adaptive mesh refinement on a magnetized liner implosion (2D cross-section, aegis/amr.py).
 
 A dense liner (radii 0.5-0.7, density 10, a 1% mode-6 ripple on its inner surface) implodes at Mach 4 onto a
 core holding an out-of-plane seed field, like examples/mtif_flux_compression.py. The same problem runs three
@@ -25,11 +25,11 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, iRHO, iVX, iVY, iBZ, iPR, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim
-    from sieve.solver import MHDSolver, to_numpy
-    from sieve.amr import AMR, AMRParams
-    from sieve.diagnostics import enclosed_by_tracer
+    from aegis.config import Config, NVAR, iRHO, iVX, iVY, iBZ, iPR, iCLR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim
+    from aegis.solver import MHDSolver, to_numpy
+    from aegis.amr import AMR, AMRParams
+    from aegis.diagnostics import enclosed_by_tracer
 
 G, R0, R1 = 5.0 / 3.0, 0.5, 0.7
 

@@ -1,7 +1,7 @@
 """SESAME-compatible EOS and opacity tables from analytic physics models (no LANL data).
 
 For Al, Cu, D-T, Au and Pb this writes 2D tables p, e, c_s, kappa_R, kappa_P on a log rho x log T grid, as an SI
-.npz (what sieve/tabular.py reads) and optionally SESAME ASCII (tables 301, 502, 505). Everything follows from one
+.npz (what aegis/tabular.py reads) and optionally SESAME ASCII (tables 301, 502, 505). Everything follows from one
 Helmholtz free energy per unit mass, so the EOS is thermodynamically consistent by construction:
 
     F(rho, T) = E_cold(rho) + F_ion(rho, T) + F_e(rho, T) - F_e(rho, 0)
@@ -407,7 +407,7 @@ def write(name, tab, out_dir, sesame=False):
     np.savez(path, **tab)
     if sesame:
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from sieve import tabular
+        from aegis import tabular
         nr, nt = len(tab["rho"]), len(tab["T"])
         w301 = np.concatenate([[nr, nt], tab["rho"] / 1e3, tab["T"], tab["p"].T.ravel() / 1e9,
                                tab["e"].T.ravel() / 1e6, np.zeros(nr * nt)])

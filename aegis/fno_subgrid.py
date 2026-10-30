@@ -5,7 +5,7 @@
 # linear layers). The spectral convolution keeps the lowest `modes` Fourier modes in each direction
 # (kx = -(m-1)..m-1, ky = 0..m-1) and multiplies them by learned complex channel-mixing weights. The truncated
 # transforms are written as real matrix products with cosine / sine bases, so the same code runs on CuPy or
-# NumPy, is resolution independent (the bases are built per grid) and is differentiated by sieve/autodiff.py's
+# NumPy, is resolution independent (the bases are built per grid) and is differentiated by aegis/autodiff.py's
 # tape (training uses the reverse mode of Feature 1, no external ML framework).
 #
 # Use in the solver: radiation_multigroup.step asks the model for the implicit solution E^{n+1} of every group

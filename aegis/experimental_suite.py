@@ -1,14 +1,14 @@
 # experimental_suite.py - open experimental data bundled with the code, and benchmarks that run the solver against
 # them (RMS, reduced chi^2, a comparison figure).
 #
-# Bundled data (sieve/data/experimental/), each with its provenance and a SHA-256 of its (LF-normalised) content,
+# Bundled data (aegis/data/experimental/), each with its provenance and a SHA-256 of its (LF-normalised) content,
 # checked on load:
 #   copper_hugoniot, nickel_hugoniot   shock velocity Us against particle velocity Up (and P, rho) from plate-impact
 #       experiments, Marsh (ed.), "LASL Shock Hugoniot Data", University of California Press (1980), as transcribed
 #       in LLNL's BALSCD repository (github.com/llnl/BALSCD, MIT licence, notice files alongside the data)
 # No open B-dot, VISAR-trace or x-ray-radius data from pulsed-power shots are bundled: none were found in an open,
 # citable machine-readable form. Shot traces of your own load with load_shot() (CSV: t, value, sigma) and are
-# compared with simulations through sieve/validation.py (see examples/experimental_shot_fitting.py).
+# compared with simulations through aegis/validation.py (see examples/experimental_shot_fitting.py).
 #
 # hugoniot_benchmark() runs symmetric plate impacts with the solver (2D grid, one cell row of interest) at a set of
 # particle velocities, measures the shock speed from the shock front's motion, and compares Us(Up) with the data.

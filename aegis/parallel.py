@@ -10,7 +10,7 @@
 # Halo transport: NCCL device-to-device when CuPy has it (Linux) and backend="nccl"/"auto", otherwise MPI with
 # the halos staged through host memory (or passed as device buffers if the MPI is CUDA-aware, cuda_aware=True).
 #
-#   from sieve.parallel import distributed
+#   from aegis.parallel import distributed
 #   s = distributed(MHDSolver3D, cfg)            # under mpiexec -n P; cfg describes the whole grid
 #   ... set s.U on the local grid (s.x holds this rank's cell centres) and march as usual ...
 #   rho = s.gather_x(rho_interior)                # whole field on rank 0

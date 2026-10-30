@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software or its results, please cite it as below."
-title: "MagSieve-3D: GPU MHD solver and magnetic sieve study"
+title: "AEGIS-MHD: GPU MHD solver platform and the magnetic sieve study"
 type: software
 authors:
   - family-names: Shaltout

@@ -3,7 +3,7 @@
     python scripts/run_rmi_mhd.py                       # configs/rmi_mhd.json, full resolution
     python scripts/run_rmi_mhd.py --quick               # low-resolution check (config "quick" block)
     python scripts/run_rmi_mhd.py --cases mhd_parallel  # a subset
-Outputs go to <out_dir>/<case>/ (results/rmi_mhd/ by default); see sieve/problems/rmi_mhd.py.
+Outputs go to <out_dir>/<case>/ (results/rmi_mhd/ by default); see aegis/problems/rmi_mhd.py.
 """
 import os
 import sys
@@ -15,7 +15,7 @@ import io
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.problems.rmi_mhd import RMIParams, run
+    from aegis.problems.rmi_mhd import RMIParams, run
 
 
 def main(argv=None):

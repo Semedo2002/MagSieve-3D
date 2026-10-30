@@ -15,7 +15,7 @@ Conductivities are in S/m; the code units are tied to SI through --r-ref-mm (cor
 --v-ref-kms (sqrt(p/rho) of the core) and --rho-ref (core density), defaulting to the NearStar example's
 scales; they also set the liner EOS in SI (--eos-liner stiffened / mie_gruneisen use aluminium).
 
-Needs the MagSieve-3D solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
+Needs the AEGIS-MHD solver: pip install git+https://github.com/Semedo2002/MagSieve-3D
 """
 import os
 import sys
@@ -31,11 +31,11 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)  # run from a repo checkout without installing
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, EN, iRHO, iVX, iVY, iBZ, iPR, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim, internal_energy, pressure_margin
-    from sieve.solver import MHDSolver, to_numpy
-    from sieve.diagnostics import enclosed_by_tracer, cavitation_split, hotspot_conduction
-    from sieve.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
+    from aegis.config import Config, NVAR, EN, iRHO, iVX, iVY, iBZ, iPR, iCLR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim, internal_energy, pressure_margin
+    from aegis.solver import MHDSolver, to_numpy
+    from aegis.diagnostics import enclosed_by_tracer, cavitation_split, hotspot_conduction
+    from aegis.units import (add_resistivity_args, resistivity_from_args, add_eos_args, eos_from_args,
                              add_radiation_args, radiation_from_args, add_conduction_args, conduction_from_args)
 
 GAMMA = 5.0 / 3.0

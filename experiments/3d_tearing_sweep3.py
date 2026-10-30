@@ -34,8 +34,8 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config
-    from sieve.solver3d import MHDSolver3D
+    from aegis.config import Config
+    from aegis.solver3d import MHDSolver3D
 
 DATA = os.path.join(ROOT, "experiments", "data")
 ap = argparse.ArgumentParser()

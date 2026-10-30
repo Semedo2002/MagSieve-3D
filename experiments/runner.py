@@ -13,9 +13,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, RHO, MX
-    from sieve.solver import MHDSolver
-    from sieve.physics import xp
+    from aegis.config import Config, RHO, MX
+    from aegis.solver import MHDSolver
+    from aegis.physics import xp
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 

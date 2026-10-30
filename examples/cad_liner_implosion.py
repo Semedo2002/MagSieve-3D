@@ -1,4 +1,4 @@
-"""3D MHD implosion of a CAD liner, straight from the file onto the grid (sieve/cad_importer.py).
+"""3D MHD implosion of a CAD liner, straight from the file onto the grid (aegis/cad_importer.py).
 
 The target is read from a CAD file (.stl here; .step / .stp / .iges / .igs through gmsh), and its solid volume
 fraction on every cell of a 3D Cartesian grid becomes the liner: density, material tracer and inward velocity.
@@ -29,10 +29,10 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, iRHO, iVX, iVY, iPR, iBZ, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim
-    from sieve.solver3d import MHDSolver3D
-from sieve import cad_importer as ci
+    from aegis.config import Config, NVAR, iRHO, iVX, iVY, iPR, iBZ, iCLR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim
+    from aegis.solver3d import MHDSolver3D
+from aegis import cad_importer as ci
 
 DEFAULT_STL = os.path.join(ROOT, "examples", "data", "corrugated_liner.stl")
 

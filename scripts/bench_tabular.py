@@ -18,10 +18,10 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
-    from sieve.config import Config, NVAR, iRHO, iVX, iPR, iCLR
-    from sieve.physics import xp, prim_to_cons, cons_to_prim
-    from sieve.solver import MHDSolver
-    from sieve import tabular
+    from aegis.config import Config, NVAR, iRHO, iVX, iPR, iCLR
+    from aegis.physics import xp, prim_to_cons, cons_to_prim
+    from aegis.solver import MHDSolver
+    from aegis import tabular
 
 
 def make(n, table):
