@@ -211,6 +211,7 @@ class PhysicsConfig:
     fld_mg_absorption: float = 1.0                   # scales every kP_g (0: groups only diffuse, no exchange)
     # learned predictor for the multigroup implicit solve (aegis/fno_subgrid.py, a .npz model; 2D): accepted when
     # the relative residual of the linear system is <= fld_fno_tol, otherwise BiCGStab starts from it
+    fld_precond: str = "jacobi"                      # Krylov preconditioner: "jacobi" (block Jacobi) or "mg" (multigrid)
     fld_fno_model: str = ""
     fld_fno_tol: float = 1e-3
     # magnetized electron conduction (physics.conduction_div), 0 = off: k_par = cond_kappa0 T^5/2,
@@ -324,6 +325,8 @@ class PhysicsConfig:
             raise ValueError("fld_groups > 0 needs fld=True; fld_mg_opacity is grey or kramers")
         if self.fld_group_edges and len(self.fld_group_edges) != self.fld_groups - 1:
             raise ValueError("fld_group_edges holds the fld_groups - 1 inner edges")
+        if self.fld_precond not in ("jacobi", "mg"):
+            raise ValueError(f"fld_precond must be jacobi or mg, not {self.fld_precond!r}")
         if self.fld_fno_model and (self.fld_groups < 1 or self.fld_fno_tol <= 0):
             raise ValueError("fld_fno_model needs fld_groups >= 1 and fld_fno_tol > 0")
         if self.fld and self.two_temp:

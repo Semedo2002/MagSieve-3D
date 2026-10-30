@@ -247,6 +247,11 @@ def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True):
             Di = r / D
             den = 1.0 - cpl * xp.sum(w * u / D, axis=0)
             return Di + (u / D) * (cpl * xp.sum(w * Di, axis=0) / den)
+        if cfg.fld_precond == "mg":                  # geometric multigrid V-cycle (aegis/radiation_gmg.py)
+            from .radiation_gmg import Multigrid
+            prec = Multigrid(xp.broadcast_to(diag, E0.shape), [xp.stack([K[g][ax] for g in range(G)])
+                                                                 for ax in range(geo.nd)], geo.per,
+                             cu=cpl * u, w=w)
         if cfg.fld_fno_model and first and geo.nd == 2:
             # learned predictor (aegis/fno_subgrid.py), guarded by the residual of this linear system
             from . import fno_subgrid as fs

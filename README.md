@@ -25,6 +25,7 @@ aegis/            solver package
   diagnostics.py  mixing, enstrophy, interface spectrum, div B, energy
   circuit.py      RLC drive circuit coupled to an r-z liner (magnetic piston, energy-consistent inductance)
   fld.py          grey flux-limited diffusion radiation (Levermore-Pomraning, implicit CG on the GPU)
+  radiation_gmg.py  geometric multigrid V-cycle preconditioner for the grey and multigroup FLD solves
   radiation_multigroup.py  multigroup FLD: photon groups, group opacities, coupled implicit BiCGStab solve
   cad_importer.py STL / STEP / IGES import, ray-column volume fractions and apertures, immersed walls
   agent_monitor.py  automatic run diagnostics: interface mode growth, flux / insulation loss, numerical health
@@ -248,10 +249,33 @@ c rho kappa_P (a T^4 - E_r), with the Levermore-Pomraning limiter D = c lambda(R
 each face, and power-law Planck and Rosseland opacities (a free-free preset, or your own). Each step advects E_r
 with the gas, then solves the stiff part by backward Euler with the emission linearised, the gas temperature
 eliminated, and the limiter re-evaluated over a few Picard passes; the symmetric system (volume weighted, so
-also in r-z) goes to a matrix-free Jacobi-preconditioned conjugate-gradient solver on the GPU. The final update
+also in r-z) goes to a matrix-free conjugate-gradient solver on the GPU, preconditioned by Jacobi or, with
+`fld_precond="mg"`, a geometric multigrid V-cycle (below). The final update
 is written in face-flux form from the solution, so gas + radiation energy is conserved to round-off whatever
 the solver residual. 2D, r-z and 3D. Radiation pressure is left out (fine while E_r/3 << p), and FLD couples to
 a single gas temperature (not with `two_temp`).
+
+### Multigrid preconditioner for the radiation solves
+
+`fld_precond="mg"` replaces the Jacobi (grey) or block-Jacobi (multigroup) preconditioner by a geometric
+multigrid V-cycle (`aegis/radiation_gmg.py`), on the GPU arrays:
+- **Hierarchy:** cell-centred, 2:1 coarsening along every axis that is even and at least 4 cells long. Coarse
+  operators are rediscretised: volumes and the multigroup coupling vectors summed, face conductances summed across
+  the face and halved along a coarsened axis.
+- **Transfers:** restriction sums over the children, and prolongation (its transpose) copies the correction back.
+- **Smoothing:** red-black Gauss-Seidel on the cell blocks, each group block inverted exactly by Sherman-Morrison,
+  2 pre- and 2 post-sweeps in mirrored order. The V-cycle is symmetric, so it also preconditions the grey CG.
+- **Iterations (stiff case, D dt / dx^2 ~ 20-80, three steps):**
+  - Jacobi: grey 1962 / 3960 / 8010 at 64^2 / 128^2 / 256^2;
+  - multigrid: 70 / 71 / 71 (O(N) work);
+  - 6-group Kramers: 2401 / 5096 / 10985 against 85 / 103 / 122;
+  - solutions agree to the tolerance, and energy stays at round-off (the conservative update is unchanged).
+- **Wall time (P1000, idle):** the V-cycle launches many small kernels, so it pays off with size:
+  - grey: 0.6x / 0.8x / 1.4x the Jacobi speed at 64^2 / 128^2 / 256^2;
+  - 6 groups: 1.6x / 2.5x / 3.6x.
+  These are short of a 5-10x wall-clock gain at these sizes; the iteration gain (28-113x) would show fully only on
+  larger grids or with fused kernels.
+- **Default:** Jacobi stays the default.
 
 ### Multigroup radiation diffusion
 
@@ -692,6 +716,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | fno | spectral layer with identity weights = FFT low-pass (2e-15); network gradients vs central differences (2e-6); guard with an untrained network: forced acceptance keeps gas + radiation energy at round-off, forced fallback reproduces the exact solve with the same iteration count |
 | cad | STL round trip; sphere volume fractions converge with the ray sampling (6e-4 to 2.5e-5), wall area vectors close; STEP cylinder through gmsh / OpenCASCADE reads back its volume; ring wall in 2D: rest exact with B_z, a sealed blast keeps cavity mass, total mass and energy to ~1e-14; Mach 2 shock reflection off walls inclined at 45 and 30 degrees within 0.4% of the exact pressure; 3D sphere wall: rest to 2e-16, mass and energy 1.6e-15, div B 2e-15 |
 | monitor | synthetic interface: m = 3 growth rate recovered exactly, flux loss flagged; 2D liner implosion: an undeclared 3% m = 3 drive asymmetry is reported as an unexpected mode (growth 5.3 per unit time), none without it; the server serves the WebGPU page, frames (slice, contours, monitor data), the SSE stream and its status |
+| gmg | multigrid vs Jacobi preconditioning, three stiff FLD steps: grey 64^2 1962 -> 70, 128^2 3960 -> 71 iterations (flat with N), 6 Kramers groups 2401 -> 85; solutions within 3e-9, energy at round-off |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |

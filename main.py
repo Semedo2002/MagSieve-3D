@@ -3147,6 +3147,51 @@ def monitor_test():
     return ok
 
 
+def gmg_test():
+    """Geometric multigrid preconditioner for the FLD solves (aegis/radiation_gmg.py). Stiff grey FLD (D dt / dx^2
+    ~ 20-80) on 64^2 and 128^2 and 6-group Kramers multigroup on 64^2, three steps each: the multigrid
+    V-cycle needs far fewer Krylov iterations than Jacobi, about the same number at both grid sizes (O(N) work),
+    the solutions agree to the solver tolerance, and gas + radiation energy stays at round-off."""
+    from aegis import fld, radiation_multigroup as mgr
+    print("\n--- Multigrid preconditioner for FLD ---"); sys.stdout.flush()
+    ok = True
+    rows = {}
+    for groups, n in ((0, 64), (0, 128), (6, 64)):
+        x = (np.arange(n) + 0.5) / n
+        X, Y = np.meshgrid(x, x, indexing="ij")
+        res = {}
+        for pc in ("jacobi", "mg"):
+            kw = dict(nx=n, ny=n, x_max=1.0, y_max=1.0, gamma=5 / 3, bc_x_type="periodic", bc_y_type="periodic",
+                      diag_interval=10**9, snapshot_times=[], fld=True, fld_c=10.0, fld_a=1.0, fld_advect=False,
+                      fld_tol=1e-10, fld_kr0=2.0, fld_kp0=1.0, fld_precond=pc, fld_maxit=20000)
+            if groups:
+                kw.update(fld_groups=groups, fld_mg_opacity="kramers", fld_kp0=20.0, fld_edge=3.0, fld_edge_jump=10.0,
+                          fld_group_emin=0.1, fld_group_emax=20.0)
+            cfg = Config(**kw)
+            W = xp.zeros((NVAR, n, n))
+            W[iRHO] = xp.asarray(1 + 0.5 * np.cos(2 * np.pi * X) * np.sin(2 * np.pi * Y))
+            W[iPR] = W[iRHO] * xp.asarray(1 + 2 * np.exp(-((X - .5)**2 + (Y - .5)**2) / 0.01))
+            U = prim_to_cons(W, 5 / 3)
+            E = xp.asarray(0.5 + 0.5 * np.exp(-((X - .3)**2 + (Y - .6)**2) / 0.005))
+            if groups:
+                E = xp.stack([E / groups] * groups)
+            tot0 = float(xp.sum(U[EN]) + xp.sum(E))
+            its = 0
+            for _ in range(3):
+                f = mgr.step if groups else fld.step
+                its += f(E, U, 5 / 3, cfg, (1 / n, 1 / n), (True, True), 0.01, advect=False)[2]
+            res[pc] = (its, E, abs(float(xp.sum(U[EN]) + xp.sum(E)) - tot0) / tot0)
+        d = float(xp.max(xp.abs(res["mg"][1] - res["jacobi"][1])) / xp.max(res["jacobi"][1]))
+        rows[(groups, n)] = (res["jacobi"][0], res["mg"][0], d, max(res["jacobi"][2], res["mg"][2]))
+    good = all(j >= 5 * m and d < 1e-6 and e < 1e-14 for j, m, d, e in rows.values()) \
+        and rows[(0, 128)][1] <= 1.3 * rows[(0, 64)][1]
+    ok = ok and good
+    print("  Krylov iterations over 3 steps, Jacobi -> multigrid: " + "; ".join(
+        f"{'grey' if g == 0 else f'{g} groups'} {n}^2: {j} -> {m} (x{j / m:.0f}), solutions within {d:.0e}, energy {e:.0e}"
+        for (g, n), (j, m, d, e) in rows.items()) + f"  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3489,6 +3534,7 @@ VERIFICATION_TESTS = {
     "fno": fno_test,
     "cad": cad_test,
     "monitor": monitor_test,
+    "gmg": gmg_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

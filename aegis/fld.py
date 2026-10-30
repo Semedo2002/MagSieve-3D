@@ -12,7 +12,8 @@
 # with the emission linearised, a (theta + dtheta)^4 = a theta^4 + 4 a theta^3 dtheta, and the limiter taken
 # from the latest iterate over a few Picard passes (fld_picard). Eliminating dtheta
 # leaves one symmetric positive-definite system for E_r^{n+1} (volume weighted, so it stays symmetric in r-z),
-# solved by matrix-free conjugate gradients with a Jacobi preconditioner on the GPU. The update is then written
+# solved by matrix-free conjugate gradients on the GPU, preconditioned by Jacobi or (fld_precond = "mg") a
+# geometric multigrid V-cycle (aegis/radiation_gmg.py). The update is then written
 # from the solution in face-flux form plus the cell exchange that the gas receives with the opposite sign, so
 # gas + radiation energy is conserved to round-off whatever the CG residual. D is frozen at the old E_r.
 # Radiation pressure and its work are left out (fine while E_r / 3 << p). Radiation lives in the fuel only
@@ -186,7 +187,8 @@ def _opacity_table(cfg):
 def _cg(op, b, x0, Minv, tol, maxit):
     x = x0.copy()
     r = b - op(x)
-    z = Minv * r
+    M = Minv if callable(Minv) else (lambda v: Minv * v)
+    z = M(r)
     p = z.copy()
     rz = xp.sum(r * z)
     bn = float(xp.sqrt(xp.sum(b * b))) or 1.0
@@ -197,7 +199,7 @@ def _cg(op, b, x0, Minv, tol, maxit):
         alpha = rz / xp.sum(p * Ap)
         x += alpha * p
         r -= alpha * Ap
-        z = Minv * r
+        z = M(r)
         rz_new = xp.sum(r * z)
         p = z + (rz_new / rz) * p
         rz = rz_new
@@ -258,7 +260,13 @@ def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True, ghost=None,
         rhs = V * (Er + dt * s * B) + bnet
         kd = sum(k[_sl(nd, ax, slice(0, geo.shape[ax]))] + k[_sl(nd, ax, slice(1, geo.shape[ax] + 1))]
                  for ax, k in enumerate(K))
-        E1, it = _cg(op, rhs, E1, 1.0 / (diag_ + kd), cfg.fld_tol, cfg.fld_maxit)
+        if cfg.fld_precond == "mg":                  # geometric multigrid V-cycle (aegis/radiation_gmg.py)
+            from .radiation_gmg import Multigrid
+            mgv = Multigrid(xp.broadcast_to(diag_, Er.shape)[None], [k[None] for k in K], geo.per)
+            Minv = lambda v: mgv(v[None])[0]
+        else:
+            Minv = 1.0 / (diag_ + kd)
+        E1, it = _cg(op, rhs, E1, Minv, cfg.fld_tol, cfg.fld_maxit)
         its += it
     # conservative update from the solution: face fluxes telescope, the gas gets the exchange back
     Gd = diffusive(geo, E1, K, dirichlet, ghost=ghost)
