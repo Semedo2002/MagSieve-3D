@@ -3234,6 +3234,49 @@ def cyl_filter_test():
     return ok
 
 
+def rlc_adjoint_test():
+    """Differentiable RLC drive in the adjoint twin (aegis/autodiff.py, DiffMHD(circuit=...)). An r-z liner driven
+    by a capacitor bank through the magnetic piston at r_max: bank + resistor + grid energy is conserved to
+    round-off (implicit-midpoint circuit with the exact grid load power), and the adjoint derivatives of a yield
+    proxy with respect to a shape mode, V0, C, L and R agree with central differences."""
+    from aegis import autodiff as ad
+    print("\n--- Differentiable RLC drive (adjoint) ---"); sys.stdout.flush()
+    cfg = Config(nx=24, ny=12, x_min=0.0, x_max=1.6, y_min=0.0, y_max=1.0, cfl=0.3, gamma=5 / 3, geometry="cylindrical",
+                 bc_x_type="extrapolation", bc_y_type="periodic", diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(cfg)
+    sim = ad.DiffMHD(s, circuit=lambda p: (p[1], p[2], p[3], p[4]), xp=np)
+    r = to_numpy(s.rc)[:, None] * np.ones((1, s.ny_tot))
+    z = np.ones((s.nx_tot, 1)) * to_numpy(s.y)[None, :]
+
+    def W_fn(p):
+        Rz = 1.0 + p[0] * ad.const(np.cos(2 * np.pi * z))
+        prof = 0.5 * (ad.tanh((ad.const(r) - Rz) / 0.05) - ad.tanh((ad.const(r) - Rz - 0.25) / 0.05))
+        return [0.05 + prof, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.05, 0.0, prof, 0.0]
+    init = lambda p: ad.cells_to_state(sim, W_fn, p)
+    p0 = np.array([0.03, 4.0, 1.0, 0.5, 0.05])
+    _, info = sim.run(init, p0, n_steps=60)
+    pc = ad.const(p0)
+    st0 = sim.init_state(init, pc)
+    st = info["state"]
+    Eg0, Eg1 = (2 * np.pi * float(ad.total_energy(sim, x).v) for x in (st0, st))
+    E0 = sim.circuit_energy(st0, pc) + Eg0
+    dE = abs(sim.circuit_energy(st, pc) + Eg1 - E0) / E0
+    moved = (Eg1 - Eg0) / sim.circuit_energy(st0, pc)
+    Y = lambda st_, t_, p_: ad.yield_proxy(sim, st_)
+    J, g, inf = sim.value_and_grad(init, p0, n_steps=60, step_objective=Y)
+    errs = []
+    for k in range(5):
+        h = 1e-6 * max(abs(p0[k]), 1.0)
+        fd = ad.finite_difference(sim, init, p0, k, h, dts=inf["dts"], step_objective=Y)
+        errs.append(abs(fd - g[k]) / abs(g[k]))
+    good = dE < 1e-13 and moved > 0.05 and max(errs) < 1e-6
+    print(f"  60 steps: {100 * moved:.0f}% of the bank energy delivered to the liner; bank + resistor + grid energy "
+          f"{dE:.0e}; d(yield proxy)/d(a1, V0, C, L, R) adjoint vs central differences: "
+          + ", ".join(f"{e:.0e}" for e in errs) + f"  [{'PASS' if good else 'FAIL'}]")
+    return good
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3578,6 +3621,7 @@ VERIFICATION_TESTS = {
     "monitor": monitor_test,
     "gmg": gmg_test,
     "cyl_filter": cyl_filter_test,
+    "rlc_adjoint": rlc_adjoint_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

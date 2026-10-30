@@ -481,6 +481,16 @@ discrete adjoint (reverse mode):
   the branch taken. Exactly symmetric states sit on a kink. With z-uniform data the van Leer limiter sees zero
   slopes, so the one-sided derivatives differ there; start designs slightly off symmetry. Finite differences
   agree with the adjoint only where their step stays inside one smooth piece.
+- **RLC drive:** `DiffMHD(..., circuit=lambda p: (V0, C, L, R))` couples a capacitor bank to the magnetic piston
+  (B_phi(r_max) = I / (2 pi r_max)), and the circuit is part of the differentiable state (I, V_C, resistor
+  energy):
+  - the load takes exactly the RK-weighted power that enters the grid through r_max, with an implicit-midpoint
+    step solved as one scalar quadratic, so bank + resistor + grid energy is conserved to round-off;
+  - adjoint derivatives with respect to V0, C, L and R match central differences to 1e-9
+    (`--test rlc_adjoint`);
+  - `yield_proxy` is a smooth fusion-yield stand-in (sum of rho^2 theta^4 over the fuel), not a calibrated yield;
+  - `examples/optimize_liner_shape.py --circuit` optimises the liner shape and the bank capacitance (pulse
+    timing, at fixed stored energy) together.
 - **Scope:** ideal gas, ideal MHD with `div_b='ct'`, 2D. It refuses resistivity, EOS tables, transport,
   radiation, strength and 3D.
 - **Inverse design:** `examples/optimize_liner_shape.py` optimises the axial shape R(z) = R0 + sum a_k cos(2 pi k z / L)
@@ -729,6 +739,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | monitor | synthetic interface: m = 3 growth rate recovered exactly, flux loss flagged; 2D liner implosion: an undeclared 3% m = 3 drive asymmetry is reported as an unexpected mode (growth 5.3 per unit time), none without it; the server serves the WebGPU page, frames (slice, contours, monitor data), the SSE stream and its status |
 | gmg | multigrid vs Jacobi preconditioning, three stiff FLD steps: grey 64^2 1962 -> 70, 128^2 3960 -> 71 iterations (flat with N), 6 Kramers groups 2401 -> 85; solutions within 3e-9, energy at round-off |
 | cyl_filter | the azimuthal filter keeps m <= m_crit exactly and leaves outer rings alone; the blob crossing the axis (32 x 64): 1254 -> 79 steps, centroid and field error unchanged to 1e-4, energy 3e-15, div B 2e-15 |
+| rlc_adjoint | r-z liner driven by an RLC bank: bank + resistor + grid energy 2e-16; d(yield proxy)/d(shape, V0, C, L, R) adjoint vs central differences 2e-10 to 9e-9 |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |

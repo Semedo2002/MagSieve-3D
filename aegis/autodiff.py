@@ -305,18 +305,29 @@ class DiffMHD:
     arrays (ghost cells included, as MHDSolver.U) followed by the two face arrays (Bf[0], Bf[1]), each a
     Tensor. drive(t, params) -> B_phi at the outer radial boundary (r = x_max) is optional (cylindrical
     only): the outer ghost cells then carry B_phi = B_d r_max / r with the pressure extrapolated, a magnetic
-    piston for a current I = 2 pi r_max B_d / mu0 flowing on the outer boundary."""
+    piston for a current I = 2 pi r_max B_d / mu0 flowing on the outer boundary.
 
-    def __init__(self, solver, drive=None, xp=None):
+    circuit(params) -> (V0, C, L, R) instead couples an RLC bank (cylindrical only): the state then ends with the
+    circuit current I, capacitor voltage V_C and resistor energy W_R (0-d Tensors; 0, V0, 0 at t = 0), the piston field is
+    B_phi(r_max) = I / (2 pi r_max) (mu0 = 1 in code units), and the load takes exactly the power P that enters
+    the grid through r = r_max in the step (all of its energy flux, RK-weighted, times 2 pi for the full circle).
+    The circuit is advanced by the implicit midpoint rule with the load as P / I_mid:
+        L (I1 - I0) / dt = V_mid - R I_mid - P / I_mid,   C (V1 - V0) / dt = -I_mid,
+    one scalar quadratic for I_mid, so the bank energy L I^2 / 2 + C V_C^2 / 2 falls by exactly (R I_mid^2 + P) dt:
+    bank + grid energy is conserved to round-off and the circuit parameters are differentiable like the rest."""
+
+    def __init__(self, solver, drive=None, xp=None, circuit=None):
         cfg = solver.cfg
         bad = [k for k in _SUPPORTED_OFF if getattr(cfg, k, 0)]
         if not solver.ct or not isinstance(solver.eos, (int, float)) or cfg.is_resistive() or cfg.fld \
                 or cfg.two_temp or solver.strength or bad:
             raise ValueError("DiffMHD covers ideal-gas ideal MHD with div_b='ct' only (found: "
                              + ", ".join(bad or ["resistivity / EOS / FLD / two-temperature / strength / GLM"]) + ")")
-        if drive is not None and not solver.cyl:
+        if (drive is not None or circuit is not None) and not solver.cyl:
             raise ValueError("a boundary drive needs cylindrical geometry")
-        self.s, self.cfg, self.drive = solver, cfg, drive
+        if drive is not None and circuit is not None:
+            raise ValueError("give drive or circuit, not both")
+        self.s, self.cfg, self.drive, self.circuit = solver, cfg, drive, circuit
         self.xp = xp or _xp(solver.U)
         x = self.xp
         self.g = float(cfg.gamma)
@@ -368,8 +379,8 @@ class DiffMHD:
         return cfg.cfl / inv if inv > 1e-14 else cfg.cfl * min(self.dx, self.dy)
 
     # ---------------- boundary conditions ----------------
-    def _bc(self, U, t, params):
-        """MHDSolver.apply_bc on a list of cell Tensors (functional)"""
+    def _bc(self, U, t, params, Bd=None):
+        """MHDSolver.apply_bc on a list of cell Tensors (functional); Bd: the piston field at r_max (circuit)"""
         ng, nx, ny = self.ng, self.nx, self.ny
         out = []
         for k, a in enumerate(U):
@@ -385,8 +396,8 @@ class DiffMHD:
                         src = a[ng + q, :]
                         a = assign(a, (ng - 1 - q, slice(None)), -src if k in (MX, MZ, BX, BZ) else src)
             out.append(a)
-        if self.drive is not None:                   # magnetic piston on the outer radial boundary
-            Bd = self.drive(t, params)
+        if self.drive is not None or Bd is not None:   # magnetic piston on the outer radial boundary
+            Bd = self.drive(t, params) if Bd is None else Bd
             rmax = self.cfg.x_max
             for i in range(ng):
                 row = self.Nx - ng + i
@@ -627,9 +638,10 @@ class DiffMHD:
         return (0.25 * (Ea_hi + Ea_lo + Eb_r + Eb_l) + 0.125 * hy * (db_lo - db_hi)
                 + 0.125 * hx * (da_l - da_r))
 
-    def rhs(self, U, Bf, t, params):
+    def rhs(self, U, Bf, t, params, Bd=None):
         """MHDSolver.compute_rhs (ideal MHD, CT): returns (cell rates on the interior, face rates, U with the
-        boundary conditions applied, faces with ghosts)"""
+        boundary conditions applied, faces with ghosts); sets self._P_in, the energy per time entering through
+        r = x_max (per radian)"""
         ng, nx, ny, xp = self.ng, self.nx, self.ny, self.xp
         inner = (slice(ng, ng + nx), slice(ng, ng + ny))
         U = list(U)
@@ -638,7 +650,7 @@ class DiffMHD:
             n = U[0].shape[a]
             avg = 0.5 * (f[0:n, :] + f[1:n + 1, :]) if a == 0 else 0.5 * (f[:, 0:n] + f[:, 1:n + 1])
             U[BX + a] = assign(U[BX + a], inner, avg[inner])
-        U = self._bc(U, t, params)
+        U = self._bc(U, t, params, Bd)
         Bf = self._ghost_faces(Bf, U)
         W = self._prim(U)
         WLx, WRx = self._muscl(W, 0)
@@ -647,6 +659,8 @@ class DiffMHD:
         WLy, WRy = self._muscl(W, 1)
         WLy[BY] = WRy[BY] = Bf[1][:, 2:self.Ny - 1]
         Fy = self._hlld(WLy, WRy, 1)
+        if self.cyl:                                 # inflow through the outer face (face nx of Fx), per radian
+            self._P_in = -tsum(Fx[EN][nx, ng:ng + ny]) * (float(self.rf[ng + nx]) * self.dy)
         R = [None] * NVAR
         for v in range(NVAR):
             if v in (BX, BY):
@@ -686,8 +700,18 @@ class DiffMHD:
         inner = (slice(ng, ng + nx), slice(ng, ng + ny))
         fx_in = (slice(2, nx + 3), slice(2, ny + 2))
         fy_in = (slice(2, nx + 2), slice(2, ny + 3))
-        U0, F0 = list(state[:NVAR]), list(state[NVAR:])
-        stage = lambda U, Bf, tt: self.rhs(U, Bf, tt, params)
+        U0, F0 = list(state[:NVAR]), list(state[NVAR:NVAR + 2])
+        Bd = None
+        if self.circuit is not None:
+            I0, V0c = state[NVAR + 2], state[NVAR + 3]
+            Bd = I0 * (1.0 / (2 * np.pi * self.cfg.x_max))
+        P = []
+
+        def stage(U, Bf, tt):
+            out = self.rhs(U, Bf, tt, params, Bd)
+            if self.circuit is not None:
+                P.append(self._P_in)
+            return out
 
         def bounds(U):
             rho = maximum(U[RHO], FLOOR_RHO)
@@ -700,7 +724,7 @@ class DiffMHD:
         R, dB, U0b, F0g = stage(U0, F0, t)
         U1 = [self._update(U0b[k], R[k], dt, inner) for k in range(NVAR)]
         F1 = [assign(f, sl, f[sl] + d * dt) for f, d, sl in zip(F0g, dB, (fx_in, fy_in))]
-        U1 = self._bc(bounds(U1), t + dt, params)
+        U1 = self._bc(bounds(U1), t + dt, params, Bd)
         # stage 2: U2 = 3/4 U0 + 1/4 (U1 + dt L(U1))
         R, dB, U1b, F1g = stage(U1, F1, t + dt)
         U2 = []
@@ -710,7 +734,7 @@ class DiffMHD:
         F2 = []
         for f0, f1, d, sl in zip(F0g, F1g, dB, (fx_in, fy_in)):
             F2.append(assign(f1, sl, 0.75 * f0[sl] + 0.25 * (f1[sl] + d * dt)))
-        U2 = self._bc(bounds(U2), t + 0.5 * dt, params)
+        U2 = self._bc(bounds(U2), t + 0.5 * dt, params, Bd)
         # stage 3: U = 1/3 U0 + 2/3 (U2 + dt L(U2))
         R, dB, U2b, F2g = stage(U2, F2, t + 0.5 * dt)
         U3 = []
@@ -726,9 +750,36 @@ class DiffMHD:
             n = U3[0].shape[a]
             avg = 0.5 * (f[0:n, :] + f[1:n + 1, :]) if a == 0 else 0.5 * (f[:, 0:n] + f[:, 1:n + 1])
             U3[BX + a] = assign(U3[BX + a], inner, avg[inner])
-        U3 = self._bc(U3, t + dt, params)
+        U3 = self._bc(U3, t + dt, params, Bd)
         F3 = self._ghost_faces(F3, U3)
-        return U3 + F3
+        if self.circuit is None:
+            return U3 + F3
+        # circuit: implicit midpoint with the load power the grid received (RK weights 1/6, 1/6, 2/3), full circle
+        _, C, L, Rr = self.circuit(params)
+        Pw = (P[0] + P[1] + 4.0 * P[2]) * (2 * np.pi / 6.0)
+        a = 2.0 * L / dt + dt / (2.0 * C) + Rr
+        b = -(2.0 * L * I0 / dt + V0c)
+        sgn = 1.0 if float(val(b)) <= 0 else -1.0
+        Im = (-b + sgn * sqrt(maximum(b * b - 4.0 * a * Pw, 0.0))) / (2.0 * a)
+        I1 = 2.0 * Im - I0
+        V1 = V0c - dt * Im / C
+        return U3 + F3 + [I1, V1, state[NVAR + 4] + Rr * Im * Im * dt]
+
+    def init_state(self, init, params):
+        """init(params) plus the circuit state (I = 0, V_C = V0) when a circuit is coupled"""
+        st = list(init(params))
+        if self.circuit is not None:
+            V0 = self.circuit(params)[0]
+            z = const(self.xp.zeros(()))
+            st += [z + 0.0 * V0, V0 + z, z + 0.0]
+        return st
+
+    def circuit_energy(self, state, params):
+        """L I^2 / 2 + C V_C^2 / 2 of the bank, plus the energy the circuit resistor has dissipated (the last
+        state entry): with the grid energy times 2 pi this is constant to round-off"""
+        _, C, L, _ = self.circuit(params)
+        I, V = state[NVAR + 2], state[NVAR + 3]
+        return float(val(0.5 * L * I * I + 0.5 * C * V * V + state[NVAR + 4]))
 
     # ---------------- forward run and adjoint ----------------
     def run(self, init, params, t_end=None, n_steps=None, dts=None, step_objective=None, final_objective=None,
@@ -737,7 +788,7 @@ class DiffMHD:
         Returns (J, info) with info["dts"] the step sequence (reuse it for consistent finite differences) and,
         if keep, info["states"] the raw state after every step."""
         p = const(params) if not isinstance(params, Tensor) else const(params.v)
-        st = init(p)
+        st = self.init_state(init, p)
         states = [self.raw(st)] if keep else None
         J = 0.0
         t, k, used = 0.0, 0, []
@@ -799,7 +850,7 @@ class DiffMHD:
         # through the initial state
         with record():
             p = leaf(params)
-            backward(list(init(p)), lam)
+            backward(self.init_state(init, p), lam)
         if p.g is not None:
             gp += p.g
         return J, gp, info
@@ -829,6 +880,21 @@ def cells_to_state(sim, W_fn, params, Bf=None):
 def interior(sim, a):
     ng = sim.ng
     return a[ng:ng + sim.nx, ng:ng + sim.ny]
+
+
+def yield_proxy(sim, state, tracer_max=0.5):
+    """a smooth fusion-yield stand-in for objectives: sum over the fuel of rho^2 theta^4 dV (DT reactivity rises
+    roughly as T^4 at a few keV), fuel weight max(1 - C / tracer_max, 0) from the mass-fraction tracer C. Not a
+    calibrated yield: no units, cross sections or burn"""
+    I = (slice(sim.ng, sim.ng + sim.nx), slice(sim.ng, sim.ng + sim.ny))
+    rho = maximum(state[RHO][I], FLOOR_RHO)
+    E, M = state[EN][I], [state[k][I] for k in (MX, MY, MZ)]
+    Bs = state[BX][I] * state[BX][I] + state[BY][I] * state[BY][I] + state[BZ][I] * state[BZ][I]
+    p = maximum((sim.g - 1.0) * (E - 0.5 * (M[0] * M[0] + M[1] * M[1] + M[2] * M[2]) / rho - 0.5 * Bs), FLOOR_PR)
+    th = p / rho
+    C = minimum(maximum(state[RHOC][I] / rho, 0.0), 1.0)
+    fuel = maximum(1.0 - C * (1.0 / tracer_max), 0.0)
+    return tsum(fuel * rho * rho * th * th * th * th * sim.dV)
 
 
 def total_energy(sim, state):

@@ -12,12 +12,18 @@ adjoint derivative against a central finite difference before it starts.
 With --drive the liner also gets a magnetic piston (B_phi on the outer boundary, current amplitude I as a
 parameter) and the script reports dB_peak/dI alongside the shape derivatives.
 
+With --circuit the liner starts at rest and is driven by an RLC bank through that piston (DiffMHD(circuit=...)):
+the bank energy is fixed, the capacitance C is a design variable (ln C, with V0 = sqrt(2 E / C), so it sets the
+pulse rise time ~ (pi / 2) sqrt(L C)), and shape and pulse are optimised together from one adjoint pass per
+iteration. The start also reports the derivatives of a yield proxy with respect to V0, C, L and R.
+
 Dimensionless units (liner density 1, implosion speed 1, R0 = 1). Axisymmetric: the "shape" is R(z); a
 fully 3D liner is outside the differentiable twin's scope (2D only).
 
     python examples/optimize_liner_shape.py                     # 3 modes, 12 iterations
     python examples/optimize_liner_shape.py --quick             # small grid smoke run
     python examples/optimize_liner_shape.py --drive 0.3 --iters 0   # gradients only, with a drive
+    python examples/optimize_liner_shape.py --circuit               # joint shape + RLC pulse optimisation
 """
 import os
 import sys
@@ -46,7 +52,10 @@ def build(a):
     drive = None
     if a.drive:                                       # B_phi(t) = I r_max-normalised, ramped over t_ramp
         drive = lambda t, p: p[-1] * (1.0 - np.exp(-t / 0.1))
-    sim = ad.DiffMHD(s, drive=drive, xp=np)
+    circuit = None
+    if a.circuit:                                     # RLC bank of fixed energy; design variable ln C (last entry)
+        circuit = lambda p: (ad.sqrt(2.0 * a.bank_energy * ad.exp(-p[-1])), ad.exp(p[-1]), a.l_ext, a.r_ext)
+    sim = ad.DiffMHD(s, drive=drive, xp=np, circuit=circuit)
     r = s.rc.get()[:, None] * np.ones((1, s.ny_tot))
     z = np.ones((s.nx_tot, 1)) * s.y.get()[None, :]
     dV = r * cfg.dx * cfg.dy
@@ -60,7 +69,7 @@ def build(a):
         v_l = prof * ad.const(-(a.r0 + 0.5 * a.dr) / np.maximum(r, 1e-3))     # v ~ 1/r, speed 1 at mid-wall
         return prof, rho_l, v_l
 
-    zero = np.zeros(K + (1 if a.drive else 0))
+    zero = np.zeros(K + (1 if (a.drive or a.circuit) else 0))
     _, rho0, v0 = liner(ad.const(zero))
     sl = (slice(2, -2), slice(2, -2))
     M0 = float(np.sum((rho0.v * dV)[sl]))
@@ -70,6 +79,8 @@ def build(a):
         prof, rho_l, v_l = liner(p)
         M = ad.tsum(ad.getitem(rho_l * ad.const(dV), sl))
         rho_l = rho_l * (M0 / M)                      # fixed liner mass
+        if a.circuit:                                 # at rest: the bank drives it
+            return [a.rho_gas + rho_l, 0.0, 0.0, 0.0, 0.0, a.b0, 0.0, a.p0, 0.0, prof, 0.0]
         KE = ad.tsum(ad.getitem(0.5 * rho_l * v_l * v_l * ad.const(dV), sl))
         v = v_l * ad.sqrt(KE0 / KE)                   # fixed kinetic energy
         return [a.rho_gas + rho_l, v, 0.0, 0.0, 0.0, a.b0, 0.0, a.p0, 0.0, prof, 0.0]
@@ -119,25 +130,34 @@ def main():
     ap.add_argument("--iters", type=int, default=12)
     ap.add_argument("--lr", type=float, default=0.03)
     ap.add_argument("--drive", type=float, default=0.0, help="magnetic piston amplitude (B_phi at r_max)")
+    ap.add_argument("--circuit", action="store_true", help="drive by an RLC bank, co-optimise its capacitance")
+    ap.add_argument("--bank-energy", type=float, default=6.0, help="stored bank energy (code units, full circle)")
+    ap.add_argument("--c0", type=float, default=0.6, help="starting capacitance")
+    ap.add_argument("--l-ext", type=float, default=0.5, help="external inductance")
+    ap.add_argument("--r-ext", type=float, default=0.02, help="circuit resistance")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--out", default=os.path.join(ROOT, "results", "liner_optimization"))
     a = ap.parse_args()
+    if a.circuit and a.t_end == 1.1:
+        a.t_end = 1.8
     if a.quick:
-        a.nr, a.nz, a.iters, a.t_end = 28, 16, 2, 0.6
+        a.nr, a.nz, a.iters, a.t_end = 28, 16, 2, (1.6 if a.circuit else 0.6)
     os.makedirs(a.out, exist_ok=True)
     s, sim, init, step_obj, liner, geo = build(a)
     K = a.modes
     # start off the z-symmetric design: there the z slopes vanish and the van Leer limiter (and the corner EMF
     # upwinding) is not differentiable, so one-sided derivatives differ
-    p = np.full(K + (1 if a.drive else 0), a.a_start)
+    p = np.full(K + (1 if (a.drive or a.circuit) else 0), a.a_start)
     if a.drive:
         p[-1] = a.drive
+    if a.circuit:
+        p[-1] = np.log(a.c0)
 
     t0 = time.time()
     B, g, info = evaluate(sim, init, step_obj, p, a)
     dts = info["dts"]
     print(f"start: B_peak = {B:.6g} (B0 = {a.b0}), {len(dts)} steps, forward + adjoint {time.time() - t0:.1f}s")
-    names = [f"a{k + 1}" for k in range(K)] + (["I_drive"] if a.drive else [])
+    names = [f"a{k + 1}" for k in range(K)] + (["I_drive"] if a.drive else []) + (["lnC"] if a.circuit else [])
     for n, v in zip(names, g):
         print(f"  dB_peak/d{n} = {v:+.6e}")
     # finite-difference check of the first derivative, same step sequence. The scheme is piecewise smooth with
@@ -153,6 +173,14 @@ def main():
     fd = (peak(Jp, info["t"], a.q) - peak(Jm, info["t"], a.q)) / (2 * h)
     print(f"  check d/d{names[k]}: adjoint {g[k]:+.8e}, finite difference {fd:+.8e} (rel {abs(fd - g[k]) / abs(g[k]):.1e})")
 
+    if a.circuit:                                     # yield-proxy derivatives with respect to the circuit inputs
+        yobj = lambda st, t, q: ad.yield_proxy(sim, st)
+        sim_v = ad.DiffMHD(s, xp=np, circuit=lambda q: (q[K], q[K + 1], q[K + 2], q[K + 3]))
+        C0 = np.exp(p[-1])
+        pv = np.concatenate([p[:K], [np.sqrt(2 * a.bank_energy / C0), C0, a.l_ext, a.r_ext]])
+        Yv, gy, _ = sim_v.value_and_grad(init, pv, dts=dts, step_objective=yobj)
+        print(f"  yield proxy {Yv:.4e}: d/dV0 {gy[K]:+.4e}, d/dC {gy[K + 1]:+.4e}, d/dL {gy[K + 2]:+.4e}, "
+              f"d/dR {gy[K + 3]:+.4e}")
     hist = [dict(iter=0, B_peak=B, params=p.tolist(), grad=g.tolist())]
     m, v = np.zeros_like(p), np.zeros_like(p)
     best = (B, p.copy())
@@ -166,17 +194,20 @@ def main():
         step = lr * (m / (1 - 0.9**it)) / (np.sqrt(v / (1 - 0.999**it)) + 1e-12)
         p = p + step
         p[:K] = np.clip(p[:K], -a.a_max, a.a_max)
+        if a.circuit:
+            p[-1] = np.clip(p[-1], np.log(0.05), np.log(5.0))
         t1 = time.time()
         B, g, info = evaluate(sim, init, step_obj, p, a)
         hist.append(dict(iter=it, B_peak=B, params=p.tolist(), grad=g.tolist()))
         if B > best[0]:
             best = (B, p.copy())
-        print(f"iter {it:2d}: B_peak = {B:.6g}  a = {np.array2string(p[:K], precision=4)}  ({time.time() - t1:.0f}s)")
+        extra = f"  C = {np.exp(p[-1]):.4f}" if a.circuit else ""
+        print(f"iter {it:2d}: B_peak = {B:.6g}  a = {np.array2string(p[:K], precision=4)}{extra}  ({time.time() - t1:.0f}s)")
 
     summary = dict(B0=a.b0, B_peak_start=hist[0]["B_peak"], B_peak_best=best[0], params_best=best[1].tolist(),
                    gain=best[0] / hist[0]["B_peak"], fd_check=dict(param=names[0], adjoint=hist[0]["grad"][0], fd=fd),
                    history=hist, args=vars(a))
-    with open(os.path.join(a.out, "summary.json"), "w") as f:
+    with open(os.path.join(a.out, "summary_circuit.json" if a.circuit else "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
     print(f"best B_peak {best[0]:.6g} vs start {hist[0]['B_peak']:.6g} (x{summary['gain']:.3f})")
     plot(a, sim, init, liner, geo, hist, best[1])
@@ -188,6 +219,8 @@ def plot(a, sim, init, liner, geo, hist, p_best):
     import matplotlib.pyplot as plt
     p0 = np.full_like(p_best, a.a_start)
     p0[a.modes:] = p_best[a.modes:]
+    if a.circuit:
+        p0[-1] = np.log(a.c0)
     fig, ax = plt.subplots(1, 3, figsize=(14, 4.2))
     z = np.linspace(0, a.lz, 200)
     for p, lab, c in ((p0, "start", "0.5"), (p_best, "optimised", "C3")):
@@ -202,7 +235,7 @@ def plot(a, sim, init, liner, geo, hist, p_best):
     ax[1].set_xlabel("iteration"); ax[1].set_ylabel("B_peak / B0"); ax[1].set_title("objective")
     # B_z history in the window for both designs
     for p, lab, c in ((p0, "start", "0.5"), (p_best, "optimised", "C3")):
-        st = init(ad.const(p))
+        st = sim.init_state(init, ad.const(p))
         t, ts, bs = 0.0, [], []
         while t < a.t_end - 1e-12:
             dt = min(sim.compute_dt(st), a.t_end - t)
@@ -214,8 +247,9 @@ def plot(a, sim, init, liner, geo, hist, p_best):
     ax[2].set_xlabel("t"); ax[2].set_ylabel("B_z / B0 in the window"); ax[2].set_title("flux compression")
     ax[2].legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(os.path.join(a.out, "liner_optimization.png"), dpi=130)
-    print(f"wrote {os.path.join(a.out, 'liner_optimization.png')}")
+    name = "liner_circuit_optimization.png" if a.circuit else "liner_optimization.png"
+    fig.savefig(os.path.join(a.out, name), dpi=130)
+    print(f"wrote {os.path.join(a.out, name)}")
 
 
 if __name__ == "__main__":
