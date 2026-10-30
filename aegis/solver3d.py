@@ -396,6 +396,8 @@ class MHDSolver3D:
         h3 = (cfg.dx, cfg.dy, cfg.dz)
         h = min(h3)
         hy = cfg.dy * xp.maximum(self.rc, 0.5 * cfg.dx)[:, None, None] if self.cyl else cfg.dy
+        if self.cyl and cfg.cyl_filter:              # filtered rings resolve only m <= m_crit: spacing pi r / m_crit
+            hy = xp.maximum(hy, xp.asarray(self._az_setup()["h_cell"])[:, None, None])
         inv = max(float(xp.max(xp.maximum(xp.maximum(sx / cfg.dx, sy / hy), sz / cfg.dz))), self._ch / h)
         dt = cfg.cfl / inv
         if cfg.is_resistive():
@@ -409,6 +411,65 @@ class MHDSolver3D:
             if vN > 0:
                 dt = min(dt, cfg.cfl / vN)
         return dt
+
+    # ---------------- near-axis azimuthal Fourier filter (3D cylindrical) ----------------
+    # On a ring of radius r the azimuthal spacing r dtheta shrinks toward the axis and sets the explicit time step.
+    # With cyl_filter, rings with r dtheta below cyl_filter_frac dr keep only the azimuthal modes
+    # m <= m_crit(r) = max(cyl_filter_mkeep, floor(pi r / (cyl_filter_frac dr))) in their tendencies: the RK rates
+    # of the cell variables and the edge EMFs. Their shortest resolved half-wavelength is then pi r / m_crit, which
+    # the time step uses in place of r dtheta (about dr, as in r-z). Mode m = 0 is untouched, so ring sums (mass,
+    # momentum, energy on equal-volume cells) are unchanged, and B still follows from -curl E, so div B stays at
+    # round-off; the low modes m <= cyl_filter_mkeep are never filtered.
+    def _az_setup(self):
+        if getattr(self, "_az", None) is not None:
+            return self._az
+        cfg = self.cfg
+        nth, dr = cfg.ny, cfg.dx
+        get = lambda a: a.get() if hasattr(a, "get") else np.asarray(a)
+
+        def mcrit(r):
+            m = np.floor(np.pi * np.maximum(r, 0.0) / (cfg.cyl_filter_frac * dr)).astype(int)
+            return np.clip(np.maximum(m, cfg.cyl_filter_mkeep), 0, nth // 2)
+        rc, rf = get(self.rc), get(self.rf)
+        mc, mf = mcrit(rc), mcrit(rf)
+        k = np.arange(nth // 2 + 1)
+        az = dict(mc=mc, mf=mf, rows_c=np.nonzero(mc < nth // 2)[0], rows_f=np.nonzero(mf < nth // 2)[0],
+                  mask_c=xp.asarray((k[None, :] <= mc[:, None]).astype(float)),
+                  mask_f=xp.asarray((k[None, :] <= mf[:, None]).astype(float)),
+                  h_cell=np.where(mc < nth // 2, np.pi * np.maximum(rc, 0.5 * dr) / np.maximum(mc, 1), 0.0))
+        self._az = az
+        return az
+
+    def _az_apply(self, A, rows, mask, th):
+        """keep modes <= m_crit along axis 1 of A[rows] over the nth entries th (a slice), in place"""
+        if len(rows) == 0:
+            return
+        nth = self.cfg.ny
+        r = xp.asarray(rows)
+        sub = A[r][:, th]
+        f = xp.fft.rfft(sub, axis=1) * mask[r][:, :, None]
+        A[r, th] = xp.fft.irfft(f, n=nth, axis=1)
+
+    def _az_filter_rates(self, out):
+        az, ng, cfg = self._az_setup(), self.ng, self.cfg
+        rows = [i for i in az["rows_c"] if ng <= i < ng + cfg.nx]
+        th = slice(ng, ng + cfg.ny)
+        for v in range(out.shape[0]):
+            if BX <= v <= BZ and self.ct:
+                continue
+            self._az_apply(out[v], rows, az["mask_c"], th)
+
+    def _az_filter_emf(self, E):
+        """E[0] (E_r): radial cells x theta faces; E[1] (E_theta): radial faces x theta cells; E[2] (E_z): radial
+        faces x theta faces (theta face nth repeats face 0)"""
+        az, ng, nth = self._az_setup(), self.ng, self.cfg.ny
+        self._az_apply(E[0], list(az["rows_c"]), az["mask_c"], slice(0, nth))
+        E[0][:, nth] = E[0][:, 0]
+        rows_f = [i - ng for i in az["rows_f"] if ng <= i <= ng + self.cfg.nx]   # face index k = rf[ng + k]
+        mask_f = az["mask_f"][ng:]
+        self._az_apply(E[2], rows_f, mask_f, slice(0, nth))
+        E[2][:, nth] = E[2][:, 0]
+        self._az_apply(E[1], rows_f, mask_f, slice(ng, ng + nth))
 
     def _shear(self, W, S=None):
         S = self.S if S is None else S
@@ -535,6 +596,8 @@ class MHDSolver3D:
                                                 Bf[a].transpose(order), Bf[b].transpose(order), n[a], n[b])
             E.append(Ec.transpose(tuple(int(k) for k in np.argsort(order))))   # back to (x, y, z)
         E = self._emf_hook(E)
+        if self.cyl and cfg.cyl_filter:              # near-axis azimuthal filter of the edge EMFs (div B kept)
+            self._az_filter_emf(E)
         if self.cyl and self.axis:
             E[1][0] = 0.0                            # E_theta = 0 on the axis
             # E_z on the axis is one value: the theta average of the edge EMFs there (otherwise the axis cells'
@@ -704,6 +767,8 @@ class MHDSolver3D:
         if self.ct:
             out[BX:BZ + 1] = 0.0                     # B lives on the faces
             self._ct_face_rates(Fs, W, Bf, dBf, eta, vN)
+        if self.cyl and cfg.cyl_filter:
+            self._az_filter_rates(out)
         if self.walls is not None:
             self.walls.mask_rates(out)
         return out

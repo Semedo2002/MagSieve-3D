@@ -2342,14 +2342,14 @@ def cylindrical3d_test():
     return ok
 
 
-def _cyl3d_blob(Nr, Nth, T=0.5, U=1.0, B0=0.5):
+def _cyl3d_blob(Nr, Nth, T=0.5, U=1.0, B0=0.5, cyl_filter=False):
     """the m = 1 blob of cylindrical3d_test: returns centroid, field deviation, energy error, max div B"""
     from aegis.solver3d import MHDSolver3D
     from aegis import ct as _ct
     c = Config(nx=Nr, ny=Nth, nz=4, x_min=0.0, x_max=1.0, y_min=0.0, y_max=2 * np.pi, z_min=0.0, z_max=4.0 / Nr,
                cfl=0.3, gamma=5 / 3, mach=1.0, B_transverse=1.0, geometry="cylindrical", div_b="ct",
                bc_x_type="extrapolation", bc_y_type="periodic", powell_source=False, diag_interval=10**9,
-               snapshot_times=[], t_end=T)
+               snapshot_times=[], t_end=T, cyl_filter=cyl_filter)
     with contextlib.redirect_stdout(io.StringIO()):
         s = MHDSolver3D(c)
     ng = s.ng
@@ -2389,7 +2389,7 @@ def _cyl3d_blob(Nr, Nth, T=0.5, U=1.0, B0=0.5):
     Bx = Wn[iBX][I] * np.cos(thi) - Wn[iBY][I] * np.sin(thi)
     By = Wn[iBX][I] * np.sin(thi) + Wn[iBY][I] * np.cos(thi)
     return {"xc": xc, "xc_exact": -0.3 + U * T, "dB": max(float(np.max(np.abs(Bx - B0))), float(np.max(np.abs(By)))) / B0,
-            "dE": abs(s.total_energy() - E0 - float(s._acc_boundary)) / E0, "div": div}
+            "dE": abs(s.total_energy() - E0 - float(s._acc_boundary)) / E0, "div": div, "steps": s.step}
 
 
 def multigroup_test():
@@ -3192,6 +3192,48 @@ def gmg_test():
     return ok
 
 
+def cyl_filter_test():
+    """Near-axis azimuthal Fourier filter in 3D cylindrical geometry (solver3d, cyl_filter). (1) The filter keeps
+    modes m <= m_crit(r) exactly (m <= 2 everywhere) and removes the rest on the filtered rings, leaving outer rings
+    alone. (2) The blob carried across the axis by a uniform flow (cylindrical3d_test): with the filter the time
+    step is set by dr as in r-z (many times fewer steps), the centroid and field error agree with the unfiltered
+    run, energy and div B stay at round-off."""
+    from aegis.solver3d import MHDSolver3D
+    print("\n--- 3D cylindrical: near-axis azimuthal filter ---"); sys.stdout.flush()
+    ok = True
+    c = Config(nx=32, ny=64, nz=4, x_min=0.0, x_max=1.0, y_min=0.0, y_max=2 * np.pi, z_min=0.0, z_max=0.125, cfl=0.3,
+               gamma=5 / 3, geometry="cylindrical", div_b="ct", bc_x_type="extrapolation", bc_y_type="periodic",
+               powell_source=False, diag_interval=10**9, snapshot_times=[], cyl_filter=True)
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver3D(c)
+    az = s._az_setup()
+    th = (np.arange(64) + 0.5) * 2 * np.pi / 64
+    A = np.zeros((s.nx_tot, 64 + 2 * s.ng, 3))
+    low = 1.0 + 0.3 * np.cos(th) + 0.2 * np.sin(2 * th)
+    A[:, s.ng:-s.ng, :] = (low + 0.1 * np.cos(10 * th))[None, :, None]
+    Ad = xp.asarray(A)
+    rows = [i for i in az["rows_c"] if s.ng <= i < s.ng + 32]
+    s._az_apply(Ad, rows, az["mask_c"], slice(s.ng, s.ng + 64))
+    An = to_numpy(Ad)[:, s.ng:-s.ng, 0]
+    inner = [i for i in rows if az["mc"][i] < 10]
+    outer = [i for i in range(s.ng, s.ng + 32) if i not in rows]
+    e_in = max(float(np.max(np.abs(An[i] - low))) for i in inner)
+    e_out = max(float(np.max(np.abs(An[i] - low - 0.1 * np.cos(10 * th)))) for i in outer)
+    good = e_in < 1e-13 and e_out < 1e-13 and len(inner) > 0 and len(outer) > 0
+    ok = ok and good
+    print(f"  filter: {len(rows)} of 32 rings filtered (r dtheta < dr); m = 10 removed on {len(inner)} inner rings, "
+          f"m <= 2 kept to {e_in:.0e}; outer rings untouched ({e_out:.0e})  [{'PASS' if good else 'FAIL'}]")
+    ra, rb = (_cyl3d_blob(32, 64, T=0.25, cyl_filter=f) for f in (False, True))
+    na, nb = ra["steps"], rb["steps"]
+    good = (na >= 5 * nb and abs(ra["xc"] - rb["xc"]) < 2e-3 and abs(ra["dB"] - rb["dB"]) < 2e-3
+            and rb["dE"] < 1e-13 and rb["div"] < 1e-12)
+    ok = ok and good
+    print(f"  blob across the axis (32 x 64, t = 0.25): {na} steps without the filter, {nb} with it (x{na / nb:.0f}); "
+          f"centroid {ra['xc']:.4f} vs {rb['xc']:.4f}, field error {ra['dB']:.4f} vs {rb['dB']:.4f}; with the filter "
+          f"energy {rb['dE']:.0e}, div B {rb['div']:.0e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3535,6 +3577,7 @@ VERIFICATION_TESTS = {
     "cad": cad_test,
     "monitor": monitor_test,
     "gmg": gmg_test,
+    "cyl_filter": cyl_filter_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

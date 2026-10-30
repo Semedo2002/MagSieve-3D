@@ -116,8 +116,19 @@ The 3D solver runs `geometry="cylindrical"` in (r, theta, z), scale factors (1, 
   single-valued there), and the axis cell's cell-centred B_r keeps all the m >= 1 part of the outer face value;
 - without theta variation it reproduces the 2D r-z solver to 1.6e-14, and an m = 1 blob carried onto the axis
   along a uniform field converges with resolution (`--test cylindrical3d`);
-- it covers ideal MHD with the EOS options and the tracer; the other 3D physics modules are Cartesian, and the
-  azimuthal CFL limit at the axis (r dtheta) sets the time step.
+- it covers ideal MHD with the EOS options and the tracer; the other 3D physics modules are Cartesian;
+- the azimuthal spacing r dtheta shrinks toward the axis and would set the time step. `cyl_filter=True` filters
+  the rings with r dtheta < `cyl_filter_frac` dr:
+  - their tendencies (RK rates of the cell variables and the edge EMFs) keep only the azimuthal Fourier modes
+    m <= m_crit(r) = max(`cyl_filter_mkeep`, floor(pi r / dr)), with `cyl_filter_mkeep` = 2 by default so
+    m = 0, 1, 2 are never touched;
+  - the time step then uses the resolved spacing pi r / m_crit, about dr as in r-z;
+  - m = 0 is untouched, so ring sums (mass, energy) are unchanged, and B still follows from -curl E, so div B
+    stays at round-off;
+  - the blob of `--test cylindrical3d` crosses the axis in 16x fewer steps with the same centroid and field error
+    (`--test cyl_filter`);
+  - the cost is that structure finer than m_crit is removed near the axis; it uses CuPy's FFT (cuFFT; with the
+    pip CUDA wheels, `pip install aegis-mhd[fft]`).
 
 ### Thermal conduction
 
@@ -717,6 +728,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | cad | STL round trip; sphere volume fractions converge with the ray sampling (6e-4 to 2.5e-5), wall area vectors close; STEP cylinder through gmsh / OpenCASCADE reads back its volume; ring wall in 2D: rest exact with B_z, a sealed blast keeps cavity mass, total mass and energy to ~1e-14; Mach 2 shock reflection off walls inclined at 45 and 30 degrees within 0.4% of the exact pressure; 3D sphere wall: rest to 2e-16, mass and energy 1.6e-15, div B 2e-15 |
 | monitor | synthetic interface: m = 3 growth rate recovered exactly, flux loss flagged; 2D liner implosion: an undeclared 3% m = 3 drive asymmetry is reported as an unexpected mode (growth 5.3 per unit time), none without it; the server serves the WebGPU page, frames (slice, contours, monitor data), the SSE stream and its status |
 | gmg | multigrid vs Jacobi preconditioning, three stiff FLD steps: grey 64^2 1962 -> 70, 128^2 3960 -> 71 iterations (flat with N), 6 Kramers groups 2401 -> 85; solutions within 3e-9, energy at round-off |
+| cyl_filter | the azimuthal filter keeps m <= m_crit exactly and leaves outer rings alone; the blob crossing the axis (32 x 64): 1254 -> 79 steps, centroid and field error unchanged to 1e-4, energy 3e-15, div B 2e-15 |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |
@@ -961,7 +973,7 @@ these parameters. Each case writes `diagnostics.csv`, `summary.json`, `frames.np
 
 - Ideal gas (γ = 5/3) by default; liner strength is elastic-perfectly plastic (constant G and Y, no work or rate hardening, no thermal softening) with a threshold spall model, and there is no phase change. The stiffened-gas fit to a Hugoniot is exact at one particle velocity only. Mixed cells use the isobaric mixture rule, which is exact for stiffened gases and approximate for Mie-Gruneisen. Viscosity is the Braginskii parallel part plus the gyroviscous (FLR) stress, without the dissipative perpendicular terms (eta_1, eta_2), and gyroviscosity is 2D Cartesian only; thermal conduction is electron (Braginskii k_perp fit, no Righi-Leduc term) and, in two-temperature mode, ion (1/(1 + x_i^2) cross-field form), the liner is treated as an isothermal heat sink, and at grid-oblique field angles the limited scheme adds numerical cross-field diffusion that falls at second order with resolution. Radiation is optically thin bremsstrahlung or grey flux-limited diffusion (one group, no radiation pressure, power-law opacities unless a table is supplied, single gas temperature), coupled by first-order operator splitting; in mixed cells the temperature is taken from the mixture pressure and density.
 - The Hall term and anisotropic resistivity are 2D Cartesian only (not r-z or 3D), without the electron pressure gradient term of Ohm's law; the cross-field resistivity uses the strongly magnetized ratio wherever B is nonzero. The `material` model takes eta from the passive tracer, so it is only as sharp as the numerically smeared liner/fuel interface; the `spitzer` model needs its temperature floor and cap, and in the cold, dense default of the examples it sits at the cap.
-- Constrained transport keeps div B at round-off; 3D cylindrical (r, theta, z) covers ideal MHD only (resistive, transport, strength and radiation are Cartesian in 3D) and has no axis-specific time-step relief (the r dtheta spacing of the axis cells limits dt), and the Cartesian 2D MTIF examples are still cross-sections with a four-fold grid imprint (use `examples/maglif_rz.py` for an axisymmetric implosion).
+- Constrained transport keeps div B at round-off; 3D cylindrical (r, theta, z) covers ideal MHD only (resistive, transport, strength and radiation are Cartesian in 3D) and the near-axis time step needs the azimuthal filter (`cyl_filter`), which removes azimuthal structure finer than about dr on the inner rings, and the Cartesian 2D MTIF examples are still cross-sections with a four-fold grid imprint (use `examples/maglif_rz.py` for an axisymmetric implosion).
 - Pressure balance of the striped field holds exactly in the initial data but only to second order in the discrete scheme.
 - Shock-parallel stripes are restricted to the fast-shock regime, B0 < 6.55 sqrt(p_bar) at Mach 10; switch-on shocks are not modelled.
 - Most sweeps use one resolution and one realisation. The lock boundary was rechecked at 2x and 4x resolution (`experiments/convergence_lock.py`): interface roughness converges, mixing-layer enstrophy of the hydrodynamic reference does not (no physical viscosity), so enstrophy ratios against hydro are not grid-converged.

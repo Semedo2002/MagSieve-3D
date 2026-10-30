@@ -116,6 +116,11 @@ class PhysicsConfig:
     # y the axial coordinate z, and the out-of-plane components are -v_phi, -B_phi. Requires CT and an
     # extrapolation (outflow) boundary at r = x_max.
     geometry: str = "cartesian"
+    # 3D cylindrical (r, theta, z): near-axis azimuthal Fourier filter of the tendencies (solver3d), rings with
+    # r dtheta < cyl_filter_frac dr keep modes m <= max(cyl_filter_mkeep, floor(pi r / (cyl_filter_frac dr)))
+    cyl_filter: bool = False
+    cyl_filter_mkeep: int = 2
+    cyl_filter_frac: float = 1.0
     glm_ch: float = 0.0
     # GLM damping, psi *= exp(-glm_alpha * ch * dt / h). Values in [0, 1] keep the
     # cleaning transport-dominated (Mignone & Tzeferacos 2010); 1.5 measured worse.
@@ -325,6 +330,8 @@ class PhysicsConfig:
             raise ValueError("fld_groups > 0 needs fld=True; fld_mg_opacity is grey or kramers")
         if self.fld_group_edges and len(self.fld_group_edges) != self.fld_groups - 1:
             raise ValueError("fld_group_edges holds the fld_groups - 1 inner edges")
+        if self.cyl_filter and (self.geometry != "cylindrical" or self.cyl_filter_mkeep < 1 or self.cyl_filter_frac <= 0):
+            raise ValueError("cyl_filter needs cylindrical geometry (3D), cyl_filter_mkeep >= 1, cyl_filter_frac > 0")
         if self.fld_precond not in ("jacobi", "mg"):
             raise ValueError(f"fld_precond must be jacobi or mg, not {self.fld_precond!r}")
         if self.fld_fno_model and (self.fld_groups < 1 or self.fld_fno_tol <= 0):
