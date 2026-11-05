@@ -280,7 +280,8 @@ multigrid V-cycle (`aegis/radiation_gmg.py`), on the GPU arrays:
   - Jacobi: grey 1962 / 3960 / 8010 at 64^2 / 128^2 / 256^2;
   - multigrid: 70 / 71 / 71 (O(N) work);
   - 6-group Kramers: 2401 / 5096 / 10985 against 85 / 103 / 122;
-  - solutions agree to the tolerance, and energy stays at round-off (the conservative update is unchanged).
+  - the two solutions differ by 7e-10 to 1e-9 (grey) and 3e-9 to 2e-7 (6 groups, growing with the grid; the solver
+    tolerance is on the residual, 1e-10), and energy stays at round-off (the conservative update is unchanged).
 - **Wall time (P1000, idle):** the V-cycle launches many small kernels, so it pays off with size:
   - grey: 0.6x / 0.8x / 1.4x the Jacobi speed at 64^2 / 128^2 / 256^2;
   - 6 groups: 1.6x / 2.5x / 3.6x.
@@ -490,7 +491,10 @@ discrete adjoint (reverse mode):
     (`--test rlc_adjoint`);
   - `yield_proxy` is a smooth fusion-yield stand-in (sum of rho^2 theta^4 over the fuel), not a calibrated yield;
   - `examples/optimize_liner_shape.py --circuit` optimises the liner shape and the bank capacitance (pulse
-    timing, at fixed stored energy) together.
+    timing, at fixed stored energy) together. Default run (56 x 32, 12 iterations, ~40 min on one CPU core):
+    - the peak window field goes from 17.3 B0 to 24.2 B0 (smooth time maximum; instantaneous 25 -> 33 B0);
+    - C goes from 0.60 to 0.515 together with an axial reshaping of the liner;
+    - adjoint vs central difference: 1e-7 (`results/liner_optimization/`).
 - **Scope:** ideal gas, ideal MHD with `div_b='ct'`, 2D. It refuses resistivity, EOS tables, transport,
   radiation, strength and 3D.
 - **Inverse design:** `examples/optimize_liner_shape.py` optimises the axial shape R(z) = R0 + sum a_k cos(2 pi k z / L)
