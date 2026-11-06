@@ -1,0 +1,165 @@
+# CHIANTI database (Dere et al. 1997; Del Zanna et al. 2021), .drparams of Al ions
+# https://soho.nascom.nasa.gov/solarsoft/packages/chianti/dbase/al/ retrieved 2026-11-06; each block keeps its own references
+### al_2
+    1
+   13    2  4.9370e+03  1.3950e+04  8.2580e+04  1.1030e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   13    2  4.4950e-07  2.6100e-06  3.8160e-03  5.8030e-04  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  al_2.rrparams
+%parameters for dielectronic recombination rate coefficients
+Determined from the coefficients listed at:
+   http://amdpp.phys.strath.ac.uk/tamoc/DATA/RR/
+These calculations have been performed by a collaboration of researchers at:
+    Auburn University, Rollins College, and the University of Strathclyde.
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  1 15:06:56 2008
+-1
+### al_3
+    1
+   13    3  3.8090e+03  5.1200e+03  2.1660e+04  7.6350e+04  8.4770e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   13    3  1.6290e-06  3.5840e-06  1.2440e-05  4.1550e-03  2.9040e-04  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  al_3.drparams
+%parameters for dielectronic recombination rate coefficients
+Altun, Z., Yumak, A., Badnell, N.R., Loch, S.D., Pindzola, M.S., 2006, A&A, 447, 1165
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2006A%26A...447.1165A
+Dielectronic recombination data for dynamic finite-density plasmas. XI. The sodium isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:12:59 2012
+-1
+### al_4
+    1
+   13    4  5.3750e+05  8.4360e+05  1.2200e+06  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   13    4  2.4680e-05  2.9130e-03  7.0280e-04  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  al_4.drparams
+%parameters for dielectronic recombination rate coefficients
+Zatsarinny, O., Gorczyca, T.W., Korista, K., Badnell, N.R., Savin, D.W.
+2004, A&A, 426, 699
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2004A%26A...426..699Z
+Dielectronic recombination data for dynamic finite-density plasmas. VII. The neon isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:12:57 2012
+-1
+### al_5
+    1
+   13    5  2.4880e+02  1.7930e+03  9.9190e+03  4.3670e+04  4.0120e+05  6.5130e+05  1.2610e+06  0.0000e+00  0.0000e+00
+   13    5  3.2380e-07  1.1520e-06  2.3360e-06  6.9090e-06  1.9250e-03  5.0810e-03  9.3170e-03  0.0000e+00  0.0000e+00
+-1
+%file:  al_5.drparams
+%parameters for dielectronic recombination rate coefficients
+Zatsarinny, O., Gorczyca, T.W., Fu, J., Korista, K.T., Badnell, N.R., Savin, D.W.
+2006, A&A, 447, 379
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2006A%26A...447..379Z
+Dielectronic recombination data for dynamic finite-density plasmas. IX. The fluorine isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:12:54 2012
+-1
+### al_6
+    1
+   13    6  1.5430e+03  4.1150e+03  1.8900e+04  7.1370e+04  2.8730e+05  5.4060e+05  1.4180e+06  0.0000e+00  0.0000e+00
+   13    6  1.0960e-06  7.1120e-06  1.3790e-05  7.5210e-05  4.7040e-04  1.1790e-02  2.3740e-02  0.0000e+00  0.0000e+00
+-1
+%file:  al_6.drparams
+%parameters for dielectronic recombination rate coefficients
+Zatsarinny, O., Gorczyca, T.W., Korista, K.T., Fu, J., Badnell, N.R., Mitthumsiri, W., Savin, D.W.
+2005, A&A, 438, 743
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2005A%26A...438..743Z
+Dielectronic recombination data for dynamic finite-density plasmas. II. The oxygen isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:12:36 2012
+-1
+### al_7
+    1
+   13    7  4.6710e+02  1.2340e+04  4.1780e+04  3.3450e+05  6.9420e+05  1.7860e+06  0.0000e+00  0.0000e+00  0.0000e+00
+   13    7  1.4600e-05  9.7280e-05  6.8300e-04  1.2300e-02  9.6600e-03  5.0470e-02  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  al_7.drparams
+%parameters for dielectronic recombination rate coefficients
+Mitnik, D.M., Badnell, N.R., 2004, A&A, 425, 1153
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2004A%26A...425.1153M
+Dielectronic recombination data for dynamic finite-density plasmas. VIII. The nitrogen isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:12:33 2012
+-1
+### al_8
+    1
+   13    8  9.3570e+02  4.7750e+03  3.7960e+04  1.6190e+05  4.9540e+05  1.8850e+06  0.0000e+00  0.0000e+00  0.0000e+00
+   13    8  3.2360e-05  7.8210e-05  3.8990e-04  2.1060e-03  2.0150e-02  7.7100e-02  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  al_8.drparams
+%parameters for dielectronic recombination rate coefficients
+Zatsarinny, O., Gorczyca, T.W., Korista, K., Fu, J., Badnell, N.R., Mitthumsiri, W., Savin, D.W.
+2005, A&A, 440, 1203
+Dielectronic recombination data for dynamic finite-density plasmas. IV. The carbon isoelectronic sequence
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2005A%26A...440.1203Z
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:10:13 2012
+-1
+### al_9
+    1
+   13    9  1.1220e+03  6.4310e+03  5.1390e+04  1.8200e+05  4.9360e+05  2.1210e+06  1.0010e+08  0.0000e+00  0.0000e+00
+   13    9  1.4310e-05  3.5170e-05  8.7090e-04  5.0870e-03  2.6790e-02  8.9220e-02  2.4830e-04  0.0000e+00  0.0000e+00
+-1
+%file:  al_9.drparams
+%parameters for dielectronic recombination rate coefficients
+Altun, Z., Yumak, A., Badnell, N.R., Colgan, J., Pindzola, M.S., 2004, A&A, 420, 775
+Dielectronic recombination data for dynamic finite-density plasmas. VI. The boron isoelectronic sequence 
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2004A%26A...420..775A
+Erratum:  http://cdsads.u-strasbg.fr/abs/2005A%26A...433..395A
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:09:37 2012
+-1
+### al_10
+    1
+   13   10  1.3040e+04  2.4110e+04  6.9930e+04  2.0910e+05  4.5450e+05  2.3490e+06  1.5980e+07  0.0000e+00  0.0000e+00
+   13   10  1.0490e-05  5.6830e-04  2.7340e-03  6.9680e-03  2.6680e-02  3.8010e-02  3.6510e-02  0.0000e+00  0.0000e+00
+-1
+%file:  al_10.drparams
+%parameters for dielectronic recombination rate coefficients
+Colgan, J., Pindzola, M.S., Whiteford, A.D., Badnell, N.R., 2003, A&A, 412, 597
+Dielectronic recombination data for dynamic finite-density plasmas. III. The beryllium isoelectronic sequence
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2003A%26A...412..597C
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:09:34 2012
+-1
+### al_11
+    1
+   13   11  5.7670e+03  2.2070e+04  1.6390e+05  3.3360e+05  2.5190e+06  1.6170e+07  0.0000e+00  0.0000e+00  0.0000e+00
+   13   11  4.3800e-04  6.9000e-04  6.9470e-03  9.0370e-03  3.9250e-02  1.1530e-01  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  al_11.drparams
+%parameters for dielectronic recombination rate coefficients
+Colgan, J., Pindzola, M.S., Badnell, N.R., 2004, A&A, 417, 1183
+Dielectronic recombination data for dynamic finite-density plasmas. V: The lithium isoelectronic sequence
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2004A%26A...417.1183C
+Erratum:  http://cdsads.u-strasbg.fr/abs/2005A%26A...429..369C
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:09:32 2012
+-1
+### al_12
+    1
+   13   12  1.3360e+07  1.6890e+07  2.0910e+07  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   13   12  4.0930e-02  1.6180e-01  1.3320e-02  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  al_12.drparams
+%parameters for dielectronic recombination rate coefficients
+Bautista, M.A., Badnell, N.R., 2007, A&A, 466, 755
+Dielectronic recombination data for dynamic finite-density plasmas. XII. The helium isoelectronic sequence
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2007A%26A...466..755B
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:09:28 2012
+-1
+### al_13
+    1
+   13   13  1.4060e+07  1.8500e+07  2.4310e+07  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   13   13  3.0040e-02  1.3060e-01  7.7860e-03  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  al_13.drparams
+%parameters for dielectronic recombination rate coefficients
+Badnell, N. R., 2006, A&A, 447, 389
+Dielectronic recombination data for dynamic finite-density plasmas. X. The hydrogen isoelectronic sequence
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2006A%26A...447..389B
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:08:14 2012
+-1

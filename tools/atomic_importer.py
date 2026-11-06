@@ -5,8 +5,10 @@ Sources, all public:
     Kramida, Ralchenko, Reader and NIST ASD Team, NIST Atomic Spectra Database, https://physics.nist.gov/asd.
   - Los Alamos TOPS (aphysics2.lanl.gov/apps): Rosseland / Planck opacities and free-electron counts, Z <= 30 only (so
     Al and Cu, not Au or Pb). Magee et al., ASP Conf. Ser. 78, 51 (1995). Used directly or as a benchmark.
-  - CHIANTI (chiantidatabase.org): .elvlc level files, parsed here from a local copy (the database is a 600 MB
-    download and covers Z <= 30). Dere et al., A&AS 125, 149 (1997) and later papers.
+  - CHIANTI (chiantidatabase.org, files from the SolarSoft mirror), Z <= 30: .elvlc levels and .wgfa lines (downloaded
+    on demand into aegis/data/atomic/chianti/, MB per ion, not bundled), .drparams dielectronic recombination fits
+    (bundled for Al and Cu) and the coronal ion fractions of chianti.ioneq (Al and Cu rows bundled, as a benchmark).
+    Dere et al., A&AS 125, 149 (1997); Del Zanna et al., ApJ 909, 38 (2021); DR fits by Badnell and co-workers.
 FAC output is not read: FAC is a code you run yourself, and its files depend on how it was run.
 
 Raw responses are cached in aegis/data/atomic/ with their source and retrieval date in the header. The conversion to
@@ -259,6 +261,115 @@ def parse_chianti_elvlc(path):
     return out
 
 
+CHIANTI = "https://soho.nascom.nasa.gov/solarsoft/packages/chianti/dbase/"
+
+
+def parse_chianti_drparams(text):
+    """one CHIANTI .drparams file: {'type': 1, 'E': [...], 'c': [...]} (rate T^-3/2 sum c exp(-E / T), T in K) or
+    {'type': 2, 'c': [A, B, T0, T1]}; trailing zero pairs are kept (harmless)"""
+    rows = []
+    for line in text.splitlines():
+        if line.strip().startswith("-1"):
+            break
+        if line.strip():
+            rows.append([float(x) for x in line.split()])
+    typ = int(rows[0][0])
+    if typ == 1:
+        return {"type": 1, "E": rows[1][2:], "c": rows[2][2:]}
+    if typ == 2:
+        return {"type": 2, "c": rows[1][2:6]}
+    raise ValueError(f"CHIANTI drparams type {typ} not supported")
+
+
+def fetch_chianti_dr(element, cache=True):
+    """CHIANTI dielectronic recombination fits for every ion of the element (Z <= 30), bundled as one text file:
+    {recombining ion charge: parsed drparams}. The fits are Badnell and co-workers' DR calculations."""
+    el = element.lower()
+    path = os.path.join(DATA, f"chianti_dr_{element}.txt")
+    if not (cache and os.path.exists(path)):
+        parts = []
+        for k in range(2, Z_OF[element] + 2):               # al_2 (Al+) ... al_13 (H-like); al_k has charge k - 1
+            try:
+                parts.append(f"### {el}_{k}\n" + _get(f"{CHIANTI}{el}/{el}_{k}/{el}_{k}.drparams").replace("\r\n", "\n"))
+            except Exception:
+                continue
+        os.makedirs(DATA, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"# CHIANTI database (Dere et al. 1997; Del Zanna et al. 2021), .drparams of {element} ions\n"
+                    f"# {CHIANTI}{el}/ retrieved {time.strftime('%Y-%m-%d')}; each block keeps its own references\n"
+                    + "".join(parts))
+    out = {}
+    for block in open(path, encoding="utf-8").read().split("### ")[1:]:
+        name, body = block.split("\n", 1)
+        out[int(name.split("_")[1]) - 1] = parse_chianti_drparams(body)
+    return out
+
+
+def load_chianti_ioneq(Z):
+    """CHIANTI coronal ion fractions bundled for Al and Cu (chianti_ioneq_Al_Cu.csv): (T in eV, fractions (Z + 1, nT))"""
+    rows = [l for l in open(os.path.join(DATA, "chianti_ioneq_Al_Cu.csv"), encoding="utf-8") if not l.startswith("#")]
+    lt = np.array([float(x) for x in rows[0].split(",")[2:]])
+    F = np.zeros((Z + 1, len(lt)))
+    for l in rows[1:]:
+        p = l.split(",")
+        if int(p[0]) == Z:
+            F[int(p[1]) - 1] = [float(x) for x in p[2:]]
+    if not F.any():
+        raise ValueError(f"no CHIANTI ion fractions bundled for Z = {Z}")
+    return 10**lt / 11604.518, F
+
+
+def parse_chianti_wgfa(path, levels):
+    """lines (ion charge placeholder 0, E_lower eV, E_upper eV, f_lu, g_lower) of a CHIANTI .wgfa file with levels from
+    parse_chianti_elvlc; zero-wavelength rows (two-photon, autoionisation) are skipped. f is computed from the radiative
+    rate, f_lu = 1.4992e-16 lambda^2 (g_u / g_l) A (lambda in Angstrom from the level energies): the file's gf column
+    equals this for allowed lines but not for some forbidden ones (1e5 too large for Al XII 1s2 - 1s3d)"""
+    E = {L["index"]: L["E_eV"] for L in levels}
+    g = {L["index"]: L["g"] for L in levels}
+    out = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        if line.strip().startswith("-1"):
+            break
+        p = line.split()
+        try:
+            i, j, wvl, A = int(p[0]), int(p[1]), float(p[2]), float(p[4])
+        except (ValueError, IndexError):
+            continue
+        if wvl == 0 or A <= 0 or i not in E or j not in E:
+            continue
+        lo, up = (i, j) if E[i] <= E[j] else (j, i)
+        if E[up] > E[lo]:
+            lam = 12398.4198 / (E[up] - E[lo])
+            out.append([0.0, E[lo], E[up], 1.4992e-16 * lam * lam * g[up] / g[lo] * A, g[lo]])
+    return np.array(out, float).reshape(-1, 5)
+
+
+def fetch_chianti_lines(element, cache_dir=None):
+    """lines of every ion of the element that CHIANTI has .elvlc and .wgfa files for, in the NIST layout (charge in
+    column 0). The files are large (MB per ion), so they are cached outside the package (aegis/data/atomic/chianti/,
+    not bundled); for Z <= 30 only."""
+    el = element.lower()
+    d = cache_dir or os.path.join(DATA, "chianti")
+    os.makedirs(d, exist_ok=True)
+    out = []
+    for k in range(1, Z_OF[element] + 1):
+        files = []
+        for ext in ("elvlc", "wgfa"):
+            p = os.path.join(d, f"{el}_{k}.{ext}")
+            if not os.path.exists(p):
+                try:
+                    txt = _get(f"{CHIANTI}{el}/{el}_{k}/{el}_{k}.{ext}", timeout=300)
+                except Exception:
+                    break
+                open(p, "w", encoding="utf-8", newline="\n").write(txt.replace("\r\n", "\n"))
+            files.append(p)
+        if len(files) == 2:
+            L = parse_chianti_wgfa(files[1], parse_chianti_elvlc(files[0]))
+            L[:, 0] = k - 1
+            out.append(L)
+    return np.concatenate(out) if out else np.zeros((0, 5))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--fetch-nist", nargs="*", default=[])
@@ -271,12 +382,19 @@ def main():
     ap.add_argument("--build", help="element to build a model table for (NIST energies; opacities are lower bounds)")
     ap.add_argument("--groups", type=float, nargs="+", default=[10, 100, 1000], help="inner group edges, eV")
     ap.add_argument("--lines", action="store_true", help="include NIST lines in the opacity")
+    ap.add_argument("--chianti-lines", action="store_true", help="include CHIANTI lines (Z <= 30; downloaded, MB per ion)")
+    ap.add_argument("--no-line-model", action="store_true", help="no screened-hydrogenic lines for stages without data")
+    ap.add_argument("--dr", choices=["chianti", "burgess"], help="dielectronic recombination in the non-LTE balance "
+                    "(chianti: fitted rates, Z <= 30, recommended; burgess: General Formula, see aegis/tabular.py)")
+    ap.add_argument("--fetch-chianti-dr", nargs="*", default=[], help="refresh the bundled CHIANTI DR fits")
     ap.add_argument("--nonlte", action="store_true", help="opacity from the collisional-radiative ion balance")
     ap.add_argument("--out")
     a = ap.parse_args()
     for el in a.fetch_nist:
         I = fetch_nist_ie(el, cache=False)
         print(f"{el}: {np.sum(np.isfinite(I))} of {Z_OF.get(el, len(I))} ionization energies, I_0 = {I[0]} eV")
+    for el in a.fetch_chianti_dr:
+        print(f"{el}: CHIANTI DR fits for {len(fetch_chianti_dr(el, cache=False))} recombining ions")
     for el in a.fetch_lines:
         L = fetch_nist_lines(el, cache=False)
         print(f"{el}: {len(L)} lines with f values, ion charges {sorted(set(L[:, 0].astype(int)))[:12]} ...")
@@ -300,9 +418,15 @@ def main():
         sys.path.insert(0, ROOT)
         from aegis import tabular
         I = fetch_nist_ie(a.build)
-        lines = fetch_nist_lines(a.build) if a.lines else None
+        lines, src = None, "NIST"
+        if a.chianti_lines:
+            lines, src = fetch_chianti_lines(a.build), "CHIANTI"
+        elif a.lines:
+            lines = fetch_nist_lines(a.build)
+        dr_table = fetch_chianti_dr(a.build) if a.dr == "chianti" else None
         edges = np.array([0.0] + list(a.groups) + [np.inf])
-        tab = tabular.build_atomic_table(Z_OF[a.build], A_OF[a.build], I, edges, lines=lines, nonlte=a.nonlte)
+        tab = tabular.build_atomic_table(Z_OF[a.build], A_OF[a.build], I, edges, lines=lines, nonlte=a.nonlte,
+                                         line_model=not a.no_line_model, dr=a.dr, dr_table=dr_table, line_source=src)
         out = a.out or f"{a.build.lower()}_atomic.npz"
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         np.savez(out, **tab)

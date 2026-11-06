@@ -3440,19 +3440,69 @@ Useful Links"""
         Zn, An = ai.Z_OF[e], ai.A_OF[e]
         sb = tb._bf_cross_sections(tb.fill_ionization(I[e]), Zn, E)
         rows = []
-        for Tk, r, kr, kp, zf, z2 in d[::3]:
+        for Tk, r, kr, kp, zf, z2 in d[::4]:
             f, ne, zb = tb.saha_balance(I[e], An, np.array(r * 1e3), np.array(Tk * 1e3))
-            ka, ke = tb.atomic_opacity(I[e], Zn, An, r * 1e3, Tk * 1e3, f, float(ne), E, None, sb)
-            pP, pR = tb.group_means(ka, ke, E, Tk * 1e3, np.array([0.0, np.inf]))
-            rows.append((zf, float(zb), kr, pR[0], kp, pP[0]))
+            q = [zf, float(zb), kr, kp]
+            for lm in (False, True):
+                ka, ke = tb.atomic_opacity(I[e], Zn, An, r * 1e3, Tk * 1e3, f, float(ne), E, None, sb, line_model=lm)
+                pP, pR = tb.group_means(ka, ke, E, Tk * 1e3, np.array([0.0, np.inf]))
+                q += [pR[0], pP[0]]
+            rows.append(q)
         o = np.array(rows)
         fac = lambda a, b: float(np.exp(np.mean(np.abs(np.log(a / b)))))
-        fz, fr, fp = fac(o[:, 1], o[:, 0]), fac(o[:, 3], o[:, 2]), fac(o[:, 5], o[:, 4])
-        good = good and fz < 1.15
-        txt.append(f"{e}: Z_bar {fz:.2f}, kappa_R {fr:.0f}, kappa_P {fp:.0f}")
+        fz = fac(o[:, 1], o[:, 0])
+        fr0, fp0, fr1, fp1 = fac(o[:, 4], o[:, 2]), fac(o[:, 5], o[:, 3]), fac(o[:, 6], o[:, 2]), fac(o[:, 7], o[:, 3])
+        good = good and fz < 1.15 and fp1 < 0.25 * fp0 and fp1 < 3.5 and fr1 <= fr0 * 1.01
+        txt.append(f"{e}: Z_bar {fz:.2f}; kappa_P {fp0:.0f} -> {fp1:.1f}, kappa_R {fr0:.0f} -> {fr1:.0f}")
     ok = ok and good
-    print("  against TOPS, mean factor off (model without line data; opacities are lower bounds): " + "; ".join(txt)
+    print("  against TOPS, mean factor off without -> with model lines (Rosseland still a lower bound): " + "; ".join(txt)
           + f"  [{'PASS' if good else 'FAIL'}]")
+    # line physics: hydrogen f values, profiles, strength conservation on the grid
+    fH = [tb.hydrogenic_f(1, 2), tb.hydrogenic_f(1, 3), tb.hydrogenic_f(2, 3)]
+    eH = max(abs(a / b - 1) for a, b in zip(fH, (0.4162, 0.0791, 0.6407)))
+    xg = np.linspace(-60.0, 60.0, 240001)
+    dx = xg[1] - xg[0]
+    wG, wL = 1.3, 0.7                                   # FWHMs; exact Voigt by direct convolution, independent of the code
+    sg = wG / (2 * np.sqrt(2 * np.log(2)))
+    gk = np.exp(-0.5 * (xg / sg)**2) / (sg * np.sqrt(2 * np.pi))
+    lk = (wL / 2 / np.pi) / (xg**2 + (wL / 2)**2)
+    vo = np.convolve(gk, lk, mode="same") * dx
+    cdf_ex = np.cumsum(vo) * dx
+    sel = slice(100000, 140001)
+    e_pv = float(np.max(np.abs(tb.pseudo_voigt_cdf(xg[sel], wG, wL) - (cdf_ex[sel] - cdf_ex[100000] + tb.pseudo_voigt_cdf(xg[100000], wG, wL)))))
+    Eg = np.geomspace(1.0, 1e4, 3000)
+    rng_l = np.random.default_rng(3)
+    E0 = 10**rng_l.uniform(0.5, 3.5, 300)
+    st = 10**rng_l.uniform(0, 3, 300)
+    al = tb.deposit_lines(Eg, E0, st, 1e-3 * E0 * rng_l.uniform(0.01, 3, 300), 1e-3 * E0 * rng_l.uniform(0, 3, 300))
+    edg = np.sqrt(Eg[1:] * Eg[:-1])
+    edg = np.concatenate([[Eg[0]**2 / edg[0]], edg, [Eg[-1]**2 / edg[-1]]])
+    e_st = abs(float(np.sum(al * np.diff(edg) * 2.417989e14)) / float(np.sum(st)) - 1)
+    good = eH < 2e-3 and e_pv < 0.012 and e_st < 1e-12
+    ok = ok and good
+    print(f"  lines: hydrogen f(1-2, 1-3, 2-3) within {eH:.0e}; pseudo-Voigt vs convolved Voigt (CDF) {e_pv:.1e}; "
+          f"strength on the grid {e_st:.0e}  [{'PASS' if good else 'FAIL'}]")
+    # dielectronic recombination: General Formula against the ADAS worked example (Ti 21+, 1s-2p), CHIANTI fits against
+    # the CHIANTI coronal ion balance
+    Tt = np.array([5e6, 1e7, 2e7, 5e7, 1e8]) / 11604.518
+    adas = np.array([5.5304e-15 / 1.3466, 1.3964e-13 / 1.0853, 4.6746e-13 / 1.0916, 4.7605e-13 / 1.1445, 2.6972e-13 / 1.1713])
+    e_gf = float(np.max(np.abs(tb.burgess_dr(None, 22, 21, Tt, np.array([[21, 0.0, 365.53 * tb._RY, 0.416, 1.0, 2, 1]])) / adas - 1)))
+    txt, good = [], e_gf < 1e-3
+    for e in ("Al", "Cu"):
+        Zn, An = ai.Z_OF[e], ai.A_OF[e]
+        Tc, Fc = ai.load_chianti_ioneq(Zn)
+        zc = np.arange(Zn + 1) @ Fc
+        s_ = (zc > 0.3) & (zc < Zn - 0.3)
+        Tc, zc = Tc[s_][::2], zc[s_][::2]
+        drt = ai.fetch_chianti_dr(e)
+        d0 = float(np.mean(np.abs(tb.cr_balance(I[e], Zn, An, np.full(len(Tc), 1e-8), Tc)[2] - zc)))
+        d1 = float(np.mean(np.abs(tb.cr_balance(I[e], Zn, An, np.full(len(Tc), 1e-8), Tc, dr="chianti", dr_table=drt)[2] - zc)))
+        d2 = float(np.mean(np.abs(tb.cr_balance(I[e], Zn, An, np.full(len(Tc), 1e-8), Tc, dr="burgess")[2] - zc)))
+        good = good and d1 < d0 and len(drt) == Zn - 1
+        txt.append(f"{e} {d0:.2f} / {d1:.2f} / {d2:.2f}")
+    ok = ok and good
+    print(f"  dielectronic recombination: General Formula vs ADAS Ti 21+ {e_gf:.0e}; coronal Z_bar vs CHIANTI, mean |dZ| "
+          f"without / CHIANTI fits / General Formula with model core lines: " + ", ".join(txt) + f"  [{'PASS' if good else 'FAIL'}]")
     # GPU lookup
     d = dict(np.load(os.path.join(ai.DATA, "tops_Al_groups.npz")))
     G = tb.GroupOpacityTable(d, 1.0, 1.0, 1.0)
@@ -3472,14 +3522,17 @@ Useful Links"""
     ex = 0.3 * rr**1.5 * tt**-2.0
     e_pw = float(xp.max(xp.abs(Gp(rr, tt)[0][0] / ex - 1)))
     def _timed(f):
-        G(rho, th); [t_(rho, th) for t_ in per]
         cp.cuda.Device().synchronize()
         t0 = _t.perf_counter()
         for _ in range(10):
             f()
         cp.cuda.Device().synchronize()
         return (_t.perf_counter() - t0) / 10
-    ta, tb_ = _timed(lambda: G(rho, th)), _timed(lambda: [t_(rho, th) for t_ in per])
+    t_end = _t.perf_counter() + 0.5                  # the GPU idles at low clocks after the CPU-only checks: warm it up,
+    while _t.perf_counter() < t_end:                 # then alternate the two and compare medians
+        G(rho, th); [t_(rho, th) for t_ in per]
+    tt = [(_timed(lambda: G(rho, th)), _timed(lambda: [t_(rho, th) for t_ in per])) for _ in range(5)]
+    ta, tb_ = float(np.median([x[0] for x in tt])), float(np.median([x[1] for x in tt]))
     good = dv < 0.05 and e_pw < 1e-11 and ta < tb_
     ok = ok and good
     print(f"  GPU group lookup, 6 groups on 256^2: vs per-group tables within {dv:.1e} in ln(kappa), power law exact to "

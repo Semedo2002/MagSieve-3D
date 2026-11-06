@@ -424,22 +424,35 @@ Interpolation is bilinear (bicubic is not implemented).
     `aegis/data/atomic/` with source and retrieval date; `--fetch-nist` and `--fetch-lines` work for other elements);
   - Los Alamos TOPS: Rosseland, Planck and group opacities plus free-electron counts, Z <= 30 only (Al and Cu tables
     bundled, `--tops-table`);
-  - CHIANTI `.elvlc` level files, parsed from a local copy of that database (Z <= 30). Levels are parsed only; no table
-    uses them yet. FAC output is not read.
+  - CHIANTI (Z <= 30): `.elvlc` levels and `.wgfa` lines (`--chianti-lines`, downloaded on demand, about 7 MB for Al,
+    not bundled), dielectronic recombination fits (`.drparams`, bundled for Al and Cu) and the coronal ion fractions of
+    `chianti.ioneq` (Al and Cu rows bundled as a benchmark). f values are computed from the A values, since the files'
+    gf column is wrong by up to 1e5 for some forbidden lines. FAC output is not read.
+- **Lines:** a screened-hydrogenic line model for every element and ion stage (Kramers oscillator strengths with the
+  Johnson Gaunt factor, exact for hydrogen to 1e-3), plus tabulated NIST or CHIANTI lines with Boltzmann lower levels and
+  a level-sum partition function. Profiles: Doppler and electron-impact (Griem's semi-empirical width) widths in a
+  pseudo-Voigt (within 0.7% of an exact Voigt), integrated over each photon bin so line strength is exact on any grid.
 - **Ion balance (`saha_balance`, `cr_balance`):** Saha with ion-sphere continuum lowering and unit partition-function
   ratios; a collisional-radiative steady state (Lotz ionization, radiative recombination, three-body by detailed
-  balance) that reduces to Saha at high density and to a coronal balance at low density. It has no dielectronic
-  recombination, no excitation-autoionization and no radiation field, so it is an optically thin estimate and not a
+  balance) that reduces to Saha at high density and to a coronal balance at low density. Optional dielectronic
+  recombination (`dr="chianti"` with the bundled fits, or the Burgess General Formula, which reproduces ADAS's worked
+  Ti 21+ example to 1e-4). No excitation-autoionization and no radiation field: an optically thin estimate, not a
   replacement for FLYCHK.
 - **Tables (`build_atomic_table`, `tops_groups_to_table`):** `.npz` in the `fld_mg_table` format, with `Zbar_lte` and
   `Zbar_nlte`. `GroupOpacityTable` looks up all groups in one GPU kernel launch; `IonizationTable` gives Z_bar on the GPU.
-- **How good it is, against TOPS (LTE):**
-  - Z_bar from NIST energies is within about 2% on average for Al and Cu;
-  - the model's opacities are **not** reliable: without line data they are low by about 7-37x (Rosseland) and 20-150x
-    (Planck), because line absorption dominates. Adding NIST lines helps the Al Planck mean, but not Rosseland;
+- **How good it is** (`examples/atomic_vs_tops.py`, full table in `results/atomic_lines/summary.md`), against TOPS
+  (LTE, 96 points each for Al and Cu, 10 eV - 1 keV, 1e-3 - 1e-1 g/cc):
+  - Z_bar from NIST energies is within about 2% on average;
+  - Planck mean: from 12x (Al) and 57x (Cu) low without lines to within about 2x with the line model;
+  - Rosseland mean: only from 8x to 4x (Al) and 36x to 19x (Cu) low. Complete tabulated line lists do not close this
+    (CHIANTI Al, 72k lines: 4.8x), so the remaining gap is continuum and broadening physics. **Nothing here is within 5%
+    of TOPS** (5% was a target for this module; reaching it needs a detailed-configuration opacity code);
+  - coronal mean charge against CHIANTI's ion balance: mean error 0.32 -> 0.22 (Al) and 1.09 -> 0.82 (Cu) with the
+    CHIANTI DR fits; the Burgess formula with the model's core transitions makes it worse (0.38, 1.38), so the
+    default is no DR;
   - for Al and Cu, use the imported TOPS tables;
-  - for Au and Pb there is no open table here and NIST lists only 32 and 43 lines with f values, so their opacities
-    are lower bounds with no benchmark. Their Z_bar is also unbenchmarked: TOPS stops at Z = 30.
+  - for Au and Pb there is no open table or DR fit here, so their opacities (with model lines) and Z_bar are
+    unbenchmarked: TOPS and CHIANTI stop at Z = 30.
 
 ### Generated material tables
 
@@ -848,7 +861,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | cyl_filter | the azimuthal filter keeps m <= m_crit exactly and leaves outer rings alone; the blob crossing the axis (32 x 64): 1254 -> 79 steps, centroid and field error unchanged to 1e-4, energy 3e-15, div B 2e-15 |
 | rlc_adjoint | r-z liner driven by an RLC bank: bank + resistor + grid energy 2e-16; d(yield proxy)/d(shape, V0, C, L, R) adjoint vs central differences 2e-10 to 9e-9 |
 | literature | digitized traces without a citation refused, sorting / scaling, HDF5 round trip; virtual probes on a manufactured state: B-dot exact (1e-12), VISAR velocity exact, framing radius within half a cell; synthetic traces: hidden speed recovered within 1%, marked [syn]; self-tests, not validation against an experiment |
-| atomic | parsers on real NIST, TOPS and CHIANTI formats; Saha vs an exact hydrogen result; collisional-radiative balance reduces to Saha at high density and is coronal at low density; Z_bar within about 2% of Los Alamos TOPS for Al and Cu, while line-free model opacities are low by 7-150x (reported, not hidden); vectorised GPU group lookup matches per-group tables to 2e-13; multigroup FLD with the imported TOPS Al table conserves energy |
+| atomic | parsers on real NIST, TOPS and CHIANTI formats; Saha vs an exact hydrogen result; collisional-radiative balance reduces to Saha at high density and is coronal at low density; Z_bar within about 2% of Los Alamos TOPS for Al and Cu; model lines bring the Planck mean within about 2-3x of TOPS (from 12-57x) and do not worsen Rosseland (still 4-20x low, reported); hydrogen f values, pseudo-Voigt vs an exact convolved Voigt, line strength exact on the grid; Burgess formula vs ADAS's worked values; CHIANTI DR fits improve the coronal mean charge against CHIANTI's ion balance; vectorised GPU group lookup matches per-group tables to 2e-13; multigroup FLD with the imported TOPS Al table conserves energy |
 | bridge | native graph loop bit-identical to the Python solver with the GIL released; overlap stepper on one periodic rank matches to 4e-15; 2 MPI ranks through the native exchange: 2e-15 vs serial, energy 2e-15, div B 4e-14, shared faces identical (one shared GPU, so no scaling claim) |
 | ml_additive | the numerical core imports no model; rejected sub-grid predictions leave the state bit-identical to the solver, accepted ones keep mass, momentum, energy and div B at round-off; AMR with trigger cells keeps conservation; surrogate optimizer spends exactly its budget and beats a same-budget scan on Branin; CNN and PINN gradients vs finite differences; does not depend on trained weights |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |

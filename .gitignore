@@ -22,3 +22,6 @@ results/fno/*.npz
 # native extension, built by tools/build_core.py
 aegis/aegis_core*.pyd
 aegis/aegis_core*.so
+
+# CHIANTI line files fetched on demand (MB per ion), not bundled
+aegis/data/atomic/chianti/

@@ -1,0 +1,355 @@
+# CHIANTI database (Dere et al. 1997; Del Zanna et al. 2021), .drparams of Cu ions
+# https://soho.nascom.nasa.gov/solarsoft/packages/chianti/dbase/cu/ retrieved 2026-11-06; each block keeps its own references
+### cu_2
+    1
+   29    2  3.4697e+04  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29    2  4.0628e-04  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_2.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_3
+    1
+   29    3  6.8711e+04  4.5808e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29    3  1.5751e-03  5.1004e-03  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_3.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_4
+    1
+   29    4  1.3582e+05  5.6591e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29    4  4.0503e-03  2.1126e-02  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_4.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_5
+    1
+   29    5  6.1464e+05  1.8998e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29    5  5.0753e-02  7.1755e-03  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_5.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_6
+    1
+   29    6  6.0665e+05  2.7575e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29    6  9.7507e-02  1.1476e-02  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_6.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_7
+    1
+   29    7  3.8096e+05  5.9866e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29    7  1.6876e-02  1.4626e-01  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_7.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_8
+    1
+   29    8  4.8335e+05  6.4446e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29    8  2.2627e-02  2.1751e-01  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_8.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_9
+    1
+   29    9  5.8296e+05  6.3597e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29    9  2.8752e-02  2.8252e-01  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_9.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_10
+    1
+   29   10  7.7982e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29   10  4.4878e-01  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_10.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_11
+    1
+   29   11  8.7759e+05  1.1357e+06  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29   11  5.3629e-01  4.7503e-02  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_11.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_12
+    1
+   29   12  4.7060e+03  1.5410e+04  2.9820e+04  7.3130e+04  2.1660e+05  6.0000e+05  1.1600e+06  0.0000e+00  0.0000e+00
+   29   12  5.8430e-04  1.6900e-03  6.4400e-03  1.3880e-02  2.9540e-02  1.4940e-01  3.5180e-01  0.0000e+00  0.0000e+00
+-1
+%file:  cu_12.drparams
+%parameters for dielectronic recombination rate coefficients
+Nikolic, D., Gorczyca, T. W., Korista, K. T., Badnell, N. R., 2010, A&A, 516, 97
+Dielectronic recombination of argon-like ions
+http://adsabs.harvard.edu/abs/2010A%26A...516A..97N
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:13:20 2012
+-1
+### cu_13
+    1
+   29   13  8.5522e+05  2.3142e+06  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29   13  6.7005e-01  1.9251e-01  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_13.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_14
+    1
+   29   14  2.3843e+06  8.4440e+05  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29   14  2.1501e-01  6.4004e-01  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_14.drparams
+%parameters for dielectronic recombination rate coefficients
+%reference:  Mazzitelli, G., Mattioli, M., 2002, ADNDT, 82, 313
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Fri Feb  9 08:36:17 2007
+-1
+### cu_15
+    1
+   29   15   3.635e+03   2.528e+04   1.164e+05   6.303e+05   1.775e+06   0.000e+00   0.000e+00   0.000e+00   0.000e+00
+   29   15   3.697e-03   1.857e-02   5.367e-02   3.952e-01   1.938e-01   0.000e+00   0.000e+00   0.000e+00   0.000e+00
+ -1
+ filename: cu_15.drparams 
+ total dielectronic recombination parameters 
+ recombination of Cu XV to form Cu XIV 
+ 
+ Bleda, E.~A. and Altun, Z. and Badnell, N.~R. 
+ 2022 A&S, 668, a72 
+ Dielectronic recombination data for dynamic finite-density plasmas. XVI. The phosphorus isoelectronic sequence 
+ doi: 10.1051/0004-6361/202244043 
+ adsRef: https://ui.adsabs.harvard.edu/abs/2022A&A...668A..72B 
+  
+ produced as a part of the 'CHIANTI' atomic database for astrophysical spectroscopy 
+  K. Dere (GMU) - 2022 December 29 
+ -1
+### cu_16
+    1
+   29   16   2.466e+03   2.273e+04   1.338e+05   6.643e+05   2.220e+06   1.217e+07   0.000e+00   0.000e+00   0.000e+00
+   29   16   7.276e-03   2.120e-02   4.385e-02   2.783e-01   1.308e-01   1.513e-03   0.000e+00   0.000e+00   0.000e+00
+ -1 
+%file:  cu_16.drparams
+ Kaur, Jagjit; Gorczyca, T. W.; Badnell, N. R.
+ Dielectronic recombination data for dynamic finite-density plasmas. XV. The silicon isoelectronic sequence 
+ https://ui.adsabs.harvard.edu/abs/2018A%26A...610A..41K/abstract
+
+ produced as a part of the 'CHIANTI' atomic database for astrophysical spectroscopy
+  K. Dere (GMU) - 2019 November 18
+ -1
+### cu_17
+    1
+   29   17  2.3450e+03  2.5560e+04  1.6360e+05  6.7880e+05  2.7890e+06  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29   17  7.4140e-03  1.5660e-02  7.3050e-02  3.0550e-01  4.9860e-02  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_17.drparams
+%parameters for dielectronic recombination rate coefficients
+Abdel-Naby, Sh. A., Nikolic, D., Gorczyca, T. W., Korista, K. T., Badnell, N. R.
+2012,A&A, 537, 40.
+Dielectronic recombination data for dynamic finite-density plasmas. XIV. The aluminum isoelectronic sequence
+http://adsabs.harvard.edu/abs/2012A%26A...537A..40A
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:13:03 2012
+-1
+### cu_18
+    1
+   29   18  6.6630e+03  3.9490e+04  2.0180e+05  7.1300e+05  8.2370e+06  1.5450e+07  0.0000e+00  0.0000e+00  0.0000e+00
+   29   18  2.2130e-03  2.6050e-02  8.2670e-02  2.3750e-01  5.4130e-01  1.3180e-01  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_18.drparams
+%parameters for dielectronic recombination rate coefficients
+Altun, Z., Yumak, I., Badnell, N.R., Loch, S.D., Pindzola, M.S.
+2007, A&A, 474, 1051
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2007A%26A...474.1051A
+Dielectronic recombination data for dynamic finite-density plasmas. XIII. The magnesium isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:13:01 2012
+-1
+### cu_19
+    1
+   29   19  1.3530e+04  6.2650e+04  2.0890e+05  5.4230e+05  4.4390e+06  1.0590e+07  0.0000e+00  0.0000e+00  0.0000e+00
+   29   19  3.2680e-03  8.2790e-03  4.8090e-02  1.3840e-01  2.2470e-01  1.0300e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_19.drparams
+%parameters for dielectronic recombination rate coefficients
+Altun, Z., Yumak, A., Badnell, N.R., Loch, S.D., Pindzola, M.S., 2006, A&A, 447, 1165
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2006A%26A...447.1165A
+Dielectronic recombination data for dynamic finite-density plasmas. XI. The sodium isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:12:59 2012
+-1
+### cu_20
+    1
+   29   20  3.4590e+06  5.0600e+06  9.3260e+06  1.8650e+07  4.2230e+07  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29   20  9.6650e-04  1.8240e-01  1.6440e+00  4.4200e-01 -6.7440e-02  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_20.drparams
+%parameters for dielectronic recombination rate coefficients
+Zatsarinny, O., Gorczyca, T.W., Korista, K., Badnell, N.R., Savin, D.W.
+2004, A&A, 426, 699
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2004A%26A...426..699Z
+Dielectronic recombination data for dynamic finite-density plasmas. VII. The neon isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:12:57 2012
+-1
+### cu_21
+    1
+   29   21  2.5400e+04  6.9560e+04  2.3770e+05  1.4660e+06  6.0010e+06  1.1450e+07  0.0000e+00  0.0000e+00  0.0000e+00
+   29   21  2.5330e-04  3.9260e-03  1.9100e-03  4.3010e-02  6.3000e-01  1.9610e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_21.drparams
+%parameters for dielectronic recombination rate coefficients
+Zatsarinny, O., Gorczyca, T.W., Fu, J., Korista, K.T., Badnell, N.R., Savin, D.W.
+2006, A&A, 447, 379
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2006A%26A...447..379Z
+Dielectronic recombination data for dynamic finite-density plasmas. IX. The fluorine isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:12:54 2012
+-1
+### cu_22
+    1
+   29   22  3.9450e+03  6.4640e+04  2.4590e+05  1.4170e+06  6.0080e+06  1.1540e+07  2.6640e+07  0.0000e+00  0.0000e+00
+   29   22  2.7720e-04  3.5150e-03  1.8470e-02  7.7890e-02  5.8090e-01  1.9270e+00  6.5830e-02  0.0000e+00  0.0000e+00
+-1
+%file:  cu_22.drparams
+%parameters for dielectronic recombination rate coefficients
+Zatsarinny, O., Gorczyca, T.W., Korista, K.T., Fu, J., Badnell, N.R., Mitthumsiri, W., Savin, D.W.
+2005, A&A, 438, 743
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2005A%26A...438..743Z
+Dielectronic recombination data for dynamic finite-density plasmas. II. The oxygen isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:12:36 2012
+-1
+### cu_23
+    1
+   29   23  1.6030e+03  6.8120e+04  2.6590e+05  1.0760e+06  5.6140e+06  1.2230e+07  0.0000e+00  0.0000e+00  0.0000e+00
+   29   23  3.5400e-03  1.0670e-02  3.0500e-02  9.2910e-02  5.6940e-01  2.1800e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_23.drparams
+%parameters for dielectronic recombination rate coefficients
+Mitnik, D.M., Badnell, N.R., 2004, A&A, 425, 1153
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2004A%26A...425.1153M
+Dielectronic recombination data for dynamic finite-density plasmas. VIII. The nitrogen isoelectronic sequence
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:12:34 2012
+-1
+### cu_24
+    1
+   29   24  5.4120e+03  6.3680e+04  2.9020e+05  1.1760e+06  5.6820e+06  1.2900e+07  0.0000e+00  0.0000e+00  0.0000e+00
+   29   24  1.8730e-03  2.4090e-02  3.0850e-02  9.3580e-02  4.4710e-01  1.5870e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_24.drparams
+%parameters for dielectronic recombination rate coefficients
+Zatsarinny, O., Gorczyca, T.W., Korista, K., Fu, J., Badnell, N.R., Mitthumsiri, W., Savin, D.W.
+2005, A&A, 440, 1203
+Dielectronic recombination data for dynamic finite-density plasmas. IV. The carbon isoelectronic sequence
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2005A%26A...440.1203Z
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:10:13 2012
+-1
+### cu_25
+    1
+   29   25  5.9750e+03  8.5980e+04  3.2390e+05  1.1180e+06  5.1410e+06  1.2840e+07  1.6890e+09  0.0000e+00  0.0000e+00
+   29   25  5.3290e-03  1.3930e-02  4.5780e-02  1.2130e-01  2.9080e-01  1.5070e+00  8.0270e-03  0.0000e+00  0.0000e+00
+-1
+%file:  cu_25.drparams
+%parameters for dielectronic recombination rate coefficients
+Altun, Z., Yumak, A., Badnell, N.R., Colgan, J., Pindzola, M.S., 2004, A&A, 420, 775
+Dielectronic recombination data for dynamic finite-density plasmas. VI. The boron isoelectronic sequence 
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2004A%26A...420..775A
+Erratum:  http://cdsads.u-strasbg.fr/abs/2005A%26A...433..395A
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:09:37 2012
+-1
+### cu_26
+    1
+   29   26  4.0530e+04  8.7170e+04  4.0340e+05  1.1920e+06  5.5150e+06  1.3590e+07  8.0440e+07  0.0000e+00  0.0000e+00
+   29   26  6.7950e-03  2.2040e-02  5.2530e-02  1.1840e-01  1.4370e-01  7.6540e-01  4.0510e-01  0.0000e+00  0.0000e+00
+-1
+%file:  cu_26.drparams
+%parameters for dielectronic recombination rate coefficients
+Colgan, J., Pindzola, M.S., Whiteford, A.D., Badnell, N.R., 2003, A&A, 412, 597
+Dielectronic recombination data for dynamic finite-density plasmas. III. The beryllium isoelectronic sequence
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2003A%26A...412..597C
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:09:35 2012
+-1
+### cu_27
+    1
+   29   27  5.0450e+04  2.1450e+05  7.3780e+05  5.0730e+06  1.3400e+07  7.0260e+07  1.2930e+08  0.0000e+00  0.0000e+00
+   29   27  9.1490e-03  2.3580e-02  6.4770e-02  7.0250e-02  4.9310e-01  5.2260e-01  1.1120e-01  0.0000e+00  0.0000e+00
+-1
+%file:  cu_27.drparams
+%parameters for dielectronic recombination rate coefficients
+Colgan, J., Pindzola, M.S., Badnell, N.R., 2004, A&A, 417, 1183
+Dielectronic recombination data for dynamic finite-density plasmas. V: The lithium isoelectronic sequence
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2004A%26A...417.1183C
+Erratum:  http://cdsads.u-strasbg.fr/abs/2005A%26A...429..369C
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:09:32 2012
+-1
+### cu_28
+    1
+   29   28  6.7670e+07  9.6280e+07  1.1230e+08  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29   28  3.4520e-01  6.3440e-01 -2.0550e-01  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_28.drparams
+%parameters for dielectronic recombination rate coefficients
+Bautista, M.A., Badnell, N.R., 2007, A&A, 466, 755
+Dielectronic recombination data for dynamic finite-density plasmas. XII. The helium isoelectronic sequence
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2007A%26A...466..755B
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:09:29 2012
+-1
+### cu_29
+    1
+   29   29  6.9140e+07  9.2780e+07  1.4820e+08  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+   29   29  2.2230e-01  2.8200e-01 -1.0130e-03  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00  0.0000e+00
+-1
+%file:  cu_29.drparams
+%parameters for dielectronic recombination rate coefficients
+Badnell, N. R., 2006, A&A, 447, 389
+Dielectronic recombination data for dynamic finite-density plasmas. X. The hydrogen isoelectronic sequence
+http://cdsads.u-strasbg.fr/cgi-bin/bib_query?2006A%26A...447..389B
+ produced for the CHIANTI atomic database for astrophysical spectroscopy
+ created by Ken Dere (GMU):  Wed Feb 15 11:08:15 2012
+-1

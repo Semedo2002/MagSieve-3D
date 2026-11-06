@@ -414,15 +414,17 @@ class OpacityTable:
 #   states only); solved for n_e by bisection on charge neutrality.
 #   Non-LTE (collisional-radiative steady state): electron-impact ionization by Lotz's formula, radiative recombination
 #   2.6e-13 z^2 sqrt(13.6 / T) cm^3/s, three-body recombination by detailed balance with ionization, so the balance
-#   reduces to Saha at high density and to a coronal, density-independent one at low density. No dielectronic
-#   recombination, no excitation-autoionization, no radiation field: an optically thin estimate, not FLYCHK.
+#   reduces to Saha at high density and to a coronal, density-independent one at low density. Dielectronic
+#   recombination optional (dr_rates, below); no excitation-autoionization, no radiation field: an optically thin
+#   estimate, not FLYCHK.
 #   Opacity on a fine photon grid: free-free (Kramers, Gaunt 1.2, with the stage-averaged Z^2), bound-free per subshell
 #   (hydrogenic nu^-3 from an edge at the NIST ionization energy of the ion in which that subshell is the outermost),
-#   Thomson scattering in the Rosseland mean, and optionally lines from NIST (f values, Boltzmann lower levels, Doppler
-#   the grid bin). NIST holds few f values for heavy ions (32 for Au, 43 for Pb), so their line opacity is essentially
-#   missing. Against Los Alamos TOPS (--test atomic) Z_bar agrees within about 2% on average for Al and Cu, but the
-#   line-free opacities are low by about 7-37x (Rosseland) and 20-150x (Planck): treat them as lower bounds.
-#   For Z <= 30 prefer tables imported from TOPS itself (tops_groups_to_table).
+#   Thomson scattering in the Rosseland mean, and lines: tabulated (NIST, CHIANTI; f values, Boltzmann lower levels)
+#   and/or the screened-hydrogenic line model below for every stage without tabulated lines, with Voigt-type profiles.
+#   Against Los Alamos TOPS (--test atomic, results/atomic_lines/) Z_bar agrees within about 2% for Al and Cu; with
+#   lines the Planck mean comes within about 2x (from 20-150x low without lines), but the Rosseland mean stays low
+#   by about 5x (Al) to 25x (Cu): the model has no term structure, so the windows between lines stay open. Treat the
+#   Rosseland means as lower bounds and, for Z <= 30, prefer tables imported from TOPS itself (tops_groups_to_table).
 _ME_CGS, _E2_CGS, _KB_EV, _AMU = 9.1093837e-28, 2.30707755e-19, 1.602176634e-12, 1.66053907e-27
 _SUBSHELLS = [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2), (4, 0), (4, 1), (4, 2), (5, 0), (5, 1), (4, 3), (5, 2), (6, 0),
               (6, 1), (5, 3), (6, 2), (7, 0)]
@@ -511,8 +513,26 @@ def lotz_rate(I_eV, z, Z, T_eV):
     return S
 
 
-def cr_balance(I_eV, Z, A, rho, T_eV):
-    """collisional-radiative steady-state ion fractions (see the notes above): (fractions, n_e cm^-3, Z_bar)"""
+def dr_rates(I_eV, Z, T_eV, dr="burgess", dr_table=None):
+    """dielectronic rates (Z, ...) cm^3/s, row z for the recombination z + 1 -> z: 'burgess' (General Formula over the
+    model core transitions), 'chianti' (fitted rates in dr_table {recombining charge: parsed .drparams}, Burgess where
+    the table has none) or None"""
+    T = np.asarray(T_eV, float)
+    if dr is None:
+        return np.zeros((Z,) + T.shape)
+    out = []
+    for z in range(Z):
+        q = z + 1
+        if dr == "chianti" and dr_table and q in dr_table:
+            out.append(chianti_dr_rate(dr_table[q], T))
+        else:
+            out.append(burgess_dr(I_eV, Z, q, T))
+    return np.stack([np.broadcast_to(o, T.shape) for o in out])
+
+
+def cr_balance(I_eV, Z, A, rho, T_eV, dr=None, dr_table=None):
+    """collisional-radiative steady-state ion fractions (see the notes above): (fractions, n_e cm^-3, Z_bar). dr: the
+    dielectronic recombination model of dr_rates ('burgess', 'chianti' with dr_table, or None)"""
     I = fill_ionization(I_eV)
     rho, T = np.broadcast_arrays(np.asarray(rho, float), np.asarray(T_eV, float))
     ni = rho * 1e-3 / (A * _AMU * 1e3)
@@ -521,7 +541,7 @@ def cr_balance(I_eV, Z, A, rho, T_eV):
     zz = np.arange(len(I)).reshape(shape)
     Ik = I.reshape(shape)
     S = np.stack([lotz_rate(I_eV, z, Z, T) for z in range(len(I))])
-    alpha_r = 2.6e-13 * (zz + 1.0)**2 * np.sqrt(13.6 / T[None])
+    alpha_r = 2.6e-13 * (zz + 1.0)**2 * np.sqrt(13.6 / T[None]) + dr_rates(I_eV, Z, T, dr, dr_table)
     S0 = 6.0359e21 * T**1.5
 
     def ratio(ne):
@@ -543,8 +563,200 @@ def _bf_cross_sections(I, Z, E):
     return out
 
 
-def atomic_opacity(I_eV, Z, A, rho, T_eV, fractions, ne, E, lines=None, sigma_bf=None):
-    """absorption alpha / rho (E grid) and Thomson kappa per unit mass, cm^2/g, at one density and temperature"""
+# ------------------------------------------------------------------ bound-bound lines and dielectronic recombination
+# Screened-hydrogenic line model for any element and ion stage, from the ground configuration (aufbau order) and the
+# NIST ionization energies: a subshell's binding energy is the ionization energy of the ion in which it is outermost
+# (as for the bound-free edges); an empty upper level of principal number m is hydrogenic in the screened charge z + 1.
+#   dn >= 1 (n -> m): hydrogenic oscillator strengths, Kramers with the Johnson (1972, ApJ 174, 227) bound-bound Gaunt
+#     factor, per electron of the lower subshell and times the vacancy of shell m.
+#   dn = 0 (nl -> n l+1, n >= 2): f = (2/3) (dE / Ry) (l + 1) / (2l + 1) R^2 with the hydrogenic radial integral
+#     R^2 = (9/4) n^2 (n^2 - (l+1)^2) / Z_eff^2 a0^2.
+#   Upper levels whose radius m^2 a0 / (z + 1) exceeds the ion-sphere radius are dissolved (no line).
+# Profiles: Doppler (Gaussian) and electron-impact (Lorentzian) widths combined into a pseudo-Voigt (Thompson, Cox and
+# Hastings 1987, J. Appl. Cryst. 20, 79), integrated exactly over each photon bin so line strength is conserved on any grid.
+# The impact width is Griem's semi-empirical estimate (Phys. Rev. 165, 258, 1968) with an effective Gaunt factor of
+# max(0.2, sqrt(3)/(2 pi) ln(kT / dE_neighbour)): an order-of-magnitude width, not a line-shape calculation.
+# Missing: fine structure and term splitting (each line here is a whole transition array at one energy), dn = 0 lines
+# (their energies would need the subshell energies of the same ion; with the ionization-energy convention above they
+# come out 2-5x too high, so dn0=True is off by default), satellites, occupation probabilities. excited_bf=True adds
+# photoionisation and lines from hydrogenic excited levels, but with the hard ion-sphere cutoff it puts too much of the
+# population in high levels (Planck mean 1.9x -> 5x off TOPS for Al), so it is off by default.
+# Measured against TOPS (examples/atomic_vs_tops.py, results/atomic_lines/): with model lines the Planck mean comes from
+# 12x (Al) and 57x (Cu) low to within about 2x; the Rosseland mean only from 8x to 4x (Al) and 36x to 19x (Cu) low.
+# Tabulated lines do not close the Rosseland gap either (CHIANTI Al, 72k lines: 4.8x), so most of what is missing is
+# continuum and broadening physics, not line lists. Nothing here comes within 5% of TOPS.
+# Dielectronic recombination (cr_balance dr=...): the Burgess General Formula (verified against ADAS's worked Ti 21+
+# values, --test atomic) over valence dn >= 1 core transitions of the model, or CHIANTI's fitted rates for Z <= 30
+# (dr="chianti" with dr_table from tools/atomic_importer.fetch_chianti_dr; Al and Cu bundled). Against CHIANTI's
+# coronal ion balance the fitted rates improve the mean charge (mean |dZ| 0.32 -> 0.22 for Al, 1.09 -> 0.82 for Cu), but
+# the General Formula with model core transitions makes it worse (0.38, 1.38): its core energies are too crude. So the
+# default is no DR; use the CHIANTI fits where they exist. Zero-density rates: density suppression is not modelled.
+_RY, _A0_CM = 13.605693, 0.529177e-8
+
+
+def _subshells(N):
+    """(n, l, occupation, electrons up to and including this subshell) of the ground configuration with N electrons"""
+    out, c = [], 0
+    for n, l in _SUBSHELLS:
+        if c >= N:
+            break
+        k = min(2 * (2 * l + 1), N - c)
+        c += k
+        out.append((n, l, k, c))
+    return out
+
+
+def _johnson_gaunt(n, x):
+    if n == 1:
+        g0, g1, g2 = 1.1330, -0.4059, 0.07014
+    elif n == 2:
+        g0, g1, g2 = 1.0785, -0.2319, 0.02947
+    else:
+        g0 = 0.9935 + 0.2328 / n - 0.1296 / n**2
+        g1 = -(0.6282 - 0.5598 / n + 0.5299 / n**2) / n
+        g2 = (0.3887 - 1.181 / n + 1.470 / n**2) / n**2
+    return g0 + g1 / x + g2 / x**2
+
+
+def hydrogenic_f(n, m):
+    """absorption oscillator strength n -> m of hydrogen averaged over the l states of n: Kramers times the Johnson
+    (1972) Gaunt factor (0.4162, 0.0791, 0.6407 exact for 1-2, 1-3, 2-3)"""
+    n, m = float(n), float(m)                        # integer powers overflow int32 (the NumPy default on Windows)
+    x = 1.0 - (n / m)**2
+    return 32 / (3 * np.sqrt(3) * np.pi) / (n**5 * m**3) * (1 / n**2 - 1 / m**2)**-3 * _johnson_gaunt(n, x)
+
+
+def model_lines(I_eV, Z, z, ni_cgs=None, n_max=10, dn0=False):
+    """screened-hydrogenic absorption lines of the ion of charge z from its ground configuration (see the notes above):
+    rows (z, E_lower = 0, E_upper eV, f, g = 1, m, n), the NIST line layout plus the upper and lower principal numbers,
+    f summed over the electrons of the lower subshell"""
+    I = fill_ionization(I_eV)
+    N = Z - z
+    if N <= 0:
+        return np.zeros((0, 7))
+    sub = _subshells(N)
+    zc = z + 1.0
+    occ_n, occ_nl, bind = {}, {}, {}
+    for n, l, k, c in sub:
+        occ_n[n] = occ_n.get(n, 0) + k
+        occ_nl[(n, l)] = k
+        bind[(n, l)] = I[Z - c]
+    if ni_cgs is not None:                           # dissolved levels: hydrogenic radius beyond the ion sphere
+        r_is = (3.0 / (4 * np.pi * ni_cgs))**(1.0 / 3.0) / _A0_CM
+        n_max = int(min(n_max, max(np.sqrt(r_is * zc), 1.0)))
+
+    def upper(m):                                    # binding of shell m: its outermost occupied subshell, else hydrogenic
+        b = [bind[(n, l)] for n, l, k, c in sub if n == m]
+        return min(b) if b else _RY * zc**2 / m**2
+    rows = []
+    for n, l, k, c in sub:
+        B = bind[(n, l)]
+        if dn0 and l + 1 < n:                        # dn = 0 (off by default: energies not reliable, see the notes)
+            vac = 1.0 - occ_nl.get((n, l + 1), 0) / (2.0 * (2 * l + 3))
+            Bu = bind.get((n, l + 1), _RY * zc**2 / n**2)
+            dE = B - Bu
+            if vac > 0 and dE > 0:
+                R2 = 2.25 * n * n * (n * n - (l + 1)**2) / (B * n * n / _RY)
+                rows.append((z, 0.0, dE, (2.0 / 3.0) * dE / _RY * (l + 1) / (2 * l + 1) * R2 * k * vac, 1.0, n, n))
+        for m in range(n + 1, n_max + 1):           # dn >= 1
+            vac = 1.0 - occ_n.get(m, 0) / (2.0 * m * m)
+            dE = B - upper(m)
+            if vac > 0 and dE > 0:
+                rows.append((z, 0.0, dE, k * hydrogenic_f(n, m) * vac, 1.0, m, n))
+    return np.array(rows, float).reshape(-1, 7)
+
+
+def _erf(x):
+    """erf to 1.5e-7 (Abramowitz & Stegun 7.1.26)"""
+    s = np.sign(x)
+    x = np.abs(x)
+    t = 1.0 / (1.0 + 0.3275911 * x)
+    y = 1.0 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * np.exp(-x * x)
+    return s * y
+
+
+def pseudo_voigt_cdf(x, fwhm_g, fwhm_l):
+    """cumulative pseudo-Voigt profile at offset x from line centre (same units as the widths), Thompson-Cox-Hastings"""
+    g, lo = np.maximum(fwhm_g, 1e-300), fwhm_l
+    G = (g**5 + 2.69269 * g**4 * lo + 2.42843 * g**3 * lo**2 + 4.47163 * g**2 * lo**3 + 0.07842 * g * lo**4 + lo**5)**0.2
+    r = lo / G
+    eta = 1.36603 * r - 0.47719 * r**2 + 0.11116 * r**3
+    cg = 0.5 * (1.0 + _erf(x * (2.0 * np.sqrt(np.log(2.0)) / G)))
+    cl = 0.5 + np.arctan(2.0 * x / G) / np.pi
+    return eta * cl + (1.0 - eta) * cg
+
+
+def line_widths(E0, z, m, A, T_eV, ne):
+    """(Doppler FWHM, electron-impact FWHM) in eV of a line at E0 (eV) to an upper level of principal number m in an ion
+    of charge z (see the notes above)"""
+    zc = z + 1.0
+    dop = E0 * np.sqrt(8 * np.log(2.0) * T_eV / (A * 931.494e6))
+    r2 = m * m * (5.0 * m * m + 1.0 - 6.0) / (2.0 * zc * zc)          # <r^2> / a0^2 of an upper p-like level
+    dE_nb = 2.0 * _RY * zc * zc / np.maximum(m, 1.0)**3
+    gauntf = np.maximum(0.2, np.sqrt(3.0) / (2 * np.pi) * np.log(np.maximum(T_eV / dE_nb, 1e-30)))
+    hw = 3.46e-23 * ne * np.sqrt(_RY / T_eV) * np.maximum(r2, 0.0) * gauntf     # half width, eV (Griem 1968)
+    return dop, 2.0 * hw
+
+
+def deposit_lines(E, E0, strength, fwhm_g, fwhm_l, reach=30.0):
+    """absorption (cm^-1) on the photon grid E (log-spaced, eV) of lines at E0 with integrated strengths in cm^-1 Hz: each
+    profile is integrated over the bins within reach widths of its centre and renormalised there"""
+    edges = np.sqrt(E[1:] * E[:-1])
+    edges = np.concatenate([[E[0]**2 / edges[0]], edges, [E[-1]**2 / edges[-1]]])
+    out = np.zeros(len(E))
+    if not len(E0):
+        return out
+    k0 = np.clip(np.searchsorted(edges, E0) - 1, 0, len(E) - 1)
+    width = np.maximum(fwhm_g, fwhm_l)
+    K = np.clip(np.ceil(reach * width / (edges[k0 + 1] - edges[k0])), 1, 512).astype(int)
+    for kk in np.unique(2**np.ceil(np.log2(K)).astype(int)):     # group lines by window size
+        sel = (2**np.ceil(np.log2(K)).astype(int)) == kk
+        off = np.arange(-kk, kk + 1)
+        idx = np.clip(k0[sel, None] + off[None], 0, len(E) - 1)
+        lo, hi = edges[idx] - E0[sel, None], edges[idx + 1] - E0[sel, None]
+        c = pseudo_voigt_cdf(hi, fwhm_g[sel, None], fwhm_l[sel, None]) - pseudo_voigt_cdf(lo, fwhm_g[sel, None], fwhm_l[sel, None])
+        c = np.where(np.diff(np.concatenate([idx[:, :1] - 1, idx], axis=1), axis=1) > 0, c, 0.0)   # clipped duplicates
+        c /= np.maximum(c.sum(axis=1, keepdims=True), 1e-300)
+        np.add.at(out, idx.ravel(), (strength[sel, None] * c).ravel())
+    return out / (np.diff(edges) * 2.417989e14)
+
+
+def burgess_dr(I_eV, Z, q, T_eV, core=None):
+    """zero-density dielectronic recombination rate coefficient (cm^3/s) of the ion of charge q into q - 1, Burgess
+    General Formula over the dipole core transitions of the recombining ion (model_lines unless core rows are given)"""
+    if q >= Z or q < 1:
+        return np.zeros_like(np.asarray(T_eV, float))
+    if core is None:                                 # core transitions of the valence (outermost) shell only
+        core = model_lines(I_eV, Z, q)
+        n_out = max(n for n, l, k, c in _subshells(Z - q))
+        core = core[(core[:, 6] == n_out) & (core[:, 5] > core[:, 6])]
+    T_K = np.asarray(T_eV, float) * 11604.518
+    B = np.sqrt(q) * (q + 1)**2.5 / np.sqrt(q * q + 13.4)
+    a = 1.0 + 0.015 * q**3 / (q + 1)**2
+    out = 0.0
+    for row in core:
+        El, Eu, f = row[1], row[2], row[3]
+        e = (Eu - El) / _RY
+        x = e / (q + 1)
+        Ax = np.sqrt(x) / (1.0 + 0.105 * x + 0.015 * x * x)
+        out = out + f * Ax * np.exp(-e * 157887.5 / (a * T_K))
+    return 3.0e-3 * T_K**-1.5 * B * out
+
+
+def chianti_dr_rate(rows, T_eV):
+    """dielectronic rate (cm^3/s) from a parsed CHIANTI .drparams entry: type 1, T^-3/2 sum c_i exp(-E_i / T), or
+    type 2, A T^-3/2 exp(-T0 / T) (1 + B exp(-T1 / T)); T in K inside"""
+    T = np.asarray(T_eV, float) * 11604.518
+    if rows["type"] == 1:
+        return T**-1.5 * sum(c * np.exp(-e / T) for e, c in zip(rows["E"], rows["c"]) if c != 0)
+    A, B, T0, T1 = rows["c"][:4]
+    return A * T**-1.5 * np.exp(-T0 / T) * (1 + B * np.exp(-T1 / T))
+
+
+def atomic_opacity(I_eV, Z, A, rho, T_eV, fractions, ne, E, lines=None, sigma_bf=None, line_model=False, dn0=False,
+                   excited_bf=False):
+    """absorption alpha / rho (E grid) and Thomson kappa per unit mass, cm^2/g, at one density and temperature. lines:
+    tabulated lines (NIST layout); line_model: add screened-hydrogenic lines for the stages without tabulated ones"""
     I = fill_ionization(I_eV)
     sigma_bf = _bf_cross_sections(I, Z, E) if sigma_bf is None else sigma_bf
     rho_cgs = rho * 1e-3
@@ -555,30 +767,75 @@ def atomic_opacity(I_eV, Z, A, rho, T_eV, fractions, ne, E, lines=None, sigma_bf
     nu = E * 2.417989e14
     T_K = T_eV * 11604.518
     a_ff = 3.692e8 * 1.2 * stim * z2 * ne * ni / np.sqrt(T_K) / nu**3
-    a_bf = ni * (fractions[:Z] @ sigma_bf) * stim
+    U_ground = np.ones(Z + 1)                        # stage population over its ground-configuration share
+    excited_lines = []
+    if excited_bf:                                   # photoionisation from excited (hydrogenic, Boltzmann) levels too
+        a_bf = np.zeros_like(E)
+        for z in range(Z):
+            if fractions[z] < 1e-8:
+                continue
+            m0 = max(n for n, l, k, c in _subshells(Z - z)) + 1
+            m_hi = int(max(np.sqrt((3.0 / (4 * np.pi * ni))**(1.0 / 3.0) / _A0_CM * (z + 1.0)), 1.0))
+            ms = np.arange(m0, max(m_hi, m0 - 1) + 1)
+            Bm = _RY * (z + 1.0)**2 / ms**2
+            wm = 2.0 * ms**2 * np.exp(-np.maximum(I[z] - Bm, 0.0) / T_eV)
+            U = 1.0 + wm.sum()
+            U_ground[z] = U
+            sig = sigma_bf[z] / U
+            for m, B, w in zip(ms, Bm, wm):
+                sig = sig + (w / U) * 7.91e-18 * m / (z + 1.0)**2 * (B / E)**3 * (E >= B)
+                for m2, B2 in zip(ms, Bm):           # and its bound-bound lines to higher excited levels
+                    if m2 > m:
+                        El = max(I[z] - B, 0.0)
+                        excited_lines.append((z, El, El + B - B2, hydrogenic_f(m, m2), 2.0 * m * m, m2))
+            a_bf += ni * fractions[z] * sig * stim
+    else:
+        a_bf = ni * (fractions[:Z] @ sigma_bf) * stim
     a = a_ff + a_bf
-    if lines is not None and len(lines):
-        q, El, Eu, fl, gl = lines.T
-        qi = q.astype(int)
-        keep = qi <= Z
-        qi, El, Eu, fl, gl = qi[keep], El[keep], Eu[keep], fl[keep], gl[keep]
-        # lower-level populations: Boltzmann within the stage, with the ground weight as the partition function
-        pop = fractions[qi] * ni * gl / np.maximum(_g0_of(qi, lines), 1.0) * np.exp(-El / T_eV)
-        strength = 2.6540e-2 * fl * pop * (1 - np.exp(-(Eu - El) / T_eV))   # pi e^2 / (m c) f n, cm^-1 Hz
-        edges = np.sqrt(E[1:] * E[:-1])
-        edges = np.concatenate([[E[0]**2 / edges[0]], edges, [E[-1]**2 / edges[-1]]])
-        k = np.clip(np.searchsorted(edges, Eu - El) - 1, 0, len(E) - 1)      # conservative deposit into the grid bin
-        a = a + np.bincount(k, strength, len(E)) / (np.diff(edges) * 2.417989e14)
+    tab = np.zeros((0, 5)) if lines is None else np.asarray(lines, float)
+    tab = tab[tab[:, 0].astype(int) <= Z] if len(tab) else tab
+    have = set(tab[:, 0].astype(int)) if len(tab) else set()
+    tab = tab[:, :5]
+    if len(tab):                                     # bound lower levels only (lists include autoionising levels)
+        tab = tab[tab[:, 1] < I[tab[:, 0].astype(int)]]
+    parts, ms = [tab], [np.full(len(tab), 3.0)]     # tabulated lines: upper principal number 3 for the impact width
+    if line_model and excited_lines:
+        X = np.array(excited_lines, float)
+        parts.append(X[:, :5])
+        ms.append(X[:, 5])
+    if line_model:
+        for z in range(Z):
+            if z not in have and fractions[z] > 1e-8:
+                L = model_lines(I, Z, z, ni, dn0=dn0)
+                parts.append(L[:, :5])
+                ms.append(L[:, 5])
+    L = np.concatenate(parts) if len(parts) > 1 else tab
+    if len(L):
+        m_up = np.concatenate(ms)
+        qi = L[:, 0].astype(int)
+        El, Eu, fl, gl = L[:, 1], L[:, 2], L[:, 3], L[:, 4]
+        U = U_ground[qi].copy()                      # model lines start in the ground configuration
+        if len(tab):
+            U[:len(tab)] = _partition_of(qi[:len(tab)], tab, T_eV)
+        # lower-level populations: Boltzmann within the stage over the partition function of its listed lower levels
+        pop = fractions[qi] * ni * gl / U * np.exp(-El / T_eV)
+        dE = Eu - El
+        strength = 2.6540e-2 * fl * pop * (-np.expm1(-dE / T_eV))      # pi e^2 / (m c) f n, cm^-1 Hz
+        gD, gL = line_widths(dE, qi, m_up, A, T_eV, ne)
+        a = a + deposit_lines(E, dE, strength, gD, gL)
     k_es = 0.6652e-24 * ne / rho_cgs
     return a / rho_cgs, k_es
 
 
-def _g0_of(q, lines):
-    """statistical weight of each stage's lowest listed level (the partition-function stand-in)"""
+def _partition_of(q, lines, T_eV):
+    """partition function of each stage at T: sum of g exp(-E / T) over the distinct lower levels in its line list
+    (CHIANTI and NIST list lines from many excited levels; their populations must sum to the stage's, so the ground
+    weight alone is not enough). Levels that appear only as upper levels are left out, a small underestimate."""
     out = np.ones(int(lines[:, 0].max()) + 1)
     for z in np.unique(lines[:, 0].astype(int)):
         s = lines[lines[:, 0].astype(int) == z]
-        out[z] = s[np.argmin(s[:, 1]), 4]
+        lev = np.unique(np.round(s[:, [1, 4]], 6), axis=0)
+        out[z] = max(float(np.sum(lev[:, 1] * np.exp(-lev[:, 0] / T_eV))), 1.0)
     return out[q]
 
 
@@ -601,9 +858,12 @@ def group_means(k_abs, k_es, E, T_eV, edges):
     return kP, kR
 
 
-def build_atomic_table(Z, A, I_eV, edges_eV, rho=None, T_eV=None, lines=None, nonlte=False, n_E=6000):
+def build_atomic_table(Z, A, I_eV, edges_eV, rho=None, T_eV=None, lines=None, nonlte=False, n_E=6000, line_model=True,
+                       dr=None, dr_table=None, line_source="NIST"):
     """multigroup opacity and ionization table from NIST-type atomic data, in the format of fld_mg_table: rho (kg/m^3),
-    T (K), kappa_R_g, kappa_P_g (G, nr, nt) in m^2/kg, group_edges_eV, plus Zbar_lte, Zbar_nlte (nr, nt)"""
+    T (K), kappa_R_g, kappa_P_g (G, nr, nt) in m^2/kg, group_edges_eV, plus Zbar_lte, Zbar_nlte (nr, nt). lines:
+    tabulated lines (NIST layout, named by line_source); line_model: screened-hydrogenic lines for the other stages;
+    dr, dr_table: dielectronic recombination in the non-LTE balance (dr_rates)"""
     rho = np.geomspace(1e-3, 1e4, 15) if rho is None else np.asarray(rho, float)
     T_eV = np.geomspace(1.0, 3e3, 36) if T_eV is None else np.asarray(T_eV, float)
     E = np.geomspace(0.05, 2e5, n_E)
@@ -613,15 +873,17 @@ def build_atomic_table(Z, A, I_eV, edges_eV, rho=None, T_eV=None, lines=None, no
     sbf = _bf_cross_sections(I, Z, E)
     R, TT = np.meshgrid(rho, T_eV, indexing="ij")
     f_l, ne_l, zb_l = saha_balance(I, A, R, TT)
-    f_n, ne_n, zb_n = cr_balance(I, Z, A, R, TT)
+    f_n, ne_n, zb_n = cr_balance(I, Z, A, R, TT, dr=dr, dr_table=dr_table)
     f, ne = (f_n, ne_n) if nonlte else (f_l, ne_l)
     kR, kP = np.zeros((G, len(rho), len(T_eV))), np.zeros((G, len(rho), len(T_eV)))
     for i in range(len(rho)):
         for j in range(len(T_eV)):
-            ka, ke = atomic_opacity(I, Z, A, rho[i], T_eV[j], f[:, i, j], ne[i, j], E, lines, sbf)
+            ka, ke = atomic_opacity(I, Z, A, rho[i], T_eV[j], f[:, i, j], ne[i, j], E, lines, sbf, line_model=line_model)
             kP[:, i, j], kR[:, i, j] = group_means(ka, ke, E, T_eV[j], edges)
-    src = ("NIST ASD ionization energies" + (" and lines" if lines is not None else "") + "; "
-           + ("collisional-radiative" if nonlte else "Saha") + " ion balance; screened-hydrogenic bound-free, Kramers free-free")
+    src = ("NIST ASD ionization energies" + (f"; {line_source} lines" if lines is not None else "")
+           + ("; screened-hydrogenic model lines" if line_model else "") + "; "
+           + ("collisional-radiative" + (f" with {dr} dielectronic recombination" if dr else "") if nonlte else "Saha")
+           + " ion balance; screened-hydrogenic bound-free, Kramers free-free")
     return dict(rho=rho, T=T_eV * 11604.518, kappa_R_g=np.maximum(kR, 1e-300) * 0.1, kappa_P_g=np.maximum(kP, 1e-300) * 0.1,
                 group_edges_eV=edges, Zbar_lte=zb_l, Zbar_nlte=zb_n, Z=Z, A=A, source=src)
 
