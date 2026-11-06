@@ -340,6 +340,31 @@ def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=
     return (div, qs) if return_flux else div
 
 
+# Thermonuclear reactivities: Bosch & Hale, Nucl. Fusion 32, 611 (1992), Table VII. <sigma v> in cm^3/s for a Maxwellian
+# at T in keV: theta = T / (1 - T (C2 + T (C4 + T C6)) / (1 + T (C3 + T (C5 + T C7)))), xi = (B_G^2 / (4 theta))^(1/3),
+# <sigma v> = C1 theta sqrt(xi / (m_r c^2 T^3)) exp(-3 xi). Within 0.25% of their tabulated reactivities over the valid
+# range (checked in --test fusion); T is clamped into that range (below it the reactivity is < 1e-9 of its peak).
+BOSCH_HALE = {   # name: (B_G keV^1/2, m_r c^2 keV, (C1 ... C7), (T_min, T_max) keV)
+    "DT": (34.3827, 1124656.0, (1.17302e-9, 1.51361e-2, 7.51886e-2, 4.60643e-3, 1.35000e-2, -1.06750e-4, 1.36600e-5),
+           (0.2, 100.0)),
+    "DHe3": (68.7508, 1124572.0, (5.51036e-10, 6.41918e-3, -2.02896e-3, -1.91080e-5, 1.35776e-4, 0.0, 0.0), (0.5, 190.0)),
+    "DD_nHe3": (31.3970, 937814.0, (5.43360e-12, 5.85778e-3, 7.68222e-3, 0.0, -2.96400e-6, 0.0, 0.0), (0.2, 100.0)),
+    "DD_pT": (31.3970, 937814.0, (5.65718e-12, 3.41267e-3, 1.99167e-3, 0.0, 1.05060e-5, 0.0, 0.0), (0.2, 100.0)),
+}
+
+
+def bosch_hale(T_keV, reaction="DT", ops=None):
+    """Maxwellian reactivity <sigma v> (cm^3/s) of reaction ('DT', 'DHe3', 'DD_nHe3', 'DD_pT') at T_keV. ops: a module
+    with exp, sqrt, maximum, minimum (NumPy, CuPy, or aegis.autodiff for a differentiable objective); default from T"""
+    if ops is None:
+        ops = np if isinstance(T_keV, (float, int, np.ndarray)) else xp
+    BG, mrc2, (C1, C2, C3, C4, C5, C6, C7), (lo, hi) = BOSCH_HALE[reaction]
+    T = ops.minimum(ops.maximum(T_keV, lo), hi)
+    theta = T / (1.0 - T * (C2 + T * (C4 + T * C6)) / (1.0 + T * (C3 + T * (C5 + T * C7))))
+    xi = (BG * BG / 4.0 / theta) ** (1.0 / 3.0)
+    return C1 * theta * ops.sqrt(xi / (mrc2 * T * T * T)) * ops.exp(-3.0 * xi)
+
+
 # RKL2 stage plans for CUDA-graph capture (aegis/bridge.NativeStepper). The stage count of a super-time-step follows
 # from the largest diffusivity, a value read back from the device. mode 'record': each split step stores its need at
 # dt * margin (keeping the largest); mode 'replay': the stored counts are used and nothing is read from the device, so

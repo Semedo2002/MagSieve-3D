@@ -3293,6 +3293,131 @@ def rlc_adjoint_test():
     return good
 
 
+def fusion_test():
+    """Thermonuclear reactivities and a calibrated, differentiable yield (aegis/physics.py bosch_hale, aegis/autodiff.py
+    fusion_rate, spline_current_drive). (1) Bosch-Hale against the reactivities tabulated in Bosch & Hale (1992), Table
+    VIII, for DT and both DD branches. (2) The same formula on autodiff tensors: equal to the array version, derivative
+    against central differences. (3) An r-z liner driven by a current I(t) given as a natural cubic spline through 5
+    knot values: the spline passes through its knots, and the adjoint gradient of the DT yield (reactions, Bosch-Hale)
+    with respect to the 5 knot currents and a shape mode agrees with central differences on the same step sequence."""
+    from aegis import autodiff as ad
+    from aegis.physics import bosch_hale
+    print("\n--- Fusion reactivity and differentiable yield ---"); sys.stdout.flush()
+    ok = True
+    # Bosch & Hale (1992) Table VIII, cm^3/s
+    Tt = np.array([1.0, 2.0, 5.0, 10.0, 20.0, 50.0])
+    tab = {"DT": [6.857e-21, 2.977e-19, 1.366e-17, 1.136e-16, 4.330e-16, 8.649e-16],
+           "DD_nHe3": [9.933e-23, 3.110e-21, 9.128e-20, 6.023e-19, 2.603e-18, 1.133e-17],
+           "DD_pT": [1.017e-22, 3.150e-21, 9.024e-20, 5.781e-19, 2.399e-18, 9.838e-18]}
+    errs = {k: float(np.max(np.abs(bosch_hale(Tt, k) / np.array(v) - 1))) for k, v in tab.items()}
+    good = max(errs.values()) < 2.5e-3
+    ok = ok and good
+    print("  Bosch-Hale vs their Table VIII (1-50 keV): " + ", ".join(f"{k} {v:.0e}" for k, v in errs.items())
+          + f"  [{'PASS' if good else 'FAIL'}]")
+    Tq = np.array([0.7, 3.0, 12.0, 60.0])
+    with ad.record():
+        x = ad.leaf(Tq.copy())
+        y = bosch_hale(x, "DT", ad)
+        ad.backward(ad.tsum(y))
+    e_v = float(np.max(np.abs(y.v / bosch_hale(Tq, "DT") - 1)))
+    fd = (bosch_hale(Tq * (1 + 1e-6), "DT") - bosch_hale(Tq * (1 - 1e-6), "DT")) / (2e-6 * Tq)
+    e_g = float(np.max(np.abs(x.g / fd - 1)))
+    good = e_v < 1e-14 and e_g < 1e-6
+    ok = ok and good
+    print(f"  on autodiff tensors: value {e_v:.0e}, d<sigma v>/dT vs differences {e_g:.0e}  [{'PASS' if good else 'FAIL'}]")
+    cfg = Config(nx=24, ny=12, x_min=0.0, x_max=1.6, y_min=0.0, y_max=1.0, cfl=0.3, gamma=5 / 3, geometry="cylindrical",
+                 bc_x_type="extrapolation", bc_y_type="periodic", diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(cfg)
+    tk = np.linspace(0.0, 0.4, 5)
+    drive = ad.spline_current_drive(tk, cfg.x_max, offset=1)
+    sim = ad.DiffMHD(s, drive=drive, xp=np)
+    r = to_numpy(s.rc)[:, None] * np.ones((1, s.ny_tot))
+    z = np.ones((s.nx_tot, 1)) * to_numpy(s.y)[None, :]
+
+    def W_fn(p):
+        Rz = 1.0 + p[0] * ad.const(np.cos(2 * np.pi * z))
+        prof = 0.5 * (ad.tanh((ad.const(r) - Rz) / 0.05) - ad.tanh((ad.const(r) - Rz - 0.25) / 0.05))
+        return [0.05 + prof, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.4, 0.0, prof, 0.0]
+    init = lambda p: ad.cells_to_state(sim, W_fn, p)
+    p0 = np.array([0.03, 1.0, 3.0, 5.0, 6.0, 6.0])
+    knots_ok = max(abs(sum(drive.weights(t)[k] * p0[1 + k] for k in range(5)) - p0[1 + i]) for i, t in enumerate(tk))
+    units = dict(L0=1e-3, v0=1e5, rho0=100.0)          # 1 mm, 100 km/s, 0.1 g/cc per code unit
+    Y = lambda st_, t_, p_: ad.fusion_rate(sim, st_, **units)
+    J, g, inf = sim.value_and_grad(init, p0, n_steps=40, step_objective=Y)
+    errs = []
+    for k in range(len(p0)):
+        h = 1e-6 * max(abs(p0[k]), 1.0)
+        fdk = ad.finite_difference(sim, init, p0, k, h, dts=inf["dts"], step_objective=Y)
+        errs.append(abs(fdk - g[k]) / abs(g[k]))
+    good = knots_ok < 1e-12 and J > 0 and max(errs) < 1e-6
+    ok = ok and good
+    print(f"  r-z liner, spline current I(t) through 5 knots (passes them to {knots_ok:.0e}): DT yield {J:.3e} reactions "
+          f"per 40 steps; adjoint d(yield)/d(shape, I_1..I_5) vs central differences: " + ", ".join(f"{e:.0e}" for e in errs)
+          + f"  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
+def _noh_cyl3d(Nr, Nth, T, filt, eps=0.0, p0=1e-6):
+    """cylindrical Noh implosion (v_r = -1 into a cold gas, Mach 775) on the 3D (r, theta, z) solver; eps: m = 1 and
+    m = 3 density perturbation outside r = 0.3. Returns theta-averaged profile data and the azimuthal Fourier modes."""
+    from aegis.solver3d import MHDSolver3D
+    c = Config(nx=Nr, ny=Nth, nz=4, x_min=0.0, x_max=1.0, y_min=0.0, y_max=2 * np.pi, z_min=0.0, z_max=4.0 / Nr,
+               cfl=0.3, gamma=5 / 3, mach=1.0, B_transverse=0.0, geometry="cylindrical", div_b="ct",
+               bc_x_type="extrapolation", bc_y_type="periodic", powell_source=False, diag_interval=10**9,
+               snapshot_times=[], t_end=T, cyl_filter=filt)
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver3D(c)
+    W = xp.zeros((NVAR,) + s.U.shape[1:])
+    th, r3 = xp.asarray(s.y)[None, :, None], xp.asarray(s.x)[:, None, None]
+    W[iRHO] = 1.0 + eps * (xp.cos(3 * th) + xp.cos(th)) * (r3 > 0.3)
+    W[iPR], W[iVX] = p0, -1.0
+    s.U = prim_to_cons(W, s.eos)
+    s._ct_sync()
+    s.t, s.step = 0.0, 0
+    while s.t < T - 1e-12:
+        s.dt = min(s.compute_dt(cons_to_prim(s.U, s.eos)), T - s.t)
+        s.step_ssprk3(); s.t += s.dt; s.step += 1
+    ng = s.ng
+    rho = to_numpy(s.U[iRHO, ng:-ng, ng:-ng, ng:-ng])
+    r = to_numpy(s.x)[ng:-ng]
+    prof = rho.mean(axis=(1, 2))
+    rs = T / 3.0
+    mid = 0.5 * (16.0 + (1.0 + T / rs))
+    i = np.where(prof > mid)[0].max()
+    r_shock = r[i] + (prof[i] - mid) / (prof[i] - prof[i + 1]) * (r[i + 1] - r[i])
+    return dict(steps=s.step, r_shock=r_shock, plateau=float(prof[(r > 0.3 * rs) & (r < 0.8 * rs)].mean()),
+                F=np.fft.rfft(rho.mean(axis=2), axis=1) / rho.shape[1], finite=bool(xp.all(xp.isfinite(s.U))))
+
+
+def noh_cyl3d_test():
+    """Strong-shock implosion through the axis of the 3D cylindrical solver with the near-axis azimuthal filter
+    (solver3d cyl_filter). Cylindrical Noh problem, cold gas at Mach 775: (1) axisymmetric, against the exact solution
+    (shock at r = t / 3, post-shock density 16): the shock radius converges with resolution. (2) With m = 1 and m = 3
+    density perturbations, filtered vs unfiltered runs: the filter takes several times fewer steps, the m = 0 and m = 1
+    content agrees everywhere and every mode agrees outside the filtered rings (r dtheta < dr, where m = 3 is removed by
+    design)."""
+    print("\n--- Strong-shock implosion through the axis (3D cylindrical, filtered) ---"); sys.stdout.flush()
+    ok = True
+    a, b = _noh_cyl3d(32, 48, 0.6, True), _noh_cyl3d(64, 96, 0.6, True)
+    ea, eb = abs(a["r_shock"] - 0.2) / 0.2, abs(b["r_shock"] - 0.2) / 0.2
+    good = a["finite"] and b["finite"] and eb < 0.03 and eb < ea and abs(b["plateau"] / 16 - 1) < 0.2
+    ok = ok and good
+    print(f"  axisymmetric Noh, Mach 775, t = 0.6: shock radius error {ea:.3f} (32 x 48), {eb:.3f} (64 x 96); post-shock "
+          f"density {a['plateau']:.1f}, {b['plateau']:.1f} (exact 16; 15.6 at 128 x 192)  [{'PASS' if good else 'FAIL'}]")
+    f, u = _noh_cyl3d(32, 48, 0.6, True, eps=0.05), _noh_cyl3d(32, 48, 0.6, False, eps=0.05)
+    rel = {m: np.abs(f["F"][:, m] - u["F"][:, m]) / np.abs(u["F"][:, m]).max() for m in (0, 1, 3)}
+    k0 = int(np.ceil(48 / (2 * np.pi)))              # filtered rings: r dtheta < dr, the first Ntheta / (2 pi)
+    out = max(float(v[k0:].max()) for v in rel.values())
+    good = (f["finite"] and u["finite"] and u["steps"] > 3 * f["steps"] and rel[0].max() < 0.01 and rel[1].max() < 0.05
+            and out < 0.01)
+    ok = ok and good
+    print(f"  m = 1 + 3 perturbed (32 x 48): {f['steps']} steps with the filter, {u['steps']} without; filtered vs "
+          f"unfiltered, m = 0 {rel[0].max():.0e}, m = 1 {rel[1].max():.0e}, m = 3 {rel[3].max():.0e} (innermost rings), "
+          f"all modes outside the {k0} filtered rings {out:.0e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def literature_test():
     """Literature trace library and virtual diagnostics (aegis/validation.py). (1) Provenance: a digitized trace
     without a citation or a figure is refused, a good one loads with click-order points sorted and units scaled, HDF5
@@ -4234,6 +4359,8 @@ VERIFICATION_TESTS = {
     "gmg": gmg_test,
     "cyl_filter": cyl_filter_test,
     "rlc_adjoint": rlc_adjoint_test,
+    "fusion": fusion_test,
+    "noh_cyl3d": noh_cyl3d_test,
     "literature": literature_test,
     "atomic": atomic_test,
     "bridge": bridge_test,

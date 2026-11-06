@@ -885,7 +885,8 @@ def interior(sim, a):
 def yield_proxy(sim, state, tracer_max=0.5):
     """a smooth fusion-yield stand-in for objectives: sum over the fuel of rho^2 theta^4 dV (DT reactivity rises
     roughly as T^4 at a few keV), fuel weight max(1 - C / tracer_max, 0) from the mass-fraction tracer C. Not a
-    calibrated yield: no units, cross sections or burn"""
+    calibrated yield: no units, cross sections or burn. Kept so earlier results reproduce; for a yield in reactions use
+    fusion_rate (Bosch-Hale)"""
     I = (slice(sim.ng, sim.ng + sim.nx), slice(sim.ng, sim.ng + sim.ny))
     rho = maximum(state[RHO][I], FLOOR_RHO)
     E, M = state[EN][I], [state[k][I] for k in (MX, MY, MZ)]
@@ -895,6 +896,74 @@ def yield_proxy(sim, state, tracer_max=0.5):
     C = minimum(maximum(state[RHOC][I] / rho, 0.0), 1.0)
     fuel = maximum(1.0 - C * (1.0 / tracer_max), 0.0)
     return tsum(fuel * rho * rho * th * th * th * th * sim.dV)
+
+
+def fusion_rate(sim, state, L0, v0, rho0, fuel="DT", tracer_max=0.5):
+    """thermonuclear reactions per unit code time over the fuel, from Bosch-Hale reactivities (physics.bosch_hale), so
+    that as a step objective (summed with weight dt) it gives the number of reactions. Units: L0 (m), v0 (m/s), rho0
+    (kg/m^3) per code unit; T_i = T_e = p / rho at full ionisation (units.temperature_eV_per_code). fuel 'DT' (50:50,
+    n_D n_T <sigma v>) or 'DD' (both branches, n_D^2 / 2 <sigma v>). Volume: the full 2 pi in r-z, per L0 of depth in
+    2D Cartesian. Fuel weight max(1 - C / tracer_max, 0) as in yield_proxy. No burn depletion, alpha heating or
+    reabsorption: the yield of the hydrodynamic history."""
+    import sys
+    from .physics import bosch_hale
+    from .units import temperature_eV_per_code, AMU
+    ad = sys.modules[__name__]
+    A = 2.5 if fuel == "DT" else 2.014
+    I = (slice(sim.ng, sim.ng + sim.nx), slice(sim.ng, sim.ng + sim.ny))
+    rho = maximum(state[RHO][I], FLOOR_RHO)
+    E, M = state[EN][I], [state[k][I] for k in (MX, MY, MZ)]
+    Bs = state[BX][I] * state[BX][I] + state[BY][I] * state[BY][I] + state[BZ][I] * state[BZ][I]
+    p = maximum((sim.g - 1.0) * (E - 0.5 * (M[0] * M[0] + M[1] * M[1] + M[2] * M[2]) / rho - 0.5 * Bs), FLOOR_PR)
+    T_keV = (p / rho) * (temperature_eV_per_code(v0, A, 1.0) * 1e-3)
+    C = minimum(maximum(state[RHOC][I] / rho, 0.0), 1.0)
+    n = (rho * fuel_weight(C, tracer_max)) * (rho0 / (A * AMU))          # fuel ions per m^3
+    if fuel == "DT":
+        dens = 0.25 * n * n * (bosch_hale(T_keV, "DT", ad) * 1e-6)
+    else:
+        dens = 0.5 * n * n * ((bosch_hale(T_keV, "DD_nHe3", ad) + bosch_hale(T_keV, "DD_pT", ad)) * 1e-6)
+    vol = sim.dV * L0**3 * (2.0 * np.pi if sim.cyl else 1.0)
+    return tsum(dens * vol) * (L0 / v0)
+
+
+def fuel_weight(C, tracer_max):
+    return maximum(1.0 - C * (1.0 / tracer_max), 0.0)
+
+
+def spline_current_drive(t_knots, r_max, offset=0):
+    """a drive(t, params) for DiffMHD: the current I(t) (code units, mu0 = 1) as a natural cubic spline through the knot
+    values params[offset : offset + len(t_knots)] at times t_knots (held at the end values outside them), applied as
+    the piston field B_phi(r_max) = I / (2 pi r_max). The spline is linear in the knot values, so their gradients are
+    exact; the weights are computed once per time."""
+    tk = np.asarray(t_knots, float)
+    n = len(tk)
+    h = np.diff(tk)
+    # second derivatives M = K y of the natural spline (M_0 = M_n-1 = 0): tridiagonal system, solved once for all y
+    Amat, Bmat = np.zeros((n, n)), np.zeros((n, n))
+    Amat[0, 0] = Amat[-1, -1] = 1.0
+    for i in range(1, n - 1):
+        Amat[i, i - 1], Amat[i, i], Amat[i, i + 1] = h[i - 1] / 6.0, (h[i - 1] + h[i]) / 3.0, h[i] / 6.0
+        Bmat[i, i - 1], Bmat[i, i], Bmat[i, i + 1] = 1.0 / h[i - 1], -1.0 / h[i - 1] - 1.0 / h[i], 1.0 / h[i]
+    K = np.linalg.solve(Amat, Bmat)
+    cache = {}
+
+    def weights(t):
+        t = float(min(max(t, tk[0]), tk[-1]))
+        if t not in cache:
+            i = int(min(max(np.searchsorted(tk, t) - 1, 0), n - 2))
+            a, b = (tk[i + 1] - t) / h[i], (t - tk[i]) / h[i]
+            w = np.zeros(n)
+            w[i], w[i + 1] = a, b
+            w += ((a**3 - a) * K[i] + (b**3 - b) * K[i + 1]) * h[i]**2 / 6.0
+            cache[t] = w
+        return cache[t]
+
+    def drive(t, params):
+        w = weights(t)
+        I = sum(params[offset + k] * float(w[k]) for k in range(n) if w[k] != 0.0)
+        return I * (1.0 / (2.0 * np.pi * r_max))
+    drive.weights = weights
+    return drive
 
 
 def total_energy(sim, state):

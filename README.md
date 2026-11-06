@@ -130,6 +130,12 @@ The 3D solver runs `geometry="cylindrical"` in (r, theta, z), scale factors (1, 
     stays at round-off;
   - the blob of `--test cylindrical3d` crosses the axis in 16x fewer steps with the same centroid and field error
     (`--test cyl_filter`);
+  - strong shocks through the axis (`--test noh_cyl3d`): the cylindrical Noh implosion of a cold gas at Mach 775 stays
+    finite and its shock radius converges to the exact r = t / 3 (14%, 1.9%, 1.3% off at 32, 64, 128 radial cells;
+    post-shock density 19.9, 13.9, 15.6 against 16, with the usual wall-heating error near the axis). With m = 1 and m = 3
+    density perturbations the filter takes 4.5x (32 x 48) to 12x (64 x 96) fewer steps; m = 0 and m = 1 agree with the
+    unfiltered run to 0.3% and 3% everywhere, every mode agrees to 5e-6 outside the filtered rings, and inside them m = 3
+    is removed by design;
   - the cost is that structure finer than m_crit is removed near the axis; it uses CuPy's FFT (cuFFT; with the
     pip CUDA wheels, `pip install aegis-mhd[fft]`).
 
@@ -583,14 +589,26 @@ discrete adjoint (reverse mode):
     step solved as one scalar quadratic, so bank + resistor + grid energy is conserved to round-off;
   - adjoint derivatives with respect to V0, C, L and R match central differences to 1e-9
     (`--test rlc_adjoint`);
-  - `yield_proxy` is a smooth fusion-yield stand-in (sum of rho^2 theta^4 over the fuel), not a calibrated yield;
+  - `yield_proxy` is a smooth fusion-yield stand-in (sum of rho^2 theta^4 over the fuel), kept so earlier results
+    reproduce; `fusion_rate` (below) is the calibrated yield;
   - `examples/optimize_liner_shape.py --circuit` optimises the liner shape and the bank capacitance (pulse
     timing, at fixed stored energy) together. Default run (56 x 32, 12 iterations, ~40 min on one CPU core):
     - the peak window field goes from 17.3 B0 to 24.2 B0 (smooth time maximum; instantaneous 25 -> 33 B0);
     - C goes from 0.60 to 0.515 together with an axial reshaping of the liner;
     - adjoint vs central difference: 1e-7 (`results/liner_optimization/`).
-- **Scope:** ideal gas, ideal MHD with `div_b='ct'`, 2D. It refuses resistivity, EOS tables, transport,
-  radiation, strength and 3D.
+- **Calibrated yield (`fusion_rate`):** thermonuclear reactions per unit time over the fuel from the Bosch-Hale (1992)
+  reactivities (`physics.bosch_hale`: DT, D-3He and both DD branches, within 0.04% of their tabulated values), with
+  SI units given by L0, v0, rho0, as a step objective. It is the yield of the hydrodynamic history: no burn depletion,
+  alpha heating or radiation.
+- **Drive waveform (`spline_current_drive`):** I(t) as a natural cubic spline through knot values, exactly linear in
+  them, so one adjoint pass gives the gradient with respect to every knot. Adjoint vs central differences for 5 knots
+  and a shape mode: 3e-7 or better (`--test fusion`). `examples/optimize_drive_waveform.py` optimises 6 knots and 2 shape
+  modes together at a fixed drive budget (int I^2 dt): the DT yield of that r-z liner (32 x 16) goes from 8.5e10
+  (linear ramp) and 6.4e11 (constant current) to 4.0e12 reactions, with an early strong pulse; the shape modes stay at
+  zero (`results/drive_waveform/`). One configuration, no burn physics: a demonstration, not a design.
+- **Scope:** ideal gas, ideal MHD with `div_b='ct'`, 2D (Cartesian or r-z). It refuses resistivity, EOS tables,
+  transport, radiation, strength and 3D. There is no 3D adjoint: non-axisymmetric target shapes cannot be optimised
+  with it.
 - **Inverse design:** `examples/optimize_liner_shape.py` optimises the axial shape R(z) = R0 + sum a_k cos(2 pi k z / L)
   of an imploding liner (fixed mass and kinetic energy) to maximise the peak axial field on the axis at the
   mid-plane, by projected Adam on adjoint gradients; `--drive` adds a magnetic piston and reports dB_peak/dI.
@@ -871,6 +889,8 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | cad | STL round trip; sphere volume fractions converge with the ray sampling (6e-4 to 2.5e-5), wall area vectors close; STEP cylinder through gmsh / OpenCASCADE reads back its volume; ring wall in 2D: rest exact with B_z, a sealed blast keeps cavity mass, total mass and energy to ~1e-14; Mach 2 shock reflection off walls inclined at 45 and 30 degrees within 0.4% of the exact pressure; 3D sphere wall: rest to 2e-16, mass and energy 1.6e-15, div B 2e-15 |
 | monitor | synthetic interface: m = 3 growth rate recovered exactly, flux loss flagged; 2D liner implosion: an undeclared 3% m = 3 drive asymmetry is reported as an unexpected mode (growth 5.3 per unit time), none without it; the server serves the WebGPU page, frames (slice, contours, monitor data), the SSE stream and its status |
 | gmg | multigrid vs Jacobi preconditioning, three stiff FLD steps: grey 64^2 1962 -> 70, 128^2 3960 -> 71 iterations (flat with N), 6 Kramers groups 2401 -> 85; solutions within 3e-9, energy at round-off |
+| fusion | Bosch-Hale reactivities within 0.04% of their Table VIII (DT, both DD branches); the same formula on autodiff tensors, derivative vs differences 4e-9; spline current I(t) passes its knots; adjoint gradient of the calibrated DT yield with respect to 5 knot currents and a shape mode vs central differences, 3e-7 or better |
+| noh_cyl3d | cylindrical Noh implosion at Mach 775 on the 3D (r, theta, z) solver with the azimuthal filter: shock radius converges to the exact t / 3 (1.9% at 64 x 96); perturbed m = 1 + 3: 4.5x fewer steps than unfiltered, m = 0, 1 agree to 0.3%, 3%, all modes agree to 5e-6 outside the filtered rings |
 | cyl_filter | the azimuthal filter keeps m <= m_crit exactly and leaves outer rings alone; the blob crossing the axis (32 x 64): 1254 -> 79 steps, centroid and field error unchanged to 1e-4, energy 3e-15, div B 2e-15 |
 | rlc_adjoint | r-z liner driven by an RLC bank: bank + resistor + grid energy 2e-16; d(yield proxy)/d(shape, V0, C, L, R) adjoint vs central differences 2e-10 to 9e-9 |
 | literature | digitized traces without a citation refused, sorting / scaling, HDF5 round trip; virtual probes on a manufactured state: B-dot exact (1e-12), VISAR velocity exact, framing radius within half a cell; synthetic traces: hidden speed recovered within 1%, marked [syn]; self-tests, not validation against an experiment |
