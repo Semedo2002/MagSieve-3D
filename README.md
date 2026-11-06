@@ -38,7 +38,7 @@ aegis/            solver package
   eos_fused.cu    device two-material / tabulated EOS, called inline by the HLLD kernel and the conversions
   eos_fused.py    its host side: packing, launches
   validation.py   shot data vs simulation: chi^2, RMS, peak offset, timing shifts, calibration, report plot
-  experimental_suite.py  bundled open data (Marsh 1980 Cu / Ni Hugoniots) and the plate-impact benchmark
+  experimental_suite.py  bundled open data (six Marsh 1980 Hugoniots), the plate-impact benchmark, validate_all
   amr.py          block-structured adaptive mesh refinement (2D, CT, refluxing, touching patches)
   bridge.py       native timestep driver: captures CUDA graphs, replays them from src/aegis_core.cpp without the GIL
   autodiff.py     reverse-mode tape and DiffMHD, the differentiable ideal-MHD twin (adjoint gradients)
@@ -370,7 +370,20 @@ off unless you turn them on, and each result below was measured against a baseli
   - Result on a held-out flow: correlation with the true stress 0.82-0.86 (Smagorinsky 0.81-0.86), but **in coarse runs it
     makes the answer worse**: velocity error 7.7% against 7.0% for Smagorinsky and 6.7% with no model, since the scheme's own
     numerical dissipation already does this job. Do not use it for accuracy as it stands.
-  - Not built: DeepONet and a multigroup line-emission closure. The radiation predictor above is the only radiation model.
+  - Dynamic Smagorinsky (`dynamic_smagorinsky_stress`, Germano-Lilly with a test filter, coefficient clipped at zero so
+    energy only goes to the sub-grid scales): it measures C_s = 0.31 on that flow and also makes the coarse run worse
+    (velocity error 7.3%). At 64^2 the HLLD scheme already dissipates more than the sub-grid transfer, so **no closure
+    tested here beats no closure**; one that did would have to return energy (backscatter), which is exactly what an
+    eddy-viscosity model with a stability clip cannot do (`results/sgs_fno/report_closures.json`).
+- **Spectrometer surrogate (`aegis/ml/deeponet_rad.py`, `examples/deeponet_spectra.py`):** a DeepONet maps a (T, rho) profile
+  along a 1 mm Al chord (48 zones) to the emergent spectrum in 48 groups (10 eV - 5 keV). Ground truth: the exact formal
+  solution of the transfer equation with opacities from the open atomic pipeline (line model, collisional-radiative ion
+  balance) and a Planck source, so lines self-absorb exactly; it is not a full non-LTE level-population calculation.
+  On 1000 held-out chords (`results/deeponet_spectra/`):
+  - groups within 1e-3 of the spectrum's peak: typical error 17%, 91% within 2x, 95th percentile 2.6x (the optically thin
+    estimate: 6.9x, 35%, 57000x); total power 11% (thin: 31x);
+  - 22 ms against 1.5 s per 1000 chords for the exact solution on the GPU (65x). Useful as a fast first look at many
+    chords; for a number to quote, use the exact solution, which is cheap here anyway.
 - **Surrogate optimizer (`scripts/surrogate_optimizer.py`):** a Gaussian process with expected improvement picks the next
   solver run. Every value it trains on and reports comes from a real run.
   - Branin test function, 30 evaluations: -0.45 against -1.45 for a Latin-hypercube scan (optimum -0.40).
@@ -382,15 +395,33 @@ off unless you turn them on, and each result below was measured against a baseli
   are added to the flags, never removed.
   - Held-out flow, recall at equal extra flagged cells: 57% against 39% for a lowered threshold at 5%, 78% against 54% at 10%.
   - With it in AMR: mass 3e-15, energy 3e-15, div B 2e-14; about 7% more fine cells in that run.
-  - It learned gradient arrival in Orszag-Tang flows only. Wall modes and Nernst erosion were not trained or tested, and
-    the accuracy gain from earlier refinement was not measured.
+  - Trained on more flow families (`--families`): an imploding shell with an m = 3 wall mode, a Nernst-eroded magnetised hot
+    spot and a Mach ~10 blast hitting a dense bubble, plus Orszag-Tang. Recall on held-out runs at 5% extra cells (width-24 network; width 12 in brackets):
+
+    | Flow | All families | Orszag-Tang only | Lowered threshold |
+    |---|---|---|---|
+    | Wall m = 3 | 0.72 (0.67) | 0.25 | 0.24 |
+    | Strong shock | 0.74 (0.70) | 0.53 | 0.42 |
+    | Nernst | 1.00 (0.87) | 0.54 | 1.00 |
+    | Orszag-Tang | 0.44 (0.33) | 0.64 | 0.50 |
+
+    At 10% extra cells the all-family network reaches 0.95, 0.96, 1.00 and 0.70. It ties the threshold on Nernst, whose hot spot is
+    already obvious to the threshold. On Orszag-Tang it is still worse than both the threshold and the single-family network, so
+    one network does not yet cover every flow. AMR with this trigger: mass 3e-15, energy 2e-15, div B 2e-14.
+  - The accuracy gain from earlier refinement in a full simulation was not measured.
 - **PINN inverse diagnostics (`aegis/ml/pinn_diagnostics.py`, `examples/pinn_inverse_diagnostics.py`):** a network on (r, t) fits
   outer B-dot, VISAR and framing data plus 1D ideal-MHD residuals and the known pre-shot state, to estimate unmeasured core
   fields. On a twin run with a known answer and 1% noise (`results/pinn_diagnostics/`):
   - RMS error of the core field 42% and core temperature 45%, against 50% and 67% for flux conservation and adiabatic
     heating from the same radius trace;
-  - it smears the arrival of the compression front and misses the peak (0.58 against 0.84 for B_z). This is an estimate with
-    no error bar, not an exact reconstruction, and it has not seen real data.
+  - it smears the arrival of the compression front and misses the peak (0.58 against 0.84 for B_z). It is not an exact
+    reconstruction, and it has not seen real data.
+  - Error bars (`PINNEnsemble`: members from their own initialisation on bootstrap resamples with fresh noise of the stated
+    sigma; NaN samples, gaps and lost channels are masked): measured on the twin, they are **not calibrated**. The truth lies
+    within +-2 sigma only 14% of the time for the core field (sigma 6%, error 45%) and 72% for the temperature (sigma 180%,
+    error 106%); with 40% of the VISAR samples and a third of the B-dot record lost, 15% and 49%. The members share the same
+    bias (ideal 1D physics, smeared front), which no spread between them can show. Check coverage on twin runs like this one
+    before using any such error bar (`results/pinn_diagnostics/ensemble_report.json`).
 
 ### Tabulated EOS and opacities
 
@@ -542,8 +573,8 @@ velocity at the surface.
 ### Open experimental data and benchmarks
 
 `aegis/experimental_suite.py` bundles open, citable experimental data and runs the solver against it:
-- **Bundled data:** copper (145 shots) and nickel (19 shots) shock Hugoniots, shock velocity against particle
-  velocity from plate impacts. They come from Marsh (ed.), *LASL Shock Hugoniot Data* (University of
+- **Bundled data:** shock Hugoniots (shock velocity against particle velocity) of copper (145 shots), nickel (19),
+  liquid argon (13), toluene (18), serpentine (13) and pyrolusite (16), every dataset that repository holds. They come from Marsh (ed.), *LASL Shock Hugoniot Data* (University of
   California Press, 1980), as transcribed in LLNL's [BALSCD](https://github.com/llnl/BALSCD) repository (MIT
   licence; its notice files sit next to the data in `aegis/data/experimental/`). Each file's SHA-256 is checked
   on load.
@@ -556,6 +587,11 @@ velocity at the surface.
   only the ambient sound speed was fitted).
 
 ![Cu Hugoniot benchmark](results/shot_benchmark/shot_benchmark_comparison.png)
+- **`python main.py --validate-all`:** every bundled record in one table (`results/validate_all/summary.json`). Where
+  the code has an independent material model (Cu: the generated table, built from ambient properties and never fitted
+  to these data), plate impacts are simulated and scored: Cu 143 shots, chi^2_nu 0.67, RMS 1.6%. The other five
+  materials have no model in the code and are reported as such; no parameters are fitted to make a comparison. The
+  `benchmarks/literature/` records are listed with their provenance; the bundled ones are synthetic self-tests.
 - **Not bundled:** no open pulsed-power shot data (B-dot, VISAR traces, x-ray core radii) in a machine-readable,
   citable form were found, so none ship with the code. Your own traces load with `load_shot()` (CSV: t, value,
   sigma) and compare with FCG / MagLIF runs through `aegis/validation.py` (`examples/experimental_shot_fitting.py`).
@@ -882,7 +918,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | amr | ratio-4 patches: periodic MHD box with regridding and three touching patches (edge and corner) conserve mass, momentum and energy to 2e-15 with div B at 5e-15 and shared faces equal; a T-junction of three patches keeps div B at 6e-15 (each shared corner takes the lowest-index patch's EMF once; corrected twice, as before, div B grew to 7e-3); CUDA-graph replay equals the eager run exactly; a gas / stiffened-gas slab crosses fixed coarse-fine boundaries with p and u uniform to 1e-13; a magnetized blast wave has 0.43x the coarse-grid density error with 21% of the fine cells |
 | cylindrical3d | 3D (r, theta, z) with d/dtheta = 0 vs the 2D r-z solver (swirl, B_phi, B_z, z-dependent flow, the axis): 1.6e-14 after 30 steps; an m = 1 blob carried onto the axis along a uniform field: centroid error 3.4e-2 -> 1.4e-2 and field error 2.7e-2 -> 1.2e-2 from 16 x 24 to 32 x 48 cells, energy 4e-14, div B 2e-14 |
 | multigroup | one group = grey FLD (1e-8 at the solver tolerance); 8 grey groups sum to grey FLD in the thick limit (within the per-group limiter), energy to round-off; 12 Kramers groups with an edge relax to the Planck spectrum; decoupled groups diffuse with D_g = c / (3 rho kR_g) over three decades of D (peak within 2% of the exact Gaussian); 2D solver with an Al group table: gas + radiation energy to round-off |
-| experimental | Cu and Ni Hugoniot data load with verified checksums, a tampered file is refused; shot-trace CSV round trip; Cu plate impacts at 5 particle velocities follow the table's own Hugoniot to 0.3% (the flow solver adds no bias) and 143 Marsh shots (Up <= 3 km/s) to 1.8% RMS, chi^2_nu 0.82 for an assumed 2% error |
+| experimental | six Marsh Hugoniot datasets (Cu, Ni, Ar, toluene, serpentine, pyrolusite) load with verified checksums, a tampered file is refused; shot-trace CSV round trip; Cu plate impacts at 5 particle velocities follow the table's own Hugoniot to 0.3% (the flow solver adds no bias) and 143 Marsh shots (Up <= 3 km/s) to 1.8% RMS, chi^2_nu 0.82 for an assumed 2% error |
 | autodiff | the differentiable twin matches MHDSolver after 20 steps (Orszag-Tang 2e-15, r-z shell with B_phi and B_z 4e-13); twin energy 1e-15 and div B 1e-14; the adjoint carries the gradient of the conserved energy back unchanged (2e-16); adjoint vs central finite differences in r-z for an initial-shape parameter, an amplitude and a boundary-drive current (6e-10, 4e-10, 3e-8) |
 | hybrid_pic | free streaming of a density mode in a collisionless gas follows exp(-k^2 theta t^2/2) (0.816 / 0.444 / 0.163 vs 0.821 / 0.454 / 0.169; fluid would ring as a sound wave), totals 6e-15; Boris: \|v\| to 1e-15, r_L Omega / v = 1.001; Orszag-Tang with a kinetic low-density channel: 13% of cells kinetic, cells switching both ways, mass 1e-14, momentum 6e-14 (absolute), energy 1e-14, div B 4e-15 |
 | fno | spectral layer with identity weights = FFT low-pass (2e-15); network gradients vs central differences (2e-6); guard with an untrained network: forced acceptance keeps gas + radiation energy at round-off, forced fallback reproduces the exact solve with the same iteration count |

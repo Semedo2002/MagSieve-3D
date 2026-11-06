@@ -1,0 +1,72 @@
+{
+ "n": 128,
+ "train_seeds": 6,
+ "width": 24,
+ "epochs": 40,
+ "recall": {
+  "orszag_tang": {
+   "0.05": {
+    "cnn_all_families": 0.4431980644451776,
+    "cnn_orszag_tang_only": 0.6391729902122512,
+    "lowered_threshold": 0.4987719491183694
+   },
+   "0.1": {
+    "cnn_all_families": 0.7028116866454049,
+    "cnn_orszag_tang_only": 0.8711829612522454,
+    "lowered_threshold": 0.6658601854906705
+   }
+  },
+  "wall": {
+   "0.05": {
+    "cnn_all_families": 0.7163221278571233,
+    "cnn_orszag_tang_only": 0.25281957453780823,
+    "lowered_threshold": 0.24435402386739125
+   },
+   "0.1": {
+    "cnn_all_families": 0.9462574073568366,
+    "cnn_orszag_tang_only": 0.4163412436167017,
+    "lowered_threshold": 0.35093803763073816
+   }
+  },
+  "nernst": {
+   "0.05": {
+    "cnn_all_families": 1.0,
+    "cnn_orszag_tang_only": 0.540796963946869,
+    "lowered_threshold": 1.0
+   },
+   "0.1": {
+    "cnn_all_families": 1.0,
+    "cnn_orszag_tang_only": 0.9089184060721063,
+    "lowered_threshold": 1.0
+   }
+  },
+  "shock": {
+   "0.05": {
+    "cnn_all_families": 0.7354029605263158,
+    "cnn_orszag_tang_only": 0.5263157894736842,
+    "lowered_threshold": 0.4147820723684211
+   },
+   "0.1": {
+    "cnn_all_families": 0.9625822368421053,
+    "cnn_orszag_tang_only": 0.8909847861842105,
+    "lowered_threshold": 0.7914782072368421
+   }
+  }
+ },
+ "amr": {
+  "without": {
+   "mass": 2.5112653185662157e-15,
+   "energy": 2.331879461757205e-15,
+   "div_b": 8.858372052852194e-15,
+   "fine_cells": 12544,
+   "patches": 6
+  },
+  "with": {
+   "mass": 2.636828584494526e-15,
+   "energy": 2.4983058698213306e-15,
+   "div_b": 1.9482162486117857e-14,
+   "fine_cells": 12412,
+   "patches": 6
+  }
+ }
+}

@@ -268,6 +268,50 @@ def smagorinsky_stress(F, dx, dy, cs=0.17):
     return m.stack([-2 * rho * nu * sxx, -2 * rho * nu * sxy, -2 * rho * nu * syy])
 
 
+def _test_filter(f, m):
+    """the (1/4, 1/2, 1/4) filter in x and y, periodic: a test filter of twice the grid width"""
+    g = 0.25 * m.roll(f, 1, -2) + 0.5 * f + 0.25 * m.roll(f, -1, -2)
+    return 0.25 * m.roll(g, 1, -1) + 0.5 * g + 0.25 * m.roll(g, -1, -1)
+
+
+def dynamic_smagorinsky_stress(F, dx, dy, return_coeff=False):
+    """dynamic Smagorinsky (Germano et al. 1991, Lilly's least squares 1992, Favre-filtered): the eddy-viscosity
+    coefficient C = (C_s Delta)^2 / Delta^2 is measured from the resolved flow at every call by testing the model between
+    the grid and a test filter of twice its width, averaged over the (periodic) domain, and clipped at C >= 0: energy only
+    goes from the resolved to the sub-grid scales (no backscatter, which destabilises an eddy-viscosity closure). If the
+    resolved flow shows no forward transfer, C = 0 and the closure switches itself off. Momentum (Reynolds) stress
+    only: the sub-grid Maxwell stress is not modelled. F: coarse features (C, nx, ny); returns (3, nx, ny)."""
+    import cupy as cp
+    m = cp.get_array_module(F)
+    rho, ux, uy = F[0], F[1], F[2]
+    D2 = dx * dy
+    d = lambda f, ax, h: (m.roll(f, -1, ax) - m.roll(f, 1, ax)) / (2 * h)
+
+    def strain(u, v):
+        sxx, syy, sxy = d(u, 0, dx), d(v, 1, dy), 0.5 * (d(u, 1, dy) + d(v, 0, dx))
+        tr = 0.5 * (sxx + syy)                       # deviatoric part (2D)
+        sxx, syy = sxx - tr, syy - tr
+        return sxx, sxy, syy, m.sqrt(2 * (sxx**2 + syy**2 + 2 * sxy**2))
+    sxx, sxy, syy, S = strain(ux, uy)
+    T = lambda f: _test_filter(f, m)
+    rh = T(rho)
+    uh, vh = T(rho * ux) / rh, T(rho * uy) / rh
+    Sxx, Sxy, Syy, Sh = strain(uh, vh)
+    L = [T(rho * ux * ux) - rh * uh * uh, T(rho * ux * uy) - rh * uh * vh, T(rho * uy * uy) - rh * vh * vh]
+    trL = 0.5 * (L[0] + L[2])
+    L = [L[0] - trL, L[1], L[2] - trL]
+    a2 = 4.0                                         # (test width / grid width)^2
+    M = [2 * D2 * (T(rho * S * sxx) - a2 * rh * Sh * Sxx), 2 * D2 * (T(rho * S * sxy) - a2 * rh * Sh * Sxy),
+         2 * D2 * (T(rho * S * syy) - a2 * rh * Sh * Syy)]
+    w = (1.0, 2.0, 1.0)                              # the xy component counts twice in L:M
+    LM = sum(wk * float(m.sum(Lk * Mk)) for wk, Lk, Mk in zip(w, L, M))
+    MM = sum(wk * float(m.sum(Mk * Mk)) for wk, Mk in zip(w, M))
+    C = max(LM / MM, 0.0) if MM > 0 else 0.0
+    nu = C * D2 * S
+    tau = m.stack([-2 * rho * nu * sxx, -2 * rho * nu * sxy, -2 * rho * nu * syy])
+    return (tau, C) if return_coeff else tau
+
+
 class SGSCoprocessor:
     """see the notes above; call .step(dt) after each MHD step of a 2D Cartesian, x- and y-periodic solver at resolution
     model grid; stress_fn(features) -> (3, nx, ny) defaults to the network"""

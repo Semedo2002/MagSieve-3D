@@ -1,0 +1,57 @@
+{
+ "args": {
+  "n": 256,
+  "r": 4,
+  "train_seeds": 10,
+  "epochs": 150,
+  "t_eval": 0.4,
+  "quick": false,
+  "no_network": true,
+  "out": "C:\\Users\\User\\Desktop\\cfd\\star sieve non ideal\\results\\sgs_fno"
+ },
+ "apriori": {
+  "dynamic coefficient C_s": 0.314550596229671,
+  "smagorinsky": [
+   0.8062926205407543,
+   0.8589642406497483,
+   0.8430699578137273
+  ],
+  "dynamic smagorinsky": [
+   0.19618864176627318,
+   0.8430250242459644,
+   0.14243716544681945
+  ]
+ },
+ "aposteriori": {
+  "no model": {
+   "err_velocity": 0.06718824093178341,
+   "err_density": 0.03192423986012741,
+   "mass": 1.2681889858759388e-14,
+   "momentum": 1.1796119636642288e-14,
+   "energy": 1.2895260451125858e-14,
+   "div_b": 4.7379343186146515e-15,
+   "accepted": null,
+   "rejected": null
+  },
+  "smagorinsky": {
+   "err_velocity": 0.06975727819826913,
+   "err_density": 0.033592005607833486,
+   "mass": 1.2807453124687699e-14,
+   "momentum": 3.0225821845419887e-14,
+   "energy": 1.2895260451125858e-14,
+   "div_b": 3.690429118774597e-15,
+   "accepted": 215,
+   "rejected": 0
+  },
+  "dynamic smagorinsky": {
+   "err_velocity": 0.07298737483779721,
+   "err_density": 0.035033051161258176,
+   "mass": 1.2807453124687699e-14,
+   "momentum": 2.0317081350640365e-14,
+   "energy": 1.2895260451125858e-14,
+   "div_b": 3.564091474840836e-15,
+   "accepted": 215,
+   "rejected": 0
+  }
+ }
+}

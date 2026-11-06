@@ -2571,9 +2571,11 @@ def experimental_test():
         refused = True
     finally:
         ex.DATA_DIR = saved
-    good = len(cu["Us_km_s"]) == 145 and len(ni["Us_km_s"]) == 19 and refused
+    others = {k: len(ex.load_dataset(k)["Us_km_s"]) for k in ex.DATASETS if k not in ("copper_hugoniot", "nickel_hugoniot")}
+    good = len(cu["Us_km_s"]) == 145 and len(ni["Us_km_s"]) == 19 and refused and len(others) == 4 and min(others.values()) > 10
     ok = ok and good
-    print(f"  datasets: copper {len(cu['Us_km_s'])} shots, nickel {len(ni['Us_km_s'])} shots, checksums verified; a "
+    print(f"  datasets: copper {len(cu['Us_km_s'])} shots, nickel {len(ni['Us_km_s'])} shots, "
+          + ", ".join(f"{k.split('_')[0]} {v}" for k, v in others.items()) + f", checksums verified; a "
           f"tampered file refused: {refused}  [{'PASS' if good else 'FAIL'}]")
     t = np.linspace(0, 1, 50)
     tr = val.Trace("vis", t, np.sin(3 * t), 0.01, "km/s", "visar")
@@ -4011,6 +4013,64 @@ def ml_additive_test():
     good = max(errs) < 1e-5 and ru < 1e-12 and abs(bfx[0] - 0.4) < 1e-12
     ok = ok and good
     print(f"  PINN: loss gradients vs differences {max(errs):.0e}; residual on a uniform state at rest {ru:.0e}; closed-form baseline  [{'PASS' if good else 'FAIL'}]")
+    # PINN ensemble: NaN samples dropped, error bars from the members
+    rng_p = np.random.default_rng(5)
+    tt = np.linspace(0.0, 1.0, 12)
+    dat = dict(t=tt, R=1.0 - 0.3 * tt, V=np.full(12, -0.3), rho_surface=np.full(12, 0.5), t_b=tt, r_p=1.4, B_p=0.1 + 0.01 * tt)
+    dat["V"][3], dat["B_p"][5] = np.nan, np.nan
+    cl = pd.clean_data(dat)
+    ens = pd.PINNEnsemble(1.6, 1.0, (1.0, 1.0, 0.1, 0.5), members=2, width=8, depth=2, n_freq=2)
+    ini = dict(r=np.linspace(0.1, 1.5, 8), rho=np.full(8, 0.1), v=np.zeros(8), p=np.full(8, 0.01), B=np.full(8, 0.1))
+    ens.fit(dat, np.linspace(0.1, 1.5, 6), np.linspace(0.0, 1.0, 5), ini, dict(V=0.01, R=0.01, B_p=0.001), iters=20)
+    pr = ens.predict(np.full(4, 0.05), np.linspace(0, 1, 4))
+    good = len(cl["t"]) == 11 and len(cl["t_b"]) == 11 and pr["sigma"].shape == (4, 4) and bool(np.all(pr["sigma"] > 0))
+    ok = ok and good
+    print(f"  PINN ensemble: NaN samples dropped ({len(cl['t'])} of 12 and {len(cl['t_b'])} of 12 kept), member spread "
+          f"positive everywhere  [{'PASS' if good else 'FAIL'}]")
+    # dynamic Smagorinsky: coefficient never negative, increments conservative through the guard
+    dd = ot()
+    cd_ = fs.SGSCoprocessor(dd, stress_fn=lambda F: fs.dynamic_smagorinsky_stress(F, h, h))
+    t0d = tot(dd)
+    march(dd, cd_)
+    t1d = tot(dd)
+    Fd = xp.stack([cons_to_prim(dd.U, dd.eos)[k, dd.ng:-dd.ng, dd.ng:-dd.ng] for k in (iRHO, iVX, iVY, iBX, iBY, iPR)])
+    _, Cd = fs.dynamic_smagorinsky_stress(Fd, h, h, return_coeff=True)
+    _, Cn = fs.dynamic_smagorinsky_stress(Fd * xp.asarray([1, -1, -1, 1, 1, 1.0])[:, None, None], h, h, return_coeff=True)
+    good = (Cd >= 0 and Cn >= 0 and abs(t1d[0] - t0d[0]) / t0d[0] < 1e-13 and abs(t1d[3] - t0d[3]) / t0d[3] < 1e-13
+            and max(abs(t1d[1] - t0d[1]), abs(t1d[2] - t0d[2])) < 1e-12)
+    ok = ok and good
+    print(f"  dynamic Smagorinsky: C_s {np.sqrt(Cd):.3f} (clipped at 0, no backscatter), {cd_.accepted} increments, mass and "
+          f"energy {max(abs(t1d[0] - t0d[0]) / t0d[0], abs(t1d[3] - t0d[3]) / t0d[3]):.0e}  [{'PASS' if good else 'FAIL'}]")
+    # spectrometer surrogate: the formal solution's limits and the DeepONet's gradients
+    from aegis.ml import deeponet_rad as dr
+    eds = np.array([10.0, 100.0, 1000.0])
+    Tu = np.full((1, 30), 200.0)
+    Bg = dr.planck_groups(eds, Tu[:, :1], np)[:, 0, 0]
+    thick, _ = dr.formal_solution(np.ones((1, 30)), Tu, 1.0, lambda r, t: (None, np.full((2,) + r.shape, 50.0)), eds, np)
+    thin_I, thin_s = dr.formal_solution(np.ones((1, 30)), Tu, 1.0, lambda r, t: (None, np.full((2,) + r.shape, 1e-9)), eds, np)
+    e_thick = float(np.max(np.abs(thick[0] / Bg - 1)))
+    e_thin = float(np.max(np.abs(thin_I[0] / thin_s[0] - 1)))
+    net = dr.DeepONet(6, p=4, width=5, depth=2, seed=1)
+    net.e = np.linspace(-1, 1, 3)[:, None]
+    xb = rng_p.normal(size=(2, 6))
+    Lf = lambda P: ad.tsum(net.forward(xb, net.e, P) ** 2)
+    with ad.record():
+        Pl = {k: ad.leaf(v) for k, v in net.P.items()}
+        ad.backward(Lf(Pl))
+    errs = []
+    for k in ("bw0", "tw1", "bwo", "b0"):
+        idx = tuple(int(rng_p.integers(0, n)) for n in net.P[k].shape)
+        p0, e = net.P[k][idx], 1e-6
+        net.P[k][idx] = p0 + e
+        Lp = float(Lf({q: ad.const(v) for q, v in net.P.items()}).v)
+        net.P[k][idx] = p0 - e
+        Lm = float(Lf({q: ad.const(v) for q, v in net.P.items()}).v)
+        net.P[k][idx] = p0
+        errs.append(abs((Lp - Lm) / (2 * e) - Pl[k].g[idx]) / max(abs(Pl[k].g[idx]), 1e-6))
+    good = e_thick < 1e-9 and e_thin < 1e-6 and max(errs) < 1e-5
+    ok = ok and good
+    print(f"  spectrometer surrogate: formal solution, optically thick limit vs Planck {e_thick:.0e}, thin limit "
+          f"{e_thin:.0e}; DeepONet gradients vs differences {max(errs):.0e}  [{'PASS' if good else 'FAIL'}]")
     return ok
 
 
@@ -4772,6 +4832,8 @@ def main(argv=None):
                       help="run a verification test (exit code 1 on failure)")
     mode.add_argument("--case", choices=list(SHOWCASE_CASES), help="run a single showcase case")
     mode.add_argument("--campaign", action="store_true", help="run the full research campaign")
+    mode.add_argument("--validate-all", action="store_true", help="every bundled measured dataset and literature record "
+                      "against the code's independent models (aegis/experimental_suite.validate_all)")
     parser.add_argument("--nx", type=int, default=400)
     parser.add_argument("--ny", type=int, default=None, help="default: nx/4")
     parser.add_argument("--t-end", type=float, default=0.8)
@@ -4788,6 +4850,11 @@ def main(argv=None):
     parser.add_argument("--no-plots", action="store_true")
     args = parser.parse_args(argv)
 
+    if args.validate_all:
+        from aegis import experimental_suite as es
+        print("--- Validation against every bundled record ---")
+        es.validate_all(out_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "validate_all"))
+        return
     if args.test:
         names = list(VERIFICATION_TESTS) if args.test == "all" else [args.test]
         results = {}

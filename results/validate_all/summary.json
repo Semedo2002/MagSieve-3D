@@ -1,0 +1,73 @@
+{
+ "records": [
+  {
+   "dataset": "copper_hugoniot",
+   "provenance": "measured",
+   "source": "S. P. Marsh (ed.), LASL Shock Hugoniot Data, University of California Press, Berkeley (1980); transcribed in github.com/llnl/BALSCD (MIT licence)",
+   "points": 145,
+   "model": "tools/generate_sesame.py table + plate-impact simulation",
+   "compared": 143,
+   "chi2_nu": 0.6743336249151649,
+   "rms_rel": 0.016423563863122582,
+   "sigma_assumed": "2% Us"
+  },
+  {
+   "dataset": "nickel_hugoniot",
+   "provenance": "measured",
+   "source": "S. P. Marsh (ed.), LASL Shock Hugoniot Data, University of California Press, Berkeley (1980); transcribed in github.com/llnl/BALSCD (MIT licence)",
+   "points": 19,
+   "model": null
+  },
+  {
+   "dataset": "argon_hugoniot",
+   "provenance": "measured",
+   "source": "S. P. Marsh (ed.), LASL Shock Hugoniot Data, University of California Press, Berkeley (1980); transcribed in github.com/llnl/BALSCD (MIT licence)",
+   "points": 13,
+   "model": null
+  },
+  {
+   "dataset": "toluene_hugoniot",
+   "provenance": "measured",
+   "source": "S. P. Marsh (ed.), LASL Shock Hugoniot Data, University of California Press, Berkeley (1980); transcribed in github.com/llnl/BALSCD (MIT licence)",
+   "points": 18,
+   "model": null
+  },
+  {
+   "dataset": "serpentine_hugoniot",
+   "provenance": "measured",
+   "source": "S. P. Marsh (ed.), LASL Shock Hugoniot Data, University of California Press, Berkeley (1980); transcribed in github.com/llnl/BALSCD (MIT licence)",
+   "points": 13,
+   "model": null
+  },
+  {
+   "dataset": "pyrolusite_hugoniot",
+   "provenance": "measured",
+   "source": "S. P. Marsh (ed.), LASL Shock Hugoniot Data, University of California Press, Berkeley (1980); transcribed in github.com/llnl/BALSCD (MIT licence)",
+   "points": 16,
+   "model": null
+  },
+  {
+   "dataset": "liner_bdot_axis",
+   "provenance": "synthetic",
+   "source": "",
+   "points": 40,
+   "model": "self-test"
+  },
+  {
+   "dataset": "liner_radius_framing",
+   "provenance": "synthetic",
+   "source": "",
+   "points": 40,
+   "model": "self-test"
+  },
+  {
+   "dataset": "liner_visar_inner",
+   "provenance": "synthetic",
+   "source": "",
+   "points": 40,
+   "model": "self-test"
+  }
+ ],
+ "pulsed_power_traces": 0,
+ "note": "no open machine-readable pulsed-power (Z, MagLIF, university) shot traces were found; digitize published figures into benchmarks/literature/ with their citation to compare against them"
+}

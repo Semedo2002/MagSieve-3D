@@ -9,8 +9,8 @@
 #     d_t rho + (1/r) d_r (r rho v), rho (d_t v + v d_r v) + d_r (p + B^2/2), d_t p + v d_r p + gamma p (1/r) d_r (r v),
 #     d_t B + (1/r) d_r (r v B);
 #   L_init: the pre-shot state, assumed known (liner geometry, fill, seed field).
-# Output: the reconstructed fields, e.g. the core field and temperature nobody measured. This is an estimate with no error bar
-# and not an exact inversion: the physics term is only as good as the assumed model (ideal, 1D), and a coordinate network
+# Output: the reconstructed fields, e.g. the core field and temperature nobody measured. A single PINN is an estimate with no
+# error bar (PINNEnsemble below gives one) and not an exact inversion: the physics term is only as good as the assumed model (ideal, 1D), and a coordinate network
 # represents steep fronts poorly. Always compare with the closed-form estimate from the same data (flux_estimate): flux
 # conservation B = B0 (R0 / R)^2 and adiabatic heating of the fill.
 import numpy as np
@@ -83,7 +83,9 @@ class PINN:
         return [r_rho * (L0 / s[0]), r_v * (L0 / (s[0] * s[1])), r_p * (L0 / s[2]), r_B * (L0 / s[3])]
 
     def fit(self, data, rg, tg, init, iters=3000, lr=2e-3, w_data=10.0, w_phys=1.0, w_init=10.0, log=None):
-        """data: dict(t, R, V, rho_surface, t_b, r_p, B_p); init: dict(r, rho, v, p, B) at t = 0. Returns the loss history"""
+        """data: dict(t, R, V, rho_surface, t_b, r_p, B_p); init: dict(r, rho, v, p, B) at t = 0. Missing samples may be NaN
+        (dropped per channel: a gap in a record, a probe that failed). Returns the loss history"""
+        data = clean_data(data)
         m = {k: np.zeros_like(v) for k, v in self.P.items()}
         v2 = {k: np.zeros_like(v) for k, v in self.P.items()}
         s = self.scale
@@ -122,3 +124,51 @@ class PINN:
         """reconstructed (rho, v, p, B) as arrays at points"""
         P = {k: ad.const(v) for k, v in self.P.items()}
         return tuple(a.v for a in self.net(np.asarray(r, float), np.asarray(t, float), P))
+
+
+def clean_data(data):
+    """drop NaN samples per channel: (t, R, V, rho_surface) share one time base, (t_b, B_p) another"""
+    d = dict(data)
+    ok = np.isfinite(d["t"]) & np.isfinite(d["R"]) & np.isfinite(d["V"]) & np.isfinite(d["rho_surface"])
+    for k in ("t", "R", "V", "rho_surface"):
+        d[k] = np.asarray(d[k], float)[ok]
+    okb = np.isfinite(d["t_b"]) & np.isfinite(d["B_p"])
+    d["t_b"], d["B_p"] = np.asarray(d["t_b"], float)[okb], np.asarray(d["B_p"], float)[okb]
+    if not (len(d["t"]) and len(d["t_b"])):
+        raise ValueError("no usable samples left in a channel")
+    return d
+
+
+class PINNEnsemble:
+    """uncertainty for the PINN estimate: K members, each fitted from its own initialisation to its own bootstrap resample
+    of the data with fresh noise of the stated measurement sigma added (randomise-then-optimise, an approximate posterior
+    sample for each member). predict() gives the mean and the member spread sigma. The spread covers data noise, gaps
+    and the network's freedom where the data do not constrain it; it does not cover a wrong physics model (ideal 1D MHD
+    in the residuals), so check its calibration on twin runs (coverage of the truth within +-2 sigma) before trusting it."""
+
+    def __init__(self, r_max, t_max, scale, members=5, seed=0, **kw):
+        self.members = [PINN(r_max, t_max, scale, seed=seed + 1000 * k, **kw) for k in range(members)]
+        self.seed = seed
+
+    def fit(self, data, rg, tg, init, sigma, log=None, **kw):
+        """sigma: dict of the measurement noise per channel, keys V, R, B_p (absolute units)"""
+        data = clean_data(data)
+        hist = []
+        for k, m in enumerate(self.members):
+            rng = np.random.default_rng(self.seed + 7919 * (k + 1))
+            i = rng.integers(0, len(data["t"]), len(data["t"]))
+            j = rng.integers(0, len(data["t_b"]), len(data["t_b"]))
+            d = dict(r_p=data["r_p"])
+            for q in ("t", "R", "V", "rho_surface"):
+                d[q] = data[q][i]
+            d["t_b"], d["B_p"] = data["t_b"][j], data["B_p"][j]
+            for q in ("V", "R", "B_p"):
+                d[q] = d[q] + rng.normal(0.0, sigma[q], len(d[q]))
+            hist.append(m.fit(d, rg, tg, init, log=(lambda r, k=k: log(dict(member=k, **r))) if log else None, **kw))
+        return hist
+
+    def predict(self, r, t):
+        """(mean, sigma) of (rho, v, p, B) and of the temperature p / rho, each an array at the points"""
+        F = np.array([m.field(r, t) for m in self.members])          # (K, 4, N)
+        Tm = F[:, 2] / F[:, 0]
+        return dict(mean=F.mean(axis=0), sigma=F.std(axis=0, ddof=1), T_mean=Tm.mean(axis=0), T_sigma=Tm.std(axis=0, ddof=1))

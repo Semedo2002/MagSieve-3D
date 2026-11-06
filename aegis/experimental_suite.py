@@ -3,9 +3,10 @@
 #
 # Bundled data (aegis/data/experimental/), each with its provenance and a SHA-256 of its (LF-normalised) content,
 # checked on load:
-#   copper_hugoniot, nickel_hugoniot   shock velocity Us against particle velocity Up (and P, rho) from plate-impact
-#       experiments, Marsh (ed.), "LASL Shock Hugoniot Data", University of California Press (1980), as transcribed
-#       in LLNL's BALSCD repository (github.com/llnl/BALSCD, MIT licence, notice files alongside the data)
+#   copper, nickel, argon (liquid), toluene, serpentine, pyrolusite Hugoniots: shock velocity Us against particle
+#       velocity Up (and P, rho) from plate-impact and explosive experiments, Marsh (ed.), "LASL Shock Hugoniot Data",
+#       University of California Press (1980), as transcribed in LLNL's BALSCD repository (github.com/llnl/BALSCD, MIT
+#       licence, notice files alongside the data). These six are every dataset that repository holds.
 # No open B-dot, VISAR-trace or x-ray-radius data from pulsed-power shots are bundled: none were found in an open,
 # citable machine-readable form. Shot traces of your own load with load_shot() (CSV: t, value, sigma) and are
 # compared with simulations through aegis/validation.py (see examples/experimental_shot_fitting.py).
@@ -32,6 +33,12 @@ DATASETS = {
                             url="https://raw.githubusercontent.com/llnl/BALSCD/main/data/nickel_marsh.csv",
                             sha256="45985b78f584bc7264fe8036d6dce85a3423e6f87ef18893797679ec4fd03ea3"),
 }
+for _m, _h in (("argon", "20e0cd745c0119f33230f6305287ac8f0f230dc15d7fb0d44ee86eab7a714177"),
+               ("toluene", "a9691c77e62fa7212ccd7e4bc6ce78416280a46378a78968ad2383016ba21a69"),
+               ("serpentine", "22a556e6f2f0a9ec20b6d19c1e6e4c383e4682eeda963cfa6e65346ffed6ad46"),
+               ("pyrolusite", "194ca67ce5264d9c038a450121dc2bac64161343af5c8008fc4a8b82ac77f98d")):
+    DATASETS[f"{_m}_hugoniot"] = dict(file=f"{_m}_marsh.csv", kind="hugoniot", material=_m, source=_MARSH,
+                                      url=f"https://raw.githubusercontent.com/llnl/BALSCD/main/data/{_m}_marsh.csv", sha256=_h)
 
 
 def _sha(path):
@@ -171,3 +178,53 @@ def hugoniot_benchmark(dataset="copper_hugoniot", ups=None, table=None, sigma_re
         fig.savefig(out_png, dpi=160)
         plt.close(fig)
     return out
+
+
+# ------------------------------------------------------------------ everything at once
+
+def validate_all(fast=False, literature=True, out_dir=None, log=print):
+    """--validate-all: every bundled measured dataset and every record of benchmarks/literature/.
+    Measured Hugoniots: if the code has an independent material model (tools/generate_sesame.py, built from ambient
+    properties, not fitted to these data), symmetric plate impacts are simulated and compared (chi^2_nu with sigma =
+    2% Us assumed, RMS); otherwise the dataset is checked and reported as 'no model'. No parameters are fitted to the
+    data here. Literature records: each is loaded with its provenance; the bundled ones are synthetic self-tests
+    (examples/validate_experimental_shots.py runs them) and are listed as such, never as experiments."""
+    import sys
+    import json
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.join(root, "tools"))
+    import generate_sesame as gs
+    rows = []
+    for name, meta in DATASETS.items():
+        d = load_dataset(name)
+        n = int(len(d["Us_km_s"]))
+        row = dict(dataset=name, provenance="measured", source=meta["source"], points=n, model=None)
+        if meta["material"] in gs.MATERIALS:
+            r = hugoniot_benchmark(name, ups=np.linspace(0.25, 3.0, 4 if fast else 8), n=240 if fast else 480)
+            row.update(model="tools/generate_sesame.py table + plate-impact simulation", compared=r["n_points"],
+                       chi2_nu=r["chi2_nu"], rms_rel=r["rms_rel"], sigma_assumed="2% Us")
+        rows.append(row)
+        log(f"  {name:22s} measured, {n:3d} points: " + (f"{row['compared']} compared (Up <= 3 km/s), chi2_nu "
+            f"{row['chi2_nu']:.2f}, RMS {100 * row['rms_rel']:.1f}%" if row["model"] else "no independent model in the code"))
+    if literature:
+        from . import validation
+        lib_dir = os.path.join(root, "benchmarks", "literature")
+        lib, bad = validation.scan_library(lib_dir)
+        for name, tr in lib.items():
+            prov = tr.meta.get("provenance", "")
+            rows.append(dict(dataset=name, provenance=prov, source=tr.meta.get("citation", ""), points=int(len(tr.t)),
+                             model="self-test" if prov == "synthetic" else None))
+            log(f"  {name:22s} {prov}, {len(tr.t):3d} points" + (": synthetic self-test, not an experiment"
+                if prov == "synthetic" else ""))
+        for path, why in bad.items():
+            rows.append(dict(dataset=os.path.basename(path), provenance="refused", reason=why))
+            log(f"  {os.path.basename(path):22s} refused: {why}")
+    measured_digitized = [r for r in rows if r.get("provenance") in ("measured", "digitized") and r["dataset"] not in DATASETS]
+    summary = dict(records=rows, pulsed_power_traces=len(measured_digitized),
+                   note="no open machine-readable pulsed-power (Z, MagLIF, university) shot traces were found; digitize "
+                        "published figures into benchmarks/literature/ with their citation to compare against them")
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(summary, f, indent=1)
+    return summary

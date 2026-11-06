@@ -102,14 +102,21 @@ def evaluate(n_f, r, seed, T, model):
     ref = make(n_f, seed)
     march_to(ref, T)
     Ft, Tt = fs.sgs_sample(fine_prim(ref), r)
-    Tp = model.predict(Ft[None])[0]
     Ts = fs.smagorinsky_stress(Ft, h, h)
-    apri = {}
-    for name, P in (("network", Tp), ("smagorinsky", Ts)):
+    Td, C_dyn = fs.dynamic_smagorinsky_stress(Ft, h, h, return_coeff=True)
+    cands = [("smagorinsky", Ts), ("dynamic smagorinsky", Td)]
+    if model is not None:
+        cands.insert(0, ("network", model.predict(Ft[None])[0]))
+    apri = {"dynamic coefficient C_s": float(np.sqrt(C_dyn))}
+    for name, P in cands:
         apri[name] = [corr(to_numpy(P[k]), to_numpy(Tt[k])) for k in range(3)]
     res = {}
     sm = lambda F: fs.smagorinsky_stress(F, h, h)
-    for name, kw in (("no model", {}), ("smagorinsky", dict(stress=sm)), ("network", dict(model=model))):
+    dyn = lambda F: fs.dynamic_smagorinsky_stress(F, h, h)
+    runs = [("no model", {}), ("smagorinsky", dict(stress=sm)), ("dynamic smagorinsky", dict(stress=dyn))]
+    if model is not None:
+        runs.append(("network", dict(model=model)))
+    for name, kw in runs:
         s, cop, cons = coarse_run(n_c, seed, T, **kw)
         W = fine_prim(s)
         e = lambda a, b: float(xp.sqrt(xp.mean((a - b)**2)) / xp.sqrt(xp.mean(b**2)))
@@ -126,12 +133,19 @@ def main():
     ap.add_argument("--epochs", type=int, default=150)
     ap.add_argument("--t-eval", type=float, default=0.4)
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--no-network", action="store_true", help="evaluate the closures without training the FNO")
     ap.add_argument("--out", default=os.path.join(ROOT, "results", "sgs_fno"))
     a = ap.parse_args()
     if a.quick:
         a.n, a.train_seeds, a.epochs = 128, 3, 15
     os.makedirs(a.out, exist_ok=True)
     times = np.linspace(0.05, 0.5, 10)
+    if a.no_network:
+        rep = evaluate(a.n, a.r, 2000, a.t_eval, None)
+        report(rep)
+        with open(os.path.join(a.out, "report_closures.json"), "w") as f:
+            json.dump(dict(args=vars(a), **rep), f, indent=1)
+        return
     t0 = time.time()
     X, Y = dataset(range(a.train_seeds), a.n, a.r, times)
     Xv, Yv = dataset([1000], a.n, a.r, times)
@@ -142,15 +156,19 @@ def main():
     hist = m.train(X, Y, epochs=a.epochs, batch=8, Xv=Xv, Yv=Yv, log=lambda r: print(f"  epoch {r['epoch']}: train {r['train']:.3e} val {r['val']:.3e}"))
     print(f"training {time.time() - t0:.0f}s")
     rep = evaluate(a.n, a.r, 2000, a.t_eval, m)
-    print("a priori, correlation with the true stress (xx, xy, yy), held-out flow:")
-    for k, v in rep["apriori"].items():
-        print(f"  {k:12s} " + " ".join(f"{x:+.3f}" for x in v))
-    print("a posteriori, coarse run vs filtered reference:")
-    for k, v in rep["aposteriori"].items():
-        print(f"  {k:12s} velocity error {v['err_velocity']:.4f}, density error {v['err_density']:.4f}; mass {v['mass']:.0e}, "
-              f"momentum {v['momentum']:.0e}, energy {v['energy']:.0e}, div B {v['div_b']:.0e}; accepted {v['accepted']}, rejected {v['rejected']}")
+    report(rep)
     with open(os.path.join(a.out, "report.json"), "w") as f:
         json.dump(dict(args=vars(a), history=hist, **rep), f, indent=1)
+
+
+def report(rep):
+    print("a priori, correlation with the true stress (xx, xy, yy), held-out flow:")
+    for k, v in rep["apriori"].items():
+        print(f"  {k:20s} " + (" ".join(f"{x:+.3f}" for x in v) if isinstance(v, list) else f"{v:.4f}"))
+    print("a posteriori, coarse run vs filtered reference:")
+    for k, v in rep["aposteriori"].items():
+        print(f"  {k:20s} velocity error {v['err_velocity']:.4f}, density error {v['err_density']:.4f}; mass {v['mass']:.0e}, "
+              f"momentum {v['momentum']:.0e}, energy {v['energy']:.0e}, div B {v['div_b']:.0e}; accepted {v['accepted']}, rejected {v['rejected']}")
 
 
 if __name__ == "__main__":
