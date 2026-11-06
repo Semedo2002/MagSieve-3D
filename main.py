@@ -3277,6 +3277,92 @@ def rlc_adjoint_test():
     return good
 
 
+def literature_test():
+    """Literature trace library and virtual diagnostics (aegis/validation.py). (1) Provenance: a digitized trace
+    without a citation or a figure is refused, a good one loads with click-order points sorted and units scaled, HDF5
+    round trip. (2) Virtual probes on a manufactured state: the B-dot coil gives -A dB/dt exactly for a field that is
+    linear in space and time; the VISAR cut finds a moving tracer front and its velocity; the framing camera averages
+    a tilted front over the slit. (3) End to end on synthetic traces (a run at a hidden speed with 2% noise): chi^2_nu
+    is about 1 at the hidden value, the scan recovers it within 1%, div B stays at round-off. These are self-tests of
+    the tool chain, not validation against an experiment."""
+    import tempfile
+    import importlib.util
+    import h5py
+    from aegis import validation as val
+    from aegis.config import iBX, iVX
+    print("\n--- Literature traces and virtual diagnostics ---"); sys.stdout.flush()
+    ok = True
+    tmp = tempfile.mkdtemp(prefix="lit_")
+    good_h = "# name: a\n# kind: bdot\n# units: V\n# provenance: digitized\n# citation: X et al. (2020)\n# figure: Fig. 1\n# sigma: 10%\n# t_scale: 1e-9\nt,y\n"
+    pa = os.path.join(tmp, "a.csv")
+    with open(pa, "w") as f:
+        f.write(good_h + "2,1\n1,3\n3,2\n")
+    tr = val.load_digitized(pa)
+    pb = os.path.join(tmp, "b.csv")
+    with open(pb, "w") as f:
+        f.write(good_h.replace("# citation: X et al. (2020)\n", "") + "1,1\n2,2\n")
+    lib, bad = val.scan_library(tmp)
+    ph = os.path.join(tmp, "c.h5")
+    with h5py.File(ph, "w") as f:
+        g = f.create_group("h")
+        g["t"], g["y"], g["sigma"] = np.arange(3.0), np.arange(3.0) + 1, np.ones(3)
+        g.attrs.update(kind="visar", units="km/s", provenance="synthetic")
+    th = val.load_digitized(ph)[0]
+    good = (list(tr.y) == [3, 1, 2] and abs(tr.t[0] - 1e-9) < 1e-20 and abs(tr.sigma[0] - 0.3) < 1e-12 and pb in bad
+            and "citation" in bad[pb] and "a" in lib and th.name == "h" and th.meta["provenance"] == "synthetic")
+    ok = ok and good
+    print(f"  provenance: a digitized trace without a citation refused, sorting and scaling, HDF5 round trip  "
+          f"[{'PASS' if good else 'FAIL'}]")
+    cfg = Config(nx=32, ny=16, x_max=2.0, y_max=1.0, gamma=5 / 3, bc_x_type="extrapolation", bc_y_type="periodic",
+                 diag_interval=10**9, snapshot_times=[])
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = MHDSolver(cfg)
+    B = val.BdotProbe("b", (0.71, 0.33), component=2, area=2.0, n_turns=3)
+    V = val.VisarProbe("v", (0.1, 0.5), axis=0, direction=1)
+    F = val.FramingCamera("f", (0.1, 0.5), axis=0, direction=1, average_over=1)
+    D = val.DiagnosticSet([B, V, F])
+    for k in range(5):
+        s.t = 0.1 * k
+        W = xp.zeros_like(s.U)
+        W[iRHO], W[iPR] = 1.0, 1.0
+        W[iBZ] = (1.0 + 0.5 * s.X + 0.25 * s.Y) * (1.0 + 2.0 * s.t)            # dB/dt known exactly
+        front = 1.0 + 0.3 * s.t + 0.1 * (s.Y - 0.5)                            # moving, tilted tracer front
+        W[iCLR] = xp.clip((s.X - front) / cfg.dx + 0.5, 0.0, 1.0)
+        W[iVX] = -0.7
+        s.U[...] = prim_to_cons(W, cfg.gamma)
+        D.record(s)
+    tb, vb = B.signal()
+    exact_b = -3 * 2.0 * (1.0 + 0.5 * 0.71 + 0.25 * 0.33) * 2.0
+    eb = float(np.max(np.abs(vb - exact_b)) / abs(exact_b))
+    ev = float(np.max(np.abs(V.signal()[1] + 0.7)))
+    rf = F.signal()[1]
+    eff = float(np.max(np.abs(rf - (1.0 + 0.3 * F.signal()[0]))))
+    good = eb < 1e-12 and ev < 1e-12 and eff < 0.5 * cfg.dx
+    ok = ok and good
+    print(f"  virtual probes on a manufactured state: B-dot {eb:.0e}, VISAR velocity {ev:.0e}, framing radius within "
+          f"{eff / cfg.dx:.2f} cell  [{'PASS' if good else 'FAIL'}]")
+    root = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("validate_shots", os.path.join(root, "examples", "validate_experimental_shots.py"))
+    ex = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ex)
+    syn = os.path.join(tmp, "syn")
+    ex.make_synthetic(syn)
+    lib, bad = val.scan_library(syn)
+    vals = [1.0, 1.04, 1.08]
+    runs, info, M = ex.sweep(vals, lib)
+    best, sig, _ = val.calibrate(np.array(vals), np.array([sum(M[r][k]["chi2"] for k in M[r]) for r in runs]))
+    at = [M["v0=1.040"][k]["chi2_nu"] for k in lib]
+    away = [M["v0=1.000"][k]["chi2_nu"] for k in lib]
+    txt = val.format_matrix(M)
+    divb = max(i["div_b"] for i in info.values())
+    good = (max(at) < 2.0 and max(away) > max(at) and abs(best - ex.HIDDEN_V0) < 0.01 and "[syn]" in txt and divb < 1e-12
+            and len(lib) == 3)
+    ok = ok and good
+    print(f"  synthetic traces, hidden speed {ex.HIDDEN_V0}: chi2_nu at it " + ", ".join(f"{x:.2f}" for x in at)
+          + f", recovered {best:.4f}, div B {divb:.0e}; self-test, not an experiment  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3622,6 +3708,7 @@ VERIFICATION_TESTS = {
     "gmg": gmg_test,
     "cyl_filter": cyl_filter_test,
     "rlc_adjoint": rlc_adjoint_test,
+    "literature": literature_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

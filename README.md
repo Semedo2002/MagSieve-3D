@@ -439,6 +439,22 @@ velocity at the surface.
 
 ![Shot calibration](results/shot_fitting/shot_calibration_fit.png)
 
+### Literature traces and virtual diagnostics
+
+`aegis/validation.py` and `benchmarks/literature/` compare runs with time series digitized from papers:
+- **Loader:** `load_digitized` reads a CSV with a provenance header, or HDF5. A `digitized` or `measured` trace without
+  a citation and a figure is refused. Provenance stays with the trace, and goodness-of-fit tables mark synthetic
+  columns.
+- **Virtual diagnostics:** recorded inside a running 2D or 3D solver through `DiagnosticSet`:
+  - `BdotProbe`: a coil at a point, V = -n A dB/dt;
+  - `VisarProbe`: a line cut to a material surface, and the velocity there;
+  - `FramingCamera`: the surface position, optionally averaged over a slit.
+- **Scores:** `goodness_matrix` and `format_matrix` give chi^2_nu and RMS per run and trace.
+  `examples/validate_experimental_shots.py` runs a sweep and calibrates the scanned parameter.
+- **What the library holds:** no digitized experimental traces yet, only synthetic self-test traces from a run at a
+  hidden speed (recovered as 1.0405 +- 0.0007 against 1.04). This tests the tool chain, with the same model on both
+  sides, and says nothing about an experiment. `benchmarks/literature/README.md` explains how to add real traces.
+
 ### Open experimental data and benchmarks
 
 `aegis/experimental_suite.py` bundles open, citable experimental data and runs the solver against it:
@@ -744,6 +760,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | gmg | multigrid vs Jacobi preconditioning, three stiff FLD steps: grey 64^2 1962 -> 70, 128^2 3960 -> 71 iterations (flat with N), 6 Kramers groups 2401 -> 85; solutions within 3e-9, energy at round-off |
 | cyl_filter | the azimuthal filter keeps m <= m_crit exactly and leaves outer rings alone; the blob crossing the axis (32 x 64): 1254 -> 79 steps, centroid and field error unchanged to 1e-4, energy 3e-15, div B 2e-15 |
 | rlc_adjoint | r-z liner driven by an RLC bank: bank + resistor + grid energy 2e-16; d(yield proxy)/d(shape, V0, C, L, R) adjoint vs central differences 2e-10 to 9e-9 |
+| literature | digitized traces without a citation refused, sorting / scaling, HDF5 round trip; virtual probes on a manufactured state: B-dot exact (1e-12), VISAR velocity exact, framing radius within half a cell; synthetic traces: hidden speed recovered within 1%, marked [syn]; self-tests, not validation against an experiment |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |
