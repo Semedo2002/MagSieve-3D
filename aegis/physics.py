@@ -340,18 +340,48 @@ def conduction_div(theta, B, rho, a, kappa0, x0, tracer_max, h, periodic, T_exp=
     return (div, qs) if return_flux else div
 
 
-def rkl2(y0, L, dt, dt_expl, s_max=60):
-    """Second-order Runge-Kutta-Legendre super-time-step (Meyer, Balsara & Aslam 2014) of dy/dt = L(y) over
-    dt, given the forward-Euler stable step dt_expl. Stable for dt <= dt_expl (s^2 + s - 2)/4 with s stages;
-    longer steps are split into sub-steps of at most s_max stages. Returns (y, total stages).
-    If L returns (L(y), fluxes) with L(y) = -div(fluxes), the fluxes go through the same linear recursion, so
-    y_end = y0 - div(Q) exactly with Q the time-integrated face flux; then returns (y, stages, Q)."""
+# RKL2 stage plans for CUDA-graph capture (aegis/bridge.NativeStepper). The stage count of a super-time-step follows
+# from the largest diffusivity, a value read back from the device. mode 'record': each split step stores its need at
+# dt * margin (keeping the largest); mode 'replay': the stored counts are used and nothing is read from the device, so
+# the step can be captured. mode None: ordinary operation.
+RKL2_PLAN = {"mode": None, "margin": 1.0, "plan": {}}
+
+
+def rkl2_split(dt, dt_expl, s_max=60):
+    """(stages per sub-step, sub-steps) of an RKL2 super-time-step over dt with forward-Euler limit dt_expl"""
     ratio = dt / dt_expl
     stages = lambda r: max(2, int(np.ceil(0.5 * (np.sqrt(9.0 + 16.0 * r) - 1.0))))
     s, nsub = stages(ratio), 1
     if s > s_max:                                   # each sub-step covers dt/nsub: ratio/nsub
         nsub = int(np.ceil(4.0 * ratio / (s_max * s_max + s_max - 2.0)))
         s = stages(ratio / nsub)
+    return s, nsub
+
+
+def rkl2_plan(tag, dt, dt_expl_of, s_max=60):
+    """the (stages, sub-steps) of one split step, or None if it has nothing to do; dt_expl_of() reads the device and
+    returns the forward-Euler limit or None. See RKL2_PLAN."""
+    P = RKL2_PLAN
+    if P["mode"] == "replay":
+        return P["plan"].get(tag)
+    dt_expl = dt_expl_of()
+    if dt_expl is None:
+        return None
+    if P["mode"] == "record":
+        need = rkl2_split(float(dt) * P["margin"], dt_expl, s_max)
+        old = P["plan"].get(tag)
+        if old is None or need[0] * need[1] > old[0] * old[1]:
+            P["plan"][tag] = need
+    return rkl2_split(dt, dt_expl, s_max)
+
+
+def rkl2(y0, L, dt, dt_expl, s_max=60, split=None):
+    """Second-order Runge-Kutta-Legendre super-time-step (Meyer, Balsara & Aslam 2014) of dy/dt = L(y) over
+    dt, given the forward-Euler stable step dt_expl. Stable for dt <= dt_expl (s^2 + s - 2)/4 with s stages;
+    longer steps are split into sub-steps of at most s_max stages. Returns (y, total stages).
+    If L returns (L(y), fluxes) with L(y) = -div(fluxes), the fluxes go through the same linear recursion, so
+    y_end = y0 - div(Q) exactly with Q the time-integrated face flux; then returns (y, stages, Q)."""
+    s, nsub = split if split is not None else rkl2_split(dt, dt_expl, s_max)
     h = dt / nsub
     b = [1.0 / 3.0] * 3 + [(j * j + j - 2.0) / (2.0 * j * (j + 1.0)) for j in range(3, s + 1)]
     w1 = 4.0 / (s * s + s - 2.0)
@@ -441,14 +471,17 @@ def conduct(U, gamma, kappa0, x0, tracer_max, h, periodic, dt, cfl=0.5, radial=N
         phi1 = electron_Z / ((1 + electron_Z) * (gamma - 1))
     elif ion_Z is not None:                      # d eps / d theta_i = rho / ((1 + Z)(gamma - 1))
         phi1 = 1.0 / ((1 + ion_Z) * (gamma - 1))
-    D = xp.where(a < tracer_max, kappa0 * theta_of(U[EN])**2.5 / (rho * phi1), 0.0)
-    D_max = float(xp.max(D))
-    if D_max <= 0:
+    def dt_expl_of():
+        D = xp.where(a < tracer_max, kappa0 * theta_of(U[EN])**2.5 / (rho * phi1), 0.0)
+        D_max = float(xp.max(D))
+        if D_max <= 0:
+            return None
+        dte = cfl / (2.0 * D_max * sum(1.0 / hh**2 for hh in h))
+        return 0.5 * dte if wall_T is not None else dte   # a wall face sits half a cell away: twice the stiffness
+    split = rkl2_plan("cond_i" if ion_Z is not None else "cond", dt, dt_expl_of)
+    if split is None:
         return 0
-    dt_expl = cfl / (2.0 * D_max * sum(1.0 / hh**2 for hh in h))
-    if wall_T is not None:
-        dt_expl *= 0.5                           # a wall face sits half a cell away: twice the stiffness
-    out = rkl2(U[EN], rate, dt, dt_expl)
+    out = rkl2(U[EN], rate, dt, None, split=split)
     U[EN], stages = out[0], out[1]
     if track:
         flux_out.extend(out[2])

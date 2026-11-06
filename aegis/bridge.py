@@ -4,7 +4,11 @@
 # is captured once as CUDA graphs; src/aegis_core.cpp then replays them from raw handles. Nothing in the numerics changes,
 # so conservation and div B are those of the solver; tools/build_core.py builds the extension.
 #
-#   NativeStepper(solver).advance(n, dt)    n steps of a fixed dt through one graph.
+#   NativeStepper(solver).advance(n, dt)    n whole steps of a fixed dt through one graph: 2D (Cartesian or r-z) and 3D
+#       (Cartesian or cylindrical r-theta-z) solvers, with the split-step physics of _post_step (resistivity, Hall and
+#       anisotropic resistivity live in the RK stages) whenever it runs without host synchronisation. Physics that needs
+#       the host inside a step (an iteration count, a stage count from max |kappa|, kinetic particles) cannot be put in a
+#       graph; the capture fails and the stepper says which. Checked bit-identical to the Python step (--test bridge).
 #   OverlapStepper(solver, comm).advance(n, dt)   n steps on a slab subdomain (or one periodic rank), with each RK stage
 #       split so that communication overlaps computation:
 #         stream 1: rates and update of the strips next to the x cuts, pack their layers, stage them to the host;
@@ -12,7 +16,7 @@
 #         stream 2: rates and update of the interior, which reads no ghost cell, while the exchange is in flight;
 #         rejoin, copy the received layers to the device, unpack them into the ghost layers of the next stage state.
 #
-# Scope: ideal gas, ideal MHD, constrained transport, Cartesian, fixed dt during a call (the caller chooses dt, e.g. the
+# OverlapStepper scope: ideal gas, ideal MHD, constrained transport, 2D Cartesian, fixed dt during a call (the caller chooses dt, e.g. the
 # global CFL value at the start of a batch; check it against the CFL limit between batches). OverlapStepper needs periodic
 # y and periodic (or MPI-cut) x. Split-step physics is refused: it is not in the graphs. The shared x-face field on a cut
 # is taken from the right rank, so both ranks hold the same value. Exchange is host-staged MPI (MPICH ABI: Intel MPI,
@@ -48,36 +52,112 @@ def _require(cfg, solver):
         raise ValueError("the native bridge covers ideal-gas ideal MHD with div_b='ct', Cartesian, no split-step physics")
 
 
-class NativeStepper:
-    """whole-step graph (RK stages and the boundary refresh) replayed natively"""
+def _snapshot(s):
+    """every attribute of the solver, with device arrays copied (restored in place, so that captured pointers stay valid)"""
+    return {k: (v, v.copy()) if isinstance(v, cp.ndarray) else (v, [f.copy() for f in v])
+            if isinstance(v, list) and v and all(isinstance(f, cp.ndarray) for f in v) else (v, None)
+            for k, v in vars(s).items()}
 
-    def __init__(self, solver):
+
+def _restore(s, snap):
+    for k in list(vars(s)):
+        if k not in snap:
+            delattr(s, k)
+    for k, (obj, copy) in snap.items():
+        if isinstance(obj, cp.ndarray):
+            obj[...] = copy
+        elif copy is not None:
+            for f, g in zip(obj, copy):
+                f[...] = g
+        setattr(s, k, obj)
+
+
+class NativeStepper:
+    """whole steps (RK stages, split-step physics, boundary refresh) captured as a CUDA graph and replayed natively.
+    physics=False leaves the split steps out (the RK stages and the boundary refresh only).
+
+    Super-time-stepped split steps (conduction, viscosity) choose their RKL2 stage count from the largest diffusivity, a
+    device value. Here that count is planned on the host before each batch, on a copy of the state at the batch's dt
+    times margin, and the graph uses the planned counts (recaptured when a batch needs more). Within a batch the
+    diffusivity may grow by the margin before the scheme leaves its stability region; that is not checked mid-batch."""
+
+    def __init__(self, solver, physics=True, margin=1.5):
         s = solver
-        _require(s.cfg, s)
-        self.s = s
+        if _core is None:
+            raise ImportError("aegis_core is not built: pip install pybind11 ziglang; python tools/build_core.py")
+        if not s.ct or getattr(s.eos, "no_graph", False) or s.cfg.pic:
+            raise ValueError("the native stepper needs div_b='ct', an equation of state without host branches and no "
+                             "kinetic particles")
+        self.s, self.physics, self.margin = s, physics, margin
         s._ct_sync()
+        if hasattr(s, "_te_sync"):
+            s._te_sync()
+        if hasattr(s, "_glm_ch_frozen"):
+            s._glm_ch_frozen = 0.0
         self._dtd = cp.zeros(())
         self._pool = cp.cuda.MemoryPool()
         self._stream = cp.cuda.Stream(non_blocking=True)
-        # one ordinary step on saved state, so that every kernel and buffer exists before the capture
-        saved = s.U.copy(), [f.copy() for f in s.Bf], s._acc_boundary_energy.copy()
-        s._glm_ch_frozen = 0.0
-        s._rk_core(1e-12)
-        s.U[...] = saved[0]
-        for f, g in zip(s.Bf, saved[1]):
-            f[...] = g
-        s._acc_boundary_energy = saved[2]
-        cp.cuda.Device().synchronize()
-        with cp.cuda.using_allocator(self._pool.malloc), self._stream:
-            self._stream.begin_capture()
-            s._rk_core(self._dtd)
+        self.graph, self.plan, self.captures = None, None, 0
+
+    def _probe(self, dt):
+        """one ordinary step on a copy of the state, recording the RKL2 stage needs; the state is restored"""
+        P = physics.RKL2_PLAN
+        snap = _snapshot(self.s)
+        P.update(mode="record", margin=self.margin, plan={})
+        try:
+            self._step(dt)
+            cp.cuda.Device().synchronize()
+        finally:
+            plan = dict(P["plan"])
+            P.update(mode=None, plan={})
+            _restore(self.s, snap)
+        return plan
+
+    def _capture(self, plan):
+        s, P = self.s, physics.RKL2_PLAN
+        snap = _snapshot(s)
+        P.update(mode="replay", plan=dict(plan))
+        try:
+            with cp.cuda.using_allocator(self._pool.malloc), self._stream:
+                self._stream.begin_capture()
+                try:
+                    self._step(self._dtd)
+                finally:
+                    graph = self._stream.end_capture()
+        except Exception as e:                       # host synchronisation inside the step: not capturable
+            cp.cuda.Device().synchronize()
+            _restore(s, snap)
+            raise ValueError(f"this solver's step cannot be captured as a CUDA graph (it needs the host mid-step): "
+                             f"{type(e).__name__}: {str(e)[:200]}") from None
+        finally:
+            P.update(mode=None, plan={})
+        graph.upload(self._stream)
+        self.graph, self.plan = graph, dict(plan)
+        self.captures += 1
+
+    def _step(self, dt):
+        s = self.s
+        s._rk_core(dt)
+        if self.physics:
+            s._post_step(dt)                         # ends with the boundary refresh
+        else:
             s.apply_bc(s.U)
             s._ghost_faces(s.Bf, s.U)
-            self.graph = self._stream.end_capture()
-        self.graph.upload(self._stream)
+
+    def prepare(self, dt):
+        """plan the split steps for dt and (re)capture if needed; advance() calls this"""
+        need = self._probe(dt) if (self.physics or self.graph is None) else {}
+        if self.graph is None or any(k not in self.plan or v[0] * v[1] > self.plan[k][0] * self.plan[k][1]
+                                     for k, v in need.items()):
+            merged = dict(self.plan or {})
+            for k, v in need.items():
+                if k not in merged or v[0] * v[1] > merged[k][0] * merged[k][1]:
+                    merged[k] = v
+            self._capture(merged)
 
     def advance(self, n, dt):
         """n steps of dt, without the GIL; returns the seconds spent in native code"""
+        self.prepare(dt)
         self._dtd.fill(dt)
         cp.cuda.Device().synchronize()
         sec = _core.run_graph(self.graph.graphExec, self._stream.ptr, int(n), _CUDA_DLL)
@@ -87,6 +167,7 @@ class NativeStepper:
 
     def advance_python(self, n, dt):
         """the same replay driven from Python, for comparison"""
+        self.prepare(dt)
         self._dtd.fill(dt)
         cp.cuda.Device().synchronize()
         for _ in range(n):

@@ -706,7 +706,16 @@ is a modest fraction of the domain.
 `aegis/bridge.py` and `src/aegis_core.cpp` (pybind11; `python tools/build_core.py`) run solver steps in native code with
 the GIL released. The kernels are the solver's own HLLD, MUSCL and CT, captured as CUDA graphs through CuPy, and the
 extension replays them from raw handles and `.data.ptr` device pointers:
-- **`NativeStepper(solver).advance(n, dt)`:** n steps of one graph, bit-identical to the Python solver.
+- **`NativeStepper(solver).advance(n, dt)`:** n whole steps of one graph (RK stages, split-step physics, boundary
+  refresh), bit-identical to the Python step for:
+  - 2D Cartesian and r-z, and the 3D solver in Cartesian and cylindrical (r, theta, z) geometry;
+  - resistivity, Hall and anisotropic resistivity (in the RK stages), optically thin radiation, and conduction and
+    viscosity (RKL2 super-time-steps).
+  RKL2 picks its stage count from the largest diffusivity, a device value a graph cannot read. So the stepper plans the
+  counts on the host before each batch, on a copy of the state at dt times a margin (default 1.5), and recaptures the
+  graph when a batch needs more. With a planned count that differs from the Python step's own per-step choice, results
+  differ at the RKL2 truncation level (3e-3 on a stiff test), with energy still at round-off. Steps that need the host
+  inside them (FLD's iterative solve, kinetic particles) are refused with the reason.
 - **`OverlapStepper(solver, comm).advance(n, dt)`:** on a slab subdomain, each RK stage runs as:
   - stream 1: boundary strips, then pack and stage them to the host;
   - non-blocking MPI of the layers, from native code;
@@ -717,10 +726,14 @@ extension replays them from raw handles and `.data.ptr` device pointers:
 - **Build:** no CUDA toolkit or MPI headers; both are loaded at run time (the CUDA driver API, and the MPICH ABI for MPI).
   With no system compiler, `pip install pybind11 ziglang` is enough.
 - **Limits:**
-  - ideal-gas ideal MHD with CT, 2D Cartesian; periodic y and periodic or MPI-cut x; split-step physics is refused;
+  - `OverlapStepper` (the stream-overlapped, MPI-exchanging one) stays ideal-gas ideal MHD with CT, 2D Cartesian,
+    periodic y and periodic or MPI-cut x; the 3D and non-ideal steps run through `NativeStepper` on one GPU only;
   - dt is fixed during a call, so the caller checks the CFL limit between batches;
-  - host-staged MPI only (no NCCL, no GPU-aware MPI), and it has only run with ranks sharing one GPU, so **overlap and
-    multi-node scaling are not measured**;
+  - host-staged MPI only. GPU-direct exchange (NCCL, or CUDA-aware MPI on device pointers) is **not implemented**:
+    neither exists on this Windows machine with one GPU (NCCL is Linux-only, and Intel MPI on Windows does not accept
+    device buffers), so it could not be run or tested, and untested exchange code is not shipped. Ranks have only shared
+    one GPU, so **overlap and multi-node scaling are not measured**;
+  - within a batch, conduction or viscosity may stiffen past the planned margin; that is not checked mid-batch;
   - graph replay was already little Python overhead, so the gain so far is freedom from the GIL, not raw speed.
 
 ### Multi-GPU domain decomposition
@@ -862,7 +875,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | rlc_adjoint | r-z liner driven by an RLC bank: bank + resistor + grid energy 2e-16; d(yield proxy)/d(shape, V0, C, L, R) adjoint vs central differences 2e-10 to 9e-9 |
 | literature | digitized traces without a citation refused, sorting / scaling, HDF5 round trip; virtual probes on a manufactured state: B-dot exact (1e-12), VISAR velocity exact, framing radius within half a cell; synthetic traces: hidden speed recovered within 1%, marked [syn]; self-tests, not validation against an experiment |
 | atomic | parsers on real NIST, TOPS and CHIANTI formats; Saha vs an exact hydrogen result; collisional-radiative balance reduces to Saha at high density and is coronal at low density; Z_bar within about 2% of Los Alamos TOPS for Al and Cu; model lines bring the Planck mean within about 2-3x of TOPS (from 12-57x) and do not worsen Rosseland (still 4-20x low, reported); hydrogen f values, pseudo-Voigt vs an exact convolved Voigt, line strength exact on the grid; Burgess formula vs ADAS's worked values; CHIANTI DR fits improve the coronal mean charge against CHIANTI's ion balance; vectorised GPU group lookup matches per-group tables to 2e-13; multigroup FLD with the imported TOPS Al table conserves energy |
-| bridge | native graph loop bit-identical to the Python solver with the GIL released; overlap stepper on one periodic rank matches to 4e-15; 2 MPI ranks through the native exchange: 2e-15 vs serial, energy 2e-15, div B 4e-14, shared faces identical (one shared GPU, so no scaling claim) |
+| bridge | native graph loop bit-identical to the Python solver with the GIL released; whole native steps bit-identical to the Python step for 2D r-z, resistive + Hall, conduction, viscosity, 3D Cartesian and cylindrical, 3D resistive, conduction, viscosity; planned RKL2 stages: energy at round-off, recapture when dt grows; FLD refused; overlap stepper on one periodic rank matches to 4e-15; 2 MPI ranks through the native exchange: 2e-15 vs serial, energy 2e-15, div B 4e-14, shared faces identical (one shared GPU, so no scaling claim) |
 | ml_additive | the numerical core imports no model; rejected sub-grid predictions leave the state bit-identical to the solver, accepted ones keep mass, momentum, energy and div B at round-off; AMR with trigger cells keeps conservation; surrogate optimizer spends exactly its budget and beats a same-budget scan on Branin; CNN and PINN gradients vs finite differences; does not depend on trained weights |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |

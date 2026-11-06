@@ -7,7 +7,7 @@
 # face: compact difference along the normal, averaged centred differences across it. Integrated as a split
 # step with RKL2, liner faces and non-periodic domain faces carry no stress.
 from .config import RHO, MX, MY, MZ, EN, iBX, iBY, iBZ, FLOOR_RHO
-from .physics import xp, _along, _pad1, rkl2
+from .physics import xp, _along, _pad1, rkl2, rkl2_plan
 
 
 def stress_rates(rho, m, E, B, eta, h, periodic, fuel, ghost=None, fluxes=None):
@@ -83,10 +83,12 @@ def viscous_step(U, eta, h, periodic, fuel, dt, cfl=0.5, ghost=None, flux_out=No
     rho = xp.maximum(U[RHO], FLOOR_RHO)
     B = (U[iBX], U[iBY], U[iBZ])
     track = flux_out is not None
-    nu_max = float(xp.max(xp.where(fuel, 3.0 * eta / rho, 0.0)))
-    if nu_max <= 0:
+    def dt_expl_of():
+        nu_max = float(xp.max(xp.where(fuel, 3.0 * eta / rho, 0.0)))
+        return cfl / (2.0 * nu_max * sum(1.0 / hh**2 for hh in h)) if nu_max > 0 else None
+    split = rkl2_plan("visc", dt, dt_expl_of)
+    if split is None:
         return 0
-    dt_expl = cfl / (2.0 * nu_max * sum(1.0 / hh**2 for hh in h))
     y0 = xp.stack([U[MX], U[MY], U[MZ], U[EN]])
 
     def rate(y):
@@ -95,7 +97,7 @@ def viscous_step(U, eta, h, periodic, fuel, dt, cfl=0.5, ghost=None, flux_out=No
         out = xp.stack([dm[0], dm[1], dm[2], dE])
         return (out, fl) if track else out
 
-    res = rkl2(y0, rate, dt, dt_expl)
+    res = rkl2(y0, rate, dt, None, split=split)
     y, stages = res[0], res[1]
     if track:
         flux_out.extend(res[2])

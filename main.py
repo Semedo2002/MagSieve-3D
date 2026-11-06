@@ -3632,6 +3632,71 @@ def bridge_test():
     good = d2 < 1e-12 and dE < 1e-13 and db < 1e-12
     ok = ok and good
     print(f"  overlap stepper, one periodic rank: vs the solver {d2:.0e}, energy {dE:.0e}, div B {db:.0e}  [{'PASS' if good else 'FAIL'}]")
+    # whole steps of other solvers and non-ideal physics through the native loop
+    from aegis.solver3d import MHDSolver3D
+
+    def make_g(dim, **kw):
+        base = dict(x_max=1.0, y_max=1.0, cfl=0.3, gamma=5 / 3, bc_x_type="periodic", bc_y_type="periodic",
+                    diag_interval=10**9, snapshot_times=[], use_cuda_graphs=False)
+        base.update(dict(nx=24, ny=20, nz=16, z_max=1.0) if dim == 3 else dict(nx=48, ny=40))
+        base.update(kw)
+        cfg_ = Config(**base)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s_ = (MHDSolver3D if dim == 3 else MHDSolver)(cfg_)
+        rg = np.random.default_rng(1)
+        W = xp.zeros_like(s_.U)
+        sh = s_.U.shape[1:]
+        W[iRHO], W[iPR] = 1.0 + 0.1 * xp.asarray(rg.random(sh)), 1.0 + 0.1 * xp.asarray(rg.random(sh))
+        for v, a_ in ((iVX, 0.2), (iVY, 0.2), (iVZ, 0.1)):
+            W[v] = a_ * xp.asarray(rg.standard_normal(sh))
+        W[iBX], W[iBY], W[iBZ] = 0.3, 0.2, 0.5
+        s_.U[...] = prim_to_cons(W, cfg_.gamma)
+        s_._ct_sync()
+        s_.apply_bc(s_.U)
+        return s_
+
+    def pair(dim, n_, margin=1.0, **kw):
+        a_ = make_g(dim, **kw)
+        dt_ = 0.3 * a_.compute_dt(cons_to_prim(a_.U, a_.eos))
+        E_0 = float(xp.sum(a_.U[(EN,) + (slice(2, -2),) * dim]))
+        for _ in range(n_):
+            a_.dt = dt_
+            a_.step_ssprk3()
+        b_ = make_g(dim, **kw)
+        st_ = bridge.NativeStepper(b_, margin=margin)
+        st_.advance(n_, dt_)
+        Ua_, Ub_ = to_numpy(a_.U), to_numpy(b_.U)
+        sc_ = np.abs(Ua_).max(axis=tuple(range(1, Ua_.ndim)), keepdims=True) + 1e-300
+        df = max(float(np.max(np.abs(Ua_ - Ub_) / sc_)), max(float(xp.max(xp.abs(f - g))) for f, g in zip(a_.Bf, b_.Bf)))
+        return df, st_, b_, dt_, E_0
+    cases = [("2D r-z", 2, dict(geometry="cylindrical", bc_x_type="extrapolation", x_min=0.0)),
+             ("2D resistive + Hall", 2, dict(eta_resistivity=1e-3, hall_di=0.02)),
+             ("2D conduction", 2, dict(cond_kappa0=1e-3)), ("2D viscosity", 2, dict(visc_coeff=1e-3)),
+             ("3D", 3, {}), ("3D cylindrical", 3, dict(geometry="cylindrical", bc_x_type="extrapolation", x_min=0.0,
+                                                      y_max=2 * np.pi)),
+             ("3D resistive", 3, dict(eta_resistivity=1e-3)), ("3D conduction", 3, dict(cond_kappa0=1e-3)),
+             ("3D viscosity", 3, dict(visc_coeff=1e-3))]
+    res = {nm: pair(dm, 6, **kw)[0] for nm, dm, kw in cases}
+    good = all(v == 0.0 for v in res.values())
+    ok = ok and good
+    print("  native whole steps vs the Python step, bit for bit: " + ", ".join(f"{k} {v:.0e}" for k, v in res.items())
+          + f"  [{'PASS' if good else 'FAIL'}]")
+    df, st_, b_, dt_, E_0 = pair(2, 10, margin=1.5, cond_kappa0=0.5)
+    e1 = abs(float(xp.sum(b_.U[EN, 2:-2, 2:-2])) - E_0) / E_0
+    plan1 = dict(st_.plan)
+    st_.advance(5, 2 * dt_)
+    e2 = abs(float(xp.sum(b_.U[EN, 2:-2, 2:-2])) - E_0) / E_0
+    refused = False
+    try:
+        bridge.NativeStepper(make_g(2, fld=True, fld_c=50.0, fld_a=1e-3, fld_kr0=1.0)).advance(1, 1e-4)
+    except ValueError:
+        refused = True
+    good = (df < 1e-2 and e1 < 1e-13 and e2 < 1e-13 and st_.captures == 2 and st_.plan["cond"][0] > plan1["cond"][0]
+            and refused)
+    ok = ok and good
+    print(f"  stiff conduction, RKL2 stages planned on the host ({plan1['cond'][0]} at margin 1.5): vs Python {df:.0e} "
+          f"(different stage counts), energy {e1:.0e}; doubled dt recaptured with {st_.plan['cond'][0]} stages, energy {e2:.0e}; "
+          f"FLD (iterative, host convergence test) refused: {refused}  [{'PASS' if good else 'FAIL'}]")
     exe = shutil_which_mpi()
     if exe is None:
         print("  2-rank exchange: SKIPPED, mpi4py or mpiexec not found")

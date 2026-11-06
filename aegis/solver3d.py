@@ -795,12 +795,17 @@ class MHDSolver3D:
 
     def step_ssprk3(self):
         dt = self.dt
-        U0 = self.U
         self._ct_sync()
         if self.cfg.two_temp and getattr(self, "_te_owner", None) is not self.U:
             if float(xp.max(xp.abs(self.U[RHOSE]))) == 0.0:
                 twotemp.init_equal(self.U, self.cfg.gamma, self.cfg.z_ion)
             self._te_owner = self.U
+        self._rk_core(dt)
+        self._post_step(dt)
+
+    def _rk_core(self, dt):
+        """SSP-RK3 stages (U, CT faces, stress) and the cell field from the faces; dt is a float or a device scalar"""
+        U0 = self.U
         F0, F1, dF = (self.Bf, self._Bf1, self._dBf) if self.ct else (None, None, None)
         S0, S1, dS = (self.S, self._S1, self._dS) if self.strength else (None, None, None)
         self.compute_rhs(U0, self.dU, F0, dF, S0, dS); self._acc(dt / 6)
@@ -832,6 +837,9 @@ class MHDSolver3D:
         else:
             rho = xp.maximum(self.U[RHO], FLOOR_RHO)
             self.U[RHOC] = rho * xp.clip(self.U[RHOC] / rho, 0.0, 1.0)
+
+    def _post_step(self, dt):
+        """split steps after the RK stages: plasticity, radiation, FLD, conduction, equilibration, viscosity, sponge, BCs"""
         cfg, ng = self.cfg, self.ng
         inner = (slice(None),) + tuple(slice(ng, ng + m) for m in (cfg.nx, cfg.ny, cfg.nz))
         if self.strength:                            # radial return to the yield surface, spall damage
