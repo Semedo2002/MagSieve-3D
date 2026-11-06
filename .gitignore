@@ -18,3 +18,7 @@ tables/
 
 # trained neural-operator weights (python tools/train_fno_radiation.py)
 results/fno/*.npz
+
+# native extension, built by tools/build_core.py
+aegis/aegis_core*.pyd
+aegis/aegis_core*.so

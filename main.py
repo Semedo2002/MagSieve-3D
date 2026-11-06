@@ -3490,6 +3490,106 @@ Useful Links"""
     return ok
 
 
+def bridge_test():
+    """Native timestep bridge (src/aegis_core.cpp, aegis/bridge.py). Built on demand with tools/build_core.py; reported
+    as skipped if no compiler is available. (1) N steps through the native graph loop are bit-identical to the Python
+    solver, and another Python thread keeps running meanwhile (the GIL is released). (2) The overlap stepper (boundary
+    and interior on two streams, exchange in native code) on one periodic rank matches the solver to round-off, energy
+    and div B at round-off. (3) Under mpiexec with 2 ranks, through the native MPI exchange: parity with the serial
+    solver, energy, div B and identical shared faces. Ranks share one GPU here, so this says nothing about scaling."""
+    import subprocess
+    import threading
+    import importlib
+    import json as _json
+    print("\n--- Native timestep bridge ---"); sys.stdout.flush()
+    here = os.path.dirname(os.path.abspath(__file__))
+    from aegis import bridge
+    if not bridge.available():
+        r = subprocess.run([sys.executable, os.path.join(here, "tools", "build_core.py")], capture_output=True, text=True)
+        if r.returncode:
+            print("  SKIPPED: aegis_core not built and no compiler found (pip install pybind11 ziglang)")
+            return True
+        importlib.reload(bridge)
+    ok = True
+
+    def make(n=64, m=48):
+        cfg = Config(nx=n, ny=m, x_max=1.0, y_max=1.0, cfl=0.3, gamma=5 / 3, bc_x_type="periodic", bc_y_type="periodic",
+                     diag_interval=10**9, snapshot_times=[], use_cuda_graphs=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        W = xp.zeros_like(s.U)
+        W[iRHO], W[iPR] = 25 / (36 * np.pi), 5 / (12 * np.pi)
+        W[iVX], W[iVY] = -xp.sin(2 * np.pi * s.Y), xp.sin(2 * np.pi * s.X)
+        s.U[...] = prim_to_cons(W, cfg.gamma)
+        B0 = 1 / np.sqrt(4 * np.pi)
+        s.set_vector_potential(lambda x, y: B0 * (np.cos(4 * np.pi * x) / (4 * np.pi) + np.cos(2 * np.pi * y) / (2 * np.pi)))
+        s.apply_bc(s.U)
+        s._ghost_faces(s.Bf, s.U)
+        return s
+    N = 40
+    a = make()
+    dt = 0.5 * a.compute_dt(cons_to_prim(a.U, a.eos))
+    E0 = float(xp.sum(a.U[EN, 2:-2, 2:-2]))
+    for _ in range(N):
+        a.dt = dt
+        a.step_ssprk3()
+    I = (slice(None), slice(2, -2), slice(2, -2))
+    Ua = to_numpy(a.U)[I]
+    scale = np.abs(Ua).max(axis=(1, 2), keepdims=True) + 1e-300
+    b = make()
+    st = bridge.NativeStepper(b)
+    tick, stop = [0], [False]
+
+    def spin():
+        while not stop[0]:
+            tick[0] += 1
+    th = threading.Thread(target=spin, daemon=True)
+    th.start()
+    sec = st.advance(N, dt)
+    during = tick[0]
+    stop[0] = True
+    th.join()
+    d1 = float(np.max(np.abs(to_numpy(b.U)[I] - Ua) / scale))
+    good = d1 < 1e-13 and during > 1000
+    ok = ok and good
+    print(f"  native graph loop, {N} steps: vs the Python solver {d1:.0e}; {1e3 * sec / N:.1f} ms/step; a Python thread "
+          f"counted {during} ticks meanwhile (GIL released)  [{'PASS' if good else 'FAIL'}]")
+    c = make()
+    so = bridge.OverlapStepper(c)
+    so.advance(N, dt)
+    d2 = float(np.max(np.abs(to_numpy(c.U)[I] - Ua) / scale))
+    dE = abs(float(xp.sum(c.U[EN, 2:-2, 2:-2])) - E0) / E0
+    db = float(c.div_b_max())
+    good = d2 < 1e-12 and dE < 1e-13 and db < 1e-12
+    ok = ok and good
+    print(f"  overlap stepper, one periodic rank: vs the solver {d2:.0e}, energy {dE:.0e}, div B {db:.0e}  [{'PASS' if good else 'FAIL'}]")
+    exe = shutil_which_mpi()
+    if exe is None:
+        print("  2-rank exchange: SKIPPED, mpi4py or mpiexec not found")
+        return ok
+    r = subprocess.run([exe, "-n", "2", sys.executable, os.path.join(here, "scripts", "bridge_mpi_check.py")],
+                       capture_output=True, text=True, timeout=900)
+    line = [l for l in r.stdout.splitlines() if l.startswith("RESULT ")]
+    if r.returncode or not line:
+        print("  2-rank exchange FAILED: " + (r.stdout + r.stderr)[-400:] + "  [FAIL]")
+        return False
+    m = _json.loads(line[0][7:])
+    good = m["parity"] < 1e-12 and m["energy"] < 1e-13 and m["div_b"] < 1e-12 and m["shared_face"] < 1e-13
+    ok = ok and good
+    print(f"  2 MPI ranks through the native exchange (one shared GPU): vs serial {m['parity']:.0e}, energy {m['energy']:.0e}, "
+          f"div B {m['div_b']:.0e}, shared faces {m['shared_face']:.0e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
+def shutil_which_mpi():
+    import shutil
+    import importlib.util
+    if importlib.util.find_spec("mpi4py") is None:
+        return None
+    return shutil.which("mpiexec") or next((p for p in (os.path.join(sys.prefix, "Library", "bin", "mpiexec.exe"),
+                                                        os.path.join(sys.prefix, "bin", "mpiexec")) if os.path.exists(p)), None)
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3837,6 +3937,7 @@ VERIFICATION_TESTS = {
     "rlc_adjoint": rlc_adjoint_test,
     "literature": literature_test,
     "atomic": atomic_test,
+    "bridge": bridge_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,
