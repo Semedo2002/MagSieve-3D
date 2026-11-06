@@ -2810,7 +2810,7 @@ def hybrid_pic_test():
 
 
 def fno_test():
-    """Fourier neural operator predictor (aegis/fno_subgrid.py) and its guard in the multigroup step.
+    """Fourier neural operator predictor (aegis/ml/fno_subgrid.py) and its guard in the multigroup step.
     (1) The spectral convolution with identity weights is the FFT low-pass of the kept modes. (2) Gradients of a
     loss through the whole network (tape of aegis/autodiff.py) agree with central differences. (3) Guard, with an
     untrained (random) network: forcing acceptance (huge tolerance) still conserves gas + radiation energy to
@@ -2818,7 +2818,8 @@ def fno_test():
     the fallback (tiny tolerance) gives the exact solver's answer to its tolerance, and a prediction no better
     than E^n costs no extra Krylov iterations (the solve then starts from E^n)."""
     import tempfile
-    from aegis import fno_subgrid as fs, autodiff as ad, radiation_multigroup as mg
+    from aegis.ml import fno_subgrid as fs
+    from aegis import autodiff as ad, radiation_multigroup as mg
     print("\n--- Fourier neural operator predictor ---"); sys.stdout.flush()
     ok = True
     rng = np.random.default_rng(0)
@@ -3590,6 +3591,171 @@ def shutil_which_mpi():
                                                         os.path.join(sys.prefix, "bin", "mpiexec")) if os.path.exists(p)), None)
 
 
+def ml_additive_test():
+    """The additive ML rule (aegis/ml, scripts/surrogate_optimizer.py). Nothing here depends on trained weights. (1) The
+    numerical core never imports a model. (2) Sub-grid guard: a rejected prediction (NaN, or far too large) leaves the state
+    bit-identical to the solver without any model; an accepted one keeps mass, momentum, energy and div B at round-off and B
+    untouched. (3) AMR trigger: it can only add flags, gradients of the CNN match finite differences, and AMR with cells added
+    by it keeps its conservation and div B. (4) The surrogate optimizer evaluates f exactly once per budgeted run and beats a
+    same-budget scan on the Branin function. (5) PINN: loss gradient vs finite differences, zero physics residual on a
+    uniform state, and the closed-form baseline."""
+    import importlib.util
+    from aegis.ml import fno_subgrid as fs, amr_trigger as at, pinn_diagnostics as pd
+    from aegis import autodiff as ad
+    from aegis.amr import AMR, AMRParams
+    from aegis.config import RHO, MX, MY
+    print("\n--- Additive ML extensions ---"); sys.stdout.flush()
+    ok = True
+    root = os.path.dirname(os.path.abspath(__file__))
+    core = ["solver.py", "solver3d.py", "physics.py", "ct.py", "fused.py", "hlld_kernel.cu"]
+    src = {f: open(os.path.join(root, "aegis", f), encoding="utf-8").read() for f in core}
+    bad = [f for f, t in src.items() if "from .ml" in t or "aegis.ml" in t or "import ml" in t]
+    good = not bad
+    ok = ok and good
+    print(f"  numerical core ({len(core)} files) imports no model  [{'PASS' if good else 'FAIL'}]")
+
+    def ot(n=48):
+        cfg = Config(nx=n, ny=n, x_max=1.0, y_max=1.0, cfl=0.3, gamma=5 / 3, bc_x_type="periodic", bc_y_type="periodic",
+                     diag_interval=10**9, snapshot_times=[])
+        with contextlib.redirect_stdout(io.StringIO()):
+            s = MHDSolver(cfg)
+        W = xp.zeros_like(s.U)
+        W[iRHO], W[iPR] = 25 / (36 * np.pi), 5 / (12 * np.pi)
+        W[iVX], W[iVY] = -xp.sin(2 * np.pi * s.Y), xp.sin(2 * np.pi * s.X)
+        s.U[...] = prim_to_cons(W, cfg.gamma)
+        B0 = 1 / np.sqrt(4 * np.pi)
+        s.set_vector_potential(lambda x, y: B0 * (np.cos(4 * np.pi * x) / (4 * np.pi) + np.cos(2 * np.pi * y) / (2 * np.pi)))
+        return s
+
+    def march(s, cop=None, n=25):
+        for _ in range(n):
+            s.dt = s.compute_dt(cons_to_prim(s.U, s.eos))
+            s.step_ssprk3()
+            if cop:
+                cop.step(s.dt)
+            s.t += s.dt
+    a = ot()
+    march(a)
+    Ua = to_numpy(a.U)
+    res = {}
+    for name, fn in (("nan", lambda F: xp.full((3,) + F.shape[1:], xp.nan)), ("huge", lambda F: 1e6 * xp.sin(40 * F[1])[None] * xp.ones((3,) + F.shape[1:]))):
+        b = ot()
+        c = fs.SGSCoprocessor(b, stress_fn=fn)
+        march(b, c)
+        res[name] = (float(np.max(np.abs(to_numpy(b.U) - Ua))), c.accepted, c.rejected)
+    good = all(v[0] == 0.0 and v[1] == 0 and v[2] == 25 for v in res.values())
+    ok = ok and good
+    print(f"  sub-grid guard: rejected predictions (NaN, huge) leave the state bit-identical to the solver: {res['nan'][0]:.0e}, "
+          f"{res['huge'][0]:.0e}, {res['nan'][2]} + {res['huge'][2]} rejected  [{'PASS' if good else 'FAIL'}]")
+    h = 1.0 / 48
+    d = ot()
+    ng = d.ng
+    Bf0 = [to_numpy(f).copy() for f in d.Bf]
+    tot = lambda s: [float(xp.sum(s.U[v, ng:-ng, ng:-ng])) for v in (RHO, MX, MY, EN)]
+    t0 = tot(d)
+    c = fs.SGSCoprocessor(d, stress_fn=lambda F: fs.smagorinsky_stress(F, h, h))
+    march(d, c)
+    t1 = tot(d)
+    dm, dE = abs(t1[0] - t0[0]) / t0[0], abs(t1[3] - t0[3]) / t0[3]
+    dp = max(abs(t1[1] - t0[1]), abs(t1[2] - t0[2]))
+    db = float(d.div_b_max())
+    changed = float(np.max(np.abs(to_numpy(d.U) - Ua)))
+    good = c.accepted == 25 and dm < 1e-13 and dE < 1e-13 and dp < 1e-12 and db < 1e-12 and changed > 0
+    ok = ok and good
+    print(f"  sub-grid increments accepted ({c.accepted}): mass {dm:.0e}, momentum {dp:.0e}, energy {dE:.0e}, div B {db:.0e}  [{'PASS' if good else 'FAIL'}]")
+    # AMR trigger
+    rng = np.random.default_rng(0)
+    m = at.TriggerCNN(width=4, xp=np)
+    x = rng.normal(size=(1, 4, 8, 8))
+
+    def L(P):
+        q = m.logits(ad.const(x), P)
+        return ad.tsum(q * q)
+    with ad.record():
+        P = {k: ad.leaf(v) for k, v in m.params.items()}
+        ad.backward(L(P))
+    errs = []
+    for k in ("k1", "k2", "w", "b1"):
+        idx = tuple(int(rng.integers(0, n)) for n in m.params[k].shape)
+        p0, e = m.params[k][idx], 1e-6
+        m.params[k][idx] = p0 + e
+        Lp = float(L({q: ad.const(v) for q, v in m.params.items()}).v)
+        m.params[k][idx] = p0 - e
+        Lm = float(L({q: ad.const(v) for q, v in m.params.items()}).v)
+        m.params[k][idx] = p0
+        fd = (Lp - Lm) / (2 * e)
+        errs.append(abs(fd - P[k].g[idx]) / max(abs(fd), 1e-3))
+    s0 = ot(32)
+    mark = np.zeros((32, 32), bool)
+    mark[4:9, 20:26] = True
+    A0 = AMR(s0.cfg, AMRParams(ratio=2, regrid_every=0, tol_rho=1e9, tol_p=1e9))
+    A0.set_state(s0.U.copy())
+    f0 = A0.flags()
+    A1 = AMR(s0.cfg, AMRParams(ratio=2, regrid_every=4, tol_rho=0.3, tol_p=0.6, trigger=lambda s: mark, graphs=False))
+    A1.set_state(s0.U)
+    c1 = A1.coarse
+    c1.Bf, c1._faces_owner = s0.Bf, c1.U
+    c1._Bf1, c1._dBf = [xp.empty_like(f) for f in c1.Bf], [xp.empty_like(f) for f in c1.Bf]
+    fl = A1.flags()
+    A1.regrid()
+    t0 = A1.totals()
+    for _ in range(16):
+        A1.advance(A1.compute_dt())
+    t1 = A1.totals()
+    dm = abs(t1["mass"] - t0["mass"]) / t0["mass"]
+    dE = abs(t1["E"] - t0["E"]) / t0["E"]
+    db = float(A1.div_b())
+    good = max(errs) < 1e-5 and bool(fl[mark].all()) and not f0.any() and dm < 1e-13 and dE < 1e-13 and db < 1e-11 and len(A1.patches) > 0
+    ok = ok and good
+    print(f"  AMR trigger: CNN gradients vs differences {max(errs):.0e}; added cells flagged; AMR with them: mass {dm:.0e}, energy "
+          f"{dE:.0e}, div B {db:.0e}  [{'PASS' if good else 'FAIL'}]")
+    spec = importlib.util.spec_from_file_location("surrogate_optimizer", os.path.join(root, "scripts", "surrogate_optimizer.py"))
+    so = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(so)
+    calls = [0]
+
+    def f(x):
+        calls[0] += 1
+        return so.branin(x)
+    _, y, _, _ = so.optimise(f, 2, 25, seed=1, n_cand=1500)
+    gp_v, lhs_v, opt = so.compare_branin(budget=25, seeds=3)
+    Xg = np.random.default_rng(0).random((12, 2))
+    yg = np.array([so.branin(x) for x in Xg])
+    G = so.GaussianProcess(2).fit(Xg, yg)
+    mu_, sd_ = G.predict(Xg)
+    good = calls[0] == 25 and len(y) == 25 and gp_v > lhs_v and abs(gp_v - opt) < 0.5 and float(np.max(sd_)) < float(np.std(yg))
+    ok = ok and good
+    print(f"  surrogate: {calls[0]} solver-style evaluations for a budget of 25; Branin best {gp_v:.3f} vs scan {lhs_v:.3f} (optimum {opt:.3f})  [{'PASS' if good else 'FAIL'}]")
+    # PINN
+    pn = pd.PINN(1.0, 1.0, (1.0, 1.0, 0.1, 0.5), width=6, depth=2, n_freq=2)
+    rg, tg = np.linspace(0.1, 1.0, 6), np.linspace(0.0, 1.0, 5)
+
+    def LP(P):
+        return sum(ad.tsum(q * q) for q in pn.residuals(P, rg, tg))
+    with ad.record():
+        P = {k: ad.leaf(v) for k, v in pn.P.items()}
+        ad.backward(LP(P))
+    errs = []
+    for k in ("w0", "w1", "wo", "bo"):
+        idx = tuple(int(rng.integers(0, n)) for n in pn.P[k].shape)
+        p0, e = pn.P[k][idx], 1e-6
+        pn.P[k][idx] = p0 + e
+        Lp = float(LP({q: ad.const(v) for q, v in pn.P.items()}).v)
+        pn.P[k][idx] = p0 - e
+        Lm = float(LP({q: ad.const(v) for q, v in pn.P.items()}).v)
+        pn.P[k][idx] = p0
+        errs.append(abs((Lp - Lm) / (2 * e) - P[k].g[idx]) / max(abs(P[k].g[idx]), 1e-3))
+    pu = pd.PINN(1.0, 1.0, (1.0, 1.0, 0.1, 0.5), width=6, depth=2, n_freq=2)
+    pu.P["wo"][...] = 0.0
+    pu.P["bo"][...] = 0.0
+    ru = max(float(np.max(np.abs(q.v))) for q in pu.residuals({k: ad.const(v) for k, v in pu.P.items()}, rg, tg))
+    bfx, tfx = pd.flux_estimate(np.array([0.5]), 0.1, 1.0, 0.2)
+    good = max(errs) < 1e-5 and ru < 1e-12 and abs(bfx[0] - 0.4) < 1e-12
+    ok = ok and good
+    print(f"  PINN: loss gradients vs differences {max(errs):.0e}; residual on a uniform state at rest {ru:.0e}; closed-form baseline  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3938,6 +4104,7 @@ VERIFICATION_TESTS = {
     "literature": literature_test,
     "atomic": atomic_test,
     "bridge": bridge_test,
+    "ml_additive": ml_additive_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

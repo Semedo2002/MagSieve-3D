@@ -258,8 +258,8 @@ def step(Er, U, eos, cfg, h, periodic, dt, radial=None, advect=True):
                                                                  for ax in range(geo.nd)], geo.per,
                              cu=cpl * u, w=w)
         if cfg.fld_fno_model and first and geo.nd == 2:
-            # learned predictor (aegis/fno_subgrid.py), guarded by the residual of this linear system
-            from . import fno_subgrid as fs
+            # learned predictor (aegis/ml/fno_subgrid.py), guarded by the residual of this linear system
+            from .ml import fno_subgrid as fs
             x0 = fs.radiation_guess(cfg, E0, theta, rho, B, dt)
             bn = max(float(xp.sqrt(xp.sum(rhs * rhs))), 1e-300)
             res = lambda x: float(xp.sqrt(xp.sum((rhs - op(x))**2))) / bn

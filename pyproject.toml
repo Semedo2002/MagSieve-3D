@@ -30,7 +30,7 @@ native = ["pybind11>=2.11", "ziglang>=0.13"]   # builds src/aegis_core.cpp (tool
 cad = ["gmsh>=4.11"]                 # STEP / IGES import (OpenCASCADE); STL needs nothing
 
 [tool.setuptools]
-packages = ["aegis", "aegis.problems"]
+packages = ["aegis", "aegis.problems", "aegis.ml"]
 
 [tool.setuptools.package-data]
 aegis = ["hlld_kernel.cu", "eos_fused.cu", "data/experimental/*", "data/atomic/*"]

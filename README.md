@@ -29,7 +29,8 @@ aegis/            solver package
   radiation_multigroup.py  multigroup FLD: photon groups, group opacities, coupled implicit BiCGStab solve
   cad_importer.py STL / STEP / IGES import, ray-column volume fractions and apertures, immersed walls
   agent_monitor.py  automatic run diagnostics: interface mode growth, flux / insulation loss, numerical health
-  fno_subgrid.py  Fourier neural operator (inference + training on the autodiff tape), guarded radiation predictor
+  ml/             additive models: amr_trigger.py (CNN refinement flags), pinn_diagnostics.py (inverse diagnostics)
+  ml/fno_subgrid.py  Fourier neural operator (inference + training on the autodiff tape), guarded radiation predictor
   parallel.py     MPI slab domain decomposition of the 2D and 3D solvers (halo and CT edge exchange)
   io3d.py         3D snapshots: VTK ImageData (.vti/.pvd) and HDF5
   data/atomic/    NIST ionization energies and lines, Los Alamos TOPS benchmark and group tables
@@ -322,7 +323,7 @@ multigrid V-cycle (`aegis/radiation_gmg.py`), on the GPU arrays:
 
 ### Neural-operator predictor for the multigroup solve
 
-`aegis/fno_subgrid.py` is a small Fourier neural operator (FNO) that runs inside the time step as a
+`aegis/ml/fno_subgrid.py` is a small Fourier neural operator (FNO) that runs inside the time step as a
 predictor for the implicit multigroup radiation solve:
 - **Model:** lift, then L Fourier layers (lowest modes mixed by learned complex weights, plus a 1x1 path, GELU),
   then a projection. The truncated transforms are cosine / sine matrix products, so the model runs on CuPy or
@@ -347,6 +348,43 @@ predictor for the implicit multigroup radiation solve:
   The engine and the guard work (`--test fno`), but this predictor does not pay off. A better preconditioner
   (multigrid) is the more promising route for this solve.
 - **Not done:** no learned sub-grid turbulence closure.
+
+### Additive machine-learning extensions
+
+Everything in `aegis/ml/` and `scripts/surrogate_optimizer.py` is an add-on. No model replaces, displaces or bypasses the
+HLLD fluxes, CT or the conservation machinery, and the numerical core imports no model (`--test ml_additive`). All models are
+off unless you turn them on, and each result below was measured against a baseline:
+
+- **Sub-grid stress co-processor (`SGSCoprocessor`, `aegis/ml/fno_subgrid.py`, `examples/sgs_fno_closure.py`):** an FNO
+  predicts the sub-grid stress from coarse 2D fields, trained on filtered 256^2 runs. It acts as a split step after the
+  solver: momentum in flux form, kinetic energy exchanged with internal energy, B untouched.
+  - Guard: every prediction must keep totals, positive pressure and a bound on the energy moved, or it is discarded. A
+    rejected prediction leaves the state bit-identical to the solver alone.
+  - Conservation with it on: mass, momentum, energy 1e-14; div B 5e-15.
+  - Result on a held-out flow: correlation with the true stress 0.82-0.86 (Smagorinsky 0.81-0.86), but **in coarse runs it
+    makes the answer worse**: velocity error 7.7% against 7.0% for Smagorinsky and 6.7% with no model, since the scheme's own
+    numerical dissipation already does this job. Do not use it for accuracy as it stands.
+  - Not built: DeepONet and a multigroup line-emission closure. The radiation predictor above is the only radiation model.
+- **Surrogate optimizer (`scripts/surrogate_optimizer.py`):** a Gaussian process with expected improvement picks the next
+  solver run. Every value it trains on and reports comes from a real run.
+  - Branin test function, 30 evaluations: -0.45 against -1.45 for a Latin-hypercube scan (optimum -0.40).
+  - 3D corrugated liner (thickness, seed field, implosion speed), 16 runs: objective 2.478 against 2.410 for the scan, on one
+    seed, so a small difference. The objective is an illustrative one. The drive is the implosion speed: a current
+    waveform I(t) exists only in the 2D r-z twin.
+- **Predictive AMR trigger (`aegis/ml/amr_trigger.py`, `AMRParams.trigger`, `examples/amr_instability_trigger.py`):** a small CNN
+  on local B, grad p, J and grad rho marks cells whose density gradient will cross the AMR threshold 5-10 steps ahead. Its cells
+  are added to the flags, never removed.
+  - Held-out flow, recall at equal extra flagged cells: 57% against 39% for a lowered threshold at 5%, 78% against 54% at 10%.
+  - With it in AMR: mass 3e-15, energy 3e-15, div B 2e-14; about 7% more fine cells in that run.
+  - It learned gradient arrival in Orszag-Tang flows only. Wall modes and Nernst erosion were not trained or tested, and
+    the accuracy gain from earlier refinement was not measured.
+- **PINN inverse diagnostics (`aegis/ml/pinn_diagnostics.py`, `examples/pinn_inverse_diagnostics.py`):** a network on (r, t) fits
+  outer B-dot, VISAR and framing data plus 1D ideal-MHD residuals and the known pre-shot state, to estimate unmeasured core
+  fields. On a twin run with a known answer and 1% noise (`results/pinn_diagnostics/`):
+  - RMS error of the core field 42% and core temperature 45%, against 50% and 67% for flux conservation and adiabatic
+    heating from the same radius trace;
+  - it smears the arrival of the compression front and misses the peak (0.58 against 0.84 for B_z). This is an estimate with
+    no error bar, not an exact reconstruction, and it has not seen real data.
 
 ### Tabulated EOS and opacities
 
@@ -812,6 +850,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | literature | digitized traces without a citation refused, sorting / scaling, HDF5 round trip; virtual probes on a manufactured state: B-dot exact (1e-12), VISAR velocity exact, framing radius within half a cell; synthetic traces: hidden speed recovered within 1%, marked [syn]; self-tests, not validation against an experiment |
 | atomic | parsers on real NIST, TOPS and CHIANTI formats; Saha vs an exact hydrogen result; collisional-radiative balance reduces to Saha at high density and is coronal at low density; Z_bar within about 2% of Los Alamos TOPS for Al and Cu, while line-free model opacities are low by 7-150x (reported, not hidden); vectorised GPU group lookup matches per-group tables to 2e-13; multigroup FLD with the imported TOPS Al table conserves energy |
 | bridge | native graph loop bit-identical to the Python solver with the GIL released; overlap stepper on one periodic rank matches to 4e-15; 2 MPI ranks through the native exchange: 2e-15 vs serial, energy 2e-15, div B 4e-14, shared faces identical (one shared GPU, so no scaling claim) |
+| ml_additive | the numerical core imports no model; rejected sub-grid predictions leave the state bit-identical to the solver, accepted ones keep mass, momentum, energy and div B at round-off; AMR with trigger cells keeps conservation; surrogate optimizer spends exactly its budget and beats a same-budget scan on Branin; CNN and PINN gradients vs finite differences; does not depend on trained weights |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |

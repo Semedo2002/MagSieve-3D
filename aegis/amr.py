@@ -556,6 +556,7 @@ class AMRParams:
     max_patches: int = 64
     efficiency: float = 0.7                          # split boxes filled less than this
     region: object = None                            # optional callable(coarse solver) -> host bool mask (interior)
+    trigger: object = None                           # same form; its cells are added to the flags (aegis/ml/amr_trigger.py)
     graphs: bool = True                              # record the fine sub-step as a CUDA graph
 
 
@@ -632,6 +633,8 @@ class AMR:
         f = to_numpy(f)
         if p.region is not None:                     # refine only where the caller says (e.g. the fuel core)
             f &= np.asarray(p.region(s), bool)
+        if p.trigger is not None:                    # predicted cells are added, never removed (aegis/ml/amr_trigger.py)
+            f |= np.asarray(p.trigger(s), bool)
         return f
 
     def cluster(self, f):

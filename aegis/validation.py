@@ -509,6 +509,16 @@ def format_matrix(M, key="chi2_nu"):
     return "\n".join(lines)
 
 
+def pinn_inversion(data, rg, tg, init, r_max, t_max, scale, **kw):
+    """estimate unmeasured interior fields from outside probes with a physics-informed network: a fitted
+    aegis.ml.pinn_diagnostics.PINN (see there, and compare with flux_estimate: it is an estimate, not an exact inversion)"""
+    from .ml.pinn_diagnostics import PINN
+    fit_kw = {k: kw.pop(k) for k in ("iters", "lr", "w_data", "w_phys", "w_init", "log") if k in kw}
+    m = PINN(r_max, t_max, scale, **kw)
+    m.fit(data, rg, tg, init, **fit_kw)
+    return m
+
+
 UNITS = {"visar": "km/s", "bdot": "V", "radiography": "mm"}
 LABELS = {"visar": "VISAR free-surface velocity", "bdot": "B-dot probe voltage", "radiography": "radiography core radius"}
 

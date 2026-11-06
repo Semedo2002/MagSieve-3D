@@ -214,7 +214,7 @@ class PhysicsConfig:
     fld_edge_jump: float = 0.0
     fld_mg_table: str = ""
     fld_mg_absorption: float = 1.0                   # scales every kP_g (0: groups only diffuse, no exchange)
-    # learned predictor for the multigroup implicit solve (aegis/fno_subgrid.py, a .npz model; 2D): accepted when
+    # learned predictor for the multigroup implicit solve (aegis/ml/fno_subgrid.py, a .npz model; 2D): accepted when
     # the relative residual of the linear system is <= fld_fno_tol, otherwise BiCGStab starts from it
     fld_precond: str = "jacobi"                      # Krylov preconditioner: "jacobi" (block Jacobi) or "mg" (multigrid)
     fld_fno_model: str = ""
