@@ -407,6 +407,319 @@ class OpacityTable:
         return 10**v if self.g.logs[name] else v
 
 
+# ------------------------------------------------------------------ open atomic data: ion balance and opacities
+# Built from measured or evaluated ionization energies (NIST ASD, tools/atomic_importer.py). Temperatures in eV, density
+# in kg/m^3 on the host; tables go to GroupOpacityTable / IonizationTable for the GPU.
+#   Ion balance per stage, LTE: Saha with continuum lowering (ion-sphere) and unit partition-function ratios (ground
+#   states only); solved for n_e by bisection on charge neutrality.
+#   Non-LTE (collisional-radiative steady state): electron-impact ionization by Lotz's formula, radiative recombination
+#   2.6e-13 z^2 sqrt(13.6 / T) cm^3/s, three-body recombination by detailed balance with ionization, so the balance
+#   reduces to Saha at high density and to a coronal, density-independent one at low density. No dielectronic
+#   recombination, no excitation-autoionization, no radiation field: an optically thin estimate, not FLYCHK.
+#   Opacity on a fine photon grid: free-free (Kramers, Gaunt 1.2, with the stage-averaged Z^2), bound-free per subshell
+#   (hydrogenic nu^-3 from an edge at the NIST ionization energy of the ion in which that subshell is the outermost),
+#   Thomson scattering in the Rosseland mean, and optionally lines from NIST (f values, Boltzmann lower levels, Doppler
+#   the grid bin). NIST holds few f values for heavy ions (32 for Au, 43 for Pb), so their line opacity is essentially
+#   missing. Against Los Alamos TOPS (--test atomic) Z_bar agrees within about 2% on average for Al and Cu, but the
+#   line-free opacities are low by about 7-37x (Rosseland) and 20-150x (Planck): treat them as lower bounds.
+#   For Z <= 30 prefer tables imported from TOPS itself (tops_groups_to_table).
+_ME_CGS, _E2_CGS, _KB_EV, _AMU = 9.1093837e-28, 2.30707755e-19, 1.602176634e-12, 1.66053907e-27
+_SUBSHELLS = [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2), (4, 0), (4, 1), (4, 2), (5, 0), (5, 1), (4, 3), (5, 2), (6, 0),
+              (6, 1), (5, 3), (6, 2), (7, 0)]
+
+
+def _shells_of(N):
+    """(n, occupation, electrons up to and including this subshell) of an ion with N bound electrons"""
+    out, c = [], 0
+    for n, l in _SUBSHELLS:
+        if c >= N:
+            break
+        k = min(2 * (2 * l + 1), N - c)
+        c += k
+        out.append((n, k, c))
+    return out
+
+
+def fill_ionization(I):
+    """ionization energies with gaps filled (log-linear in charge) and made non-decreasing"""
+    I = np.array(I, float)
+    ok = np.isfinite(I)
+    x = np.arange(len(I))
+    I = np.exp(np.interp(x, x[ok], np.log(I[ok])))
+    return np.maximum.accumulate(I)
+
+
+def _ion_sphere_lowering(z, ni_cgs):
+    """continuum lowering (eV) of an ion of charge z + 1 in the ion sphere of radius (3 / 4 pi n_i)^(1/3)"""
+    return 1.5 * (z + 1.0) * 1.43996e-7 / np.maximum((3.0 / (4 * np.pi * ni_cgs))**(1.0 / 3.0), 1e-30)
+
+
+def _balance_from_ratios(ratio_of_ne, nz, ni, zmax):
+    """fractions from n_(z+1) / n_z = ratio(ne), neutrality solved for ne by bisection in log ne"""
+    lo, hi = np.full_like(ni, 1e-8) * ni, np.maximum(zmax * ni, 1e-300)
+
+    def fractions(ne):
+        lr = np.log(np.maximum(ratio_of_ne(ne), 1e-290))             # (nz - 1, ...)
+        lf = np.concatenate([np.zeros((1,) + ne.shape), np.cumsum(lr, axis=0)], axis=0)
+        lf -= lf.max(axis=0, keepdims=True)
+        f = np.exp(lf)
+        return f / f.sum(axis=0, keepdims=True)
+    zs = np.arange(nz).reshape((-1,) + (1,) * ni.ndim)
+    for _ in range(70):
+        mid = np.sqrt(lo * hi)
+        f = fractions(mid)
+        excess = (f * zs).sum(axis=0) * ni - mid
+        lo, hi = np.where(excess > 0, mid, lo), np.where(excess > 0, hi, mid)
+    ne = np.sqrt(lo * hi)
+    return fractions(ne), ne
+
+
+def saha_balance(I_eV, A, rho, T_eV):
+    """LTE ion fractions (Z + 1, ...), n_e (cm^-3), Z_bar. rho in kg/m^3, T in eV (broadcast together)."""
+    I = fill_ionization(I_eV)
+    rho, T = np.broadcast_arrays(np.asarray(rho, float), np.asarray(T_eV, float))
+    ni = rho * 1e-3 / (A * _AMU * 1e3)
+    nz = len(I) + 1
+    zz = np.arange(len(I)).reshape((-1,) + (1,) * ni.ndim)
+    Ik = I.reshape(zz.shape)
+    S0 = 6.0359e21 * T**1.5                          # 2 (2 pi m_e k T / h^2)^(3/2), cm^-3, T in eV
+
+    def ratio(ne):
+        return S0[None] / ne[None] * np.exp(-np.maximum(Ik - _ion_sphere_lowering(zz, ni[None]), 0.0) / T[None])
+    f, ne = _balance_from_ratios(ratio, nz, ni, len(I))
+    return f, ne, ne / ni
+
+
+def _e1(x):
+    """exponential integral E1(x) for x > 0 (Abramowitz & Stegun 5.1.53 / 5.1.56)"""
+    x = np.asarray(x, float)
+    small = -np.log(np.maximum(x, 1e-300)) - 0.57721566 + x * (0.99999193 + x * (-0.24991055 + x * (0.05519968 + x * (
+        -0.00976004 + x * 0.00107857))))
+    y = np.maximum(x, 1e-300)
+    large = (y**2 + 2.334733 * y + 0.250621) / (y**2 + 3.330657 * y + 1.681534) * np.exp(-np.minimum(y, 700.0)) / y
+    return np.where(x < 1.0, small, large)
+
+
+def lotz_rate(I_eV, z, Z, T_eV):
+    """electron-impact ionization rate coefficient (cm^3/s) of the ion of charge z, Lotz (1968), over its subshells"""
+    Ifill = fill_ionization(I_eV)
+    N = Z - z
+    S = 0.0
+    for n, k, c in _shells_of(N):
+        Ie = Ifill[Z - c]
+        S = S + 3.0e-6 * k / (np.sqrt(T_eV) * Ie) * _e1(Ie / T_eV)
+    return S
+
+
+def cr_balance(I_eV, Z, A, rho, T_eV):
+    """collisional-radiative steady-state ion fractions (see the notes above): (fractions, n_e cm^-3, Z_bar)"""
+    I = fill_ionization(I_eV)
+    rho, T = np.broadcast_arrays(np.asarray(rho, float), np.asarray(T_eV, float))
+    ni = rho * 1e-3 / (A * _AMU * 1e3)
+    nz = len(I) + 1
+    shape = (-1,) + (1,) * ni.ndim
+    zz = np.arange(len(I)).reshape(shape)
+    Ik = I.reshape(shape)
+    S = np.stack([lotz_rate(I_eV, z, Z, T) for z in range(len(I))])
+    alpha_r = 2.6e-13 * (zz + 1.0)**2 * np.sqrt(13.6 / T[None])
+    S0 = 6.0359e21 * T**1.5
+
+    def ratio(ne):
+        saha = S0[None] / ne[None] * np.exp(-np.maximum(Ik - _ion_sphere_lowering(zz, ni[None]), 0.0) / T[None])
+        alpha_3 = S / np.maximum(saha, 1e-300)           # three-body rate per unit volume, detailed balance
+        return S / (alpha_r + alpha_3)
+    f, ne = _balance_from_ratios(ratio, nz, ni, len(I))
+    return f, ne, ne / ni
+
+
+def _bf_cross_sections(I, Z, E):
+    """sigma_bf (Z, len(E)) cm^2 of each ion stage with bound electrons: hydrogenic nu^-3 per subshell"""
+    out = np.zeros((Z, len(E)))
+    for z in range(Z):
+        for n, k, c in _shells_of(Z - z):
+            Ie = I[Z - c]
+            Zeff2 = Ie * n * n / 13.6057
+            out[z] += k * 7.91e-18 * n / Zeff2 * (Ie / E)**3 * (E >= Ie)
+    return out
+
+
+def atomic_opacity(I_eV, Z, A, rho, T_eV, fractions, ne, E, lines=None, sigma_bf=None):
+    """absorption alpha / rho (E grid) and Thomson kappa per unit mass, cm^2/g, at one density and temperature"""
+    I = fill_ionization(I_eV)
+    sigma_bf = _bf_cross_sections(I, Z, E) if sigma_bf is None else sigma_bf
+    rho_cgs = rho * 1e-3
+    ni = rho_cgs / (A * 1.66053907e-24)
+    stim = -np.expm1(-E / T_eV)
+    zs = np.arange(Z + 1)
+    z2 = float(np.sum(fractions * zs**2))
+    nu = E * 2.417989e14
+    T_K = T_eV * 11604.518
+    a_ff = 3.692e8 * 1.2 * stim * z2 * ne * ni / np.sqrt(T_K) / nu**3
+    a_bf = ni * (fractions[:Z] @ sigma_bf) * stim
+    a = a_ff + a_bf
+    if lines is not None and len(lines):
+        q, El, Eu, fl, gl = lines.T
+        qi = q.astype(int)
+        keep = qi <= Z
+        qi, El, Eu, fl, gl = qi[keep], El[keep], Eu[keep], fl[keep], gl[keep]
+        # lower-level populations: Boltzmann within the stage, with the ground weight as the partition function
+        pop = fractions[qi] * ni * gl / np.maximum(_g0_of(qi, lines), 1.0) * np.exp(-El / T_eV)
+        strength = 2.6540e-2 * fl * pop * (1 - np.exp(-(Eu - El) / T_eV))   # pi e^2 / (m c) f n, cm^-1 Hz
+        edges = np.sqrt(E[1:] * E[:-1])
+        edges = np.concatenate([[E[0]**2 / edges[0]], edges, [E[-1]**2 / edges[-1]]])
+        k = np.clip(np.searchsorted(edges, Eu - El) - 1, 0, len(E) - 1)      # conservative deposit into the grid bin
+        a = a + np.bincount(k, strength, len(E)) / (np.diff(edges) * 2.417989e14)
+    k_es = 0.6652e-24 * ne / rho_cgs
+    return a / rho_cgs, k_es
+
+
+def _g0_of(q, lines):
+    """statistical weight of each stage's lowest listed level (the partition-function stand-in)"""
+    out = np.ones(int(lines[:, 0].max()) + 1)
+    for z in np.unique(lines[:, 0].astype(int)):
+        s = lines[lines[:, 0].astype(int) == z]
+        out[z] = s[np.argmin(s[:, 1]), 4]
+    return out[q]
+
+
+def group_means(k_abs, k_es, E, T_eV, edges):
+    """Planck and Rosseland means per photon group on a log grid E (eV), cm^2/g; arrays (G,)"""
+    u = E / T_eV
+    w = E                                            # d(ln E) measure
+    with np.errstate(over="ignore", under="ignore"):
+        wP = np.where(u < 500, u**3 / np.maximum(np.expm1(np.minimum(u, 500)), 1e-300), 0.0)
+        wR = np.where(u < 500, u**4 * np.exp(np.minimum(u, 500)) / np.maximum(np.expm1(np.minimum(u, 500)), 1e-300)**2, 0.0)
+    G = len(edges) - 1
+    kP, kR = np.zeros(G), np.zeros(G)
+    for g in range(G):
+        m = (E >= edges[g]) & (E < edges[g + 1])
+        if not m.any():
+            continue
+        dP, dR = (wP * w)[m].sum(), (wR * w)[m].sum()
+        kP[g] = (wP * w * k_abs)[m].sum() / dP if dP > 0 else float(k_abs[m][0])
+        kR[g] = dR / (wR * w / (k_abs + k_es))[m].sum() if dR > 0 else float(k_abs[m][0] + k_es)
+    return kP, kR
+
+
+def build_atomic_table(Z, A, I_eV, edges_eV, rho=None, T_eV=None, lines=None, nonlte=False, n_E=6000):
+    """multigroup opacity and ionization table from NIST-type atomic data, in the format of fld_mg_table: rho (kg/m^3),
+    T (K), kappa_R_g, kappa_P_g (G, nr, nt) in m^2/kg, group_edges_eV, plus Zbar_lte, Zbar_nlte (nr, nt)"""
+    rho = np.geomspace(1e-3, 1e4, 15) if rho is None else np.asarray(rho, float)
+    T_eV = np.geomspace(1.0, 3e3, 36) if T_eV is None else np.asarray(T_eV, float)
+    E = np.geomspace(0.05, 2e5, n_E)
+    edges = np.asarray(edges_eV, float)
+    G = len(edges) - 1
+    I = fill_ionization(I_eV)
+    sbf = _bf_cross_sections(I, Z, E)
+    R, TT = np.meshgrid(rho, T_eV, indexing="ij")
+    f_l, ne_l, zb_l = saha_balance(I, A, R, TT)
+    f_n, ne_n, zb_n = cr_balance(I, Z, A, R, TT)
+    f, ne = (f_n, ne_n) if nonlte else (f_l, ne_l)
+    kR, kP = np.zeros((G, len(rho), len(T_eV))), np.zeros((G, len(rho), len(T_eV)))
+    for i in range(len(rho)):
+        for j in range(len(T_eV)):
+            ka, ke = atomic_opacity(I, Z, A, rho[i], T_eV[j], f[:, i, j], ne[i, j], E, lines, sbf)
+            kP[:, i, j], kR[:, i, j] = group_means(ka, ke, E, T_eV[j], edges)
+    src = ("NIST ASD ionization energies" + (" and lines" if lines is not None else "") + "; "
+           + ("collisional-radiative" if nonlte else "Saha") + " ion balance; screened-hydrogenic bound-free, Kramers free-free")
+    return dict(rho=rho, T=T_eV * 11604.518, kappa_R_g=np.maximum(kR, 1e-300) * 0.1, kappa_P_g=np.maximum(kP, 1e-300) * 0.1,
+                group_edges_eV=edges, Zbar_lte=zb_l, Zbar_nlte=zb_n, Z=Z, A=A, source=src)
+
+
+def tops_groups_to_table(rows, edges_eV, n_rho=None, n_T=None):
+    """a table in the fld_mg_table format from parsed TOPS group output (tools/atomic_importer.parse_tops_groups),
+    resampled log-linearly onto a log-uniform rho x T grid for GroupOpacityTable"""
+    T0, r0 = np.array(sorted({x["T_keV"] for x in rows})), np.array(sorted({x["rho"] for x in rows}))
+    G = len(rows[0]["kR_g"])
+    q = {k: np.zeros((len(r0), len(T0))) for k in ("Z",)}
+    kR, kP = np.zeros((G, len(r0), len(T0))), np.zeros((G, len(r0), len(T0)))
+    for x in rows:
+        i, j = np.searchsorted(r0, x["rho"]), np.searchsorted(T0, x["T_keV"])
+        kR[:, i, j], kP[:, i, j], q["Z"][i, j] = x["kR_g"], x["kP_g"], x["Zfree"]
+    nr, nt = n_rho or len(r0), n_T or 2 * len(T0)
+    lr0, lt0 = np.log10(r0), np.log10(T0)
+    lr, lt = np.linspace(lr0[0], lr0[-1], nr), np.linspace(lt0[0], lt0[-1], nt)
+
+    def resample(f):
+        a = np.stack([np.interp(lt, lt0, f[i]) for i in range(len(r0))])
+        return np.stack([np.interp(lr, lr0, a[:, j]) for j in range(nt)], axis=1)
+    fR = np.stack([resample(np.log10(np.maximum(kR[g], 1e-300))) for g in range(G)])
+    fP = np.stack([resample(np.log10(np.maximum(kP[g], 1e-300))) for g in range(G)])
+    # TOPS: cm^2/g, g/cm^3, keV -> m^2/kg, kg/m^3, K
+    return dict(rho=10**lr * 1e3, T=10**lt * 1e3 * 11604.518, kappa_R_g=10**fR * 0.1, kappa_P_g=10**fP * 0.1,
+                group_edges_eV=np.asarray(edges_eV, float), Zbar_lte=resample(q["Z"]),
+                source="Los Alamos TOPS multigroup opacities (Magee et al., ASP Conf. Ser. 78, 51, 1995)")
+
+
+_GROUP_SRC = r"""
+extern "C" __global__ void group_lookup(const double* __restrict__ rho, const double* __restrict__ th,
+                                        const double* __restrict__ KR, const double* __restrict__ KP,
+                                        double* __restrict__ oR, double* __restrict__ oP, const long N, const int G,
+                                        const int nr, const int nt, const double lr0, const double dlr, const double lt0,
+                                        const double dlt, const double T1) {
+    long t = (long)blockDim.x * blockIdx.x + threadIdx.x;
+    if (t >= N * G) return;
+    long g = t / N, c = t % N;
+    double fr = (log10(fmax(rho[c], 1e-300)) - lr0) / dlr, ft = (log10(fmax(th[c] * T1, 1e-300)) - lt0) / dlt;
+    fr = fmin(fmax(fr, 0.0), nr - 1 - 1e-9);
+    ft = fmin(fmax(ft, 0.0), nt - 1 - 1e-9);
+    long i = (long)fr, j = (long)ft;
+    double a = fr - i, b = ft - j;
+    long o = g * nr * nt + i * nt + j;
+    double r = (1 - a) * (1 - b) * KR[o] + a * (1 - b) * KR[o + nt] + (1 - a) * b * KR[o + 1] + a * b * KR[o + nt + 1];
+    double p = (1 - a) * (1 - b) * KP[o] + a * (1 - b) * KP[o + nt] + (1 - a) * b * KP[o + 1] + a * b * KP[o + nt + 1];
+    oR[t] = pow(10.0, r);
+    oP[t] = pow(10.0, p);
+}
+"""
+_GROUP_K = []
+
+
+def _group_kernel():
+    if not _GROUP_K:
+        import cupy as cp
+        _GROUP_K.append(cp.RawKernel(_GROUP_SRC, "group_lookup"))
+    return _GROUP_K[0]
+
+
+class GroupOpacityTable:
+    """every group's (kappa_P, kappa_R) at once from one device array: bilinear in (log rho, log T), clamped to the
+    table, in code units as OpacityTable. One vectorised lookup instead of one table lookup per group."""
+
+    def __init__(self, data, rho_unit, L0, T1):
+        rho, T = np.asarray(data["rho"], float) / rho_unit, np.asarray(data["T"], float)
+        self.lr, self.lt = np.log10(rho), np.log10(T)
+        self.nr, self.nt = len(rho), len(T)
+        if not (np.allclose(np.diff(self.lr), self.lr[1] - self.lr[0]) and np.allclose(np.diff(self.lt), self.lt[1] - self.lt[0])):
+            raise ValueError("GroupOpacityTable needs log-uniform rho and T")
+        self.dlr, self.dlt = self.lr[1] - self.lr[0], self.lt[1] - self.lt[0]
+        s = rho_unit * L0
+        self.kR = xp.ascontiguousarray(xp.asarray(np.log10(np.maximum(data["kappa_R_g"], 1e-300) * s)))
+        self.kP = xp.ascontiguousarray(xp.asarray(np.log10(np.maximum(data["kappa_P_g"], 1e-300) * s)))
+        self.T1 = T1
+
+    def __call__(self, rho, theta):
+        """(kappa_R, kappa_P), arrays (G, ...), one kernel launch"""
+        rho, theta = xp.ascontiguousarray(rho), xp.ascontiguousarray(theta)
+        G, N = self.kR.shape[0], rho.size
+        oR, oP = xp.empty((G,) + rho.shape), xp.empty((G,) + rho.shape)
+        _group_kernel()(((N * G + 255) // 256,), (256,),
+                        (rho, theta, self.kR, self.kP, oR, oP, np.int64(N), np.int32(G), np.int32(self.nr), np.int32(self.nt),
+                         float(self.lr[0]), float(self.dlr), float(self.lt[0]), float(self.dlt), float(self.T1)))
+        return oR, oP
+
+
+class IonizationTable:
+    """Z_bar(rho, T) from a table of build_atomic_table on the device: bilinear in (log rho, log T), clamped"""
+
+    def __init__(self, data, rho_unit, T1, key="Zbar_lte"):
+        self._g = GroupOpacityTable(dict(rho=data["rho"], T=data["T"], kappa_R_g=np.asarray(data[key])[None],
+                                         kappa_P_g=np.asarray(data[key])[None]), rho_unit, 1.0 / rho_unit, T1)
+
+    def __call__(self, rho, theta):
+        return self._g(rho, theta)[0][0]
+
+
 # ------------------------------------------------------------------ synthetic tables (tests, examples)
 
 def mie_gruneisen_table(rho0, c0, s, gamma0, cv, rho_range, T_range, nr=80, nt=80, kappa=None):

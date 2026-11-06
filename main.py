@@ -3363,6 +3363,133 @@ def literature_test():
     return ok
 
 
+def atomic_test():
+    """Open atomic data pipeline (tools/atomic_importer.py, aegis/tabular.py), offline, on the bundled NIST and TOPS files.
+    (1) Parsers on real formats: NIST ionization energies, TOPS grey and multigroup output, a CHIANTI .elvlc excerpt.
+    (2) Ion balance: Saha against the exact hydrogen result; the collisional-radiative balance reduces to Saha at high
+    density and becomes density independent (coronal) at low density. (3) Against Los Alamos TOPS for Al and Cu: Z_bar
+    within 15% on average; the model opacities without complete line data are reported as a factor off, as they are
+    not reliable (low by about 10x or more). (4) GPU lookup: the vectorised group table agrees with per-group tables, is
+    exact for a power law, and is faster. (5) A multigroup solve with the imported TOPS Al table conserves energy."""
+    import sys as _s
+    import time as _t
+    import tempfile
+    root = os.path.dirname(os.path.abspath(__file__))
+    _s.path.insert(0, os.path.join(root, "tools"))
+    import atomic_importer as ai
+    from aegis import tabular as tb, radiation_multigroup as mgr
+    print("\n--- Open atomic data pipeline ---"); _s.stdout.flush()
+    ok = True
+    I = {e: ai.fetch_nist_ie(e) for e in ("Al", "Cu", "Au", "Pb")}
+    page = """Rosseland and Planck opacities and free electrons
+ Density     Ross opa    Planck opa  No. Free    Av Sq Free  T=  1.0000E-01
+  1.0000E-02  1.6258E+02  8.3522E+02  1.0696E+01  1.1468E+02
+Multigroup opacities
+  Energy      Ross mg     Planck mg    for T, density =   1.0000E-01  1.0000E-02
+  1.0000E-02  6.6176E+02  1.5529E+03
+  1.0000E-01  1.8241E+02  8.1347E+02
+Useful Links"""
+    g, mg_ = ai.parse_tops(page), ai.parse_tops_groups(page)
+    tmp = tempfile.mkdtemp(prefix="atom_")
+    el = os.path.join(tmp, "al_3.elvlc")
+    with open(el, "w") as f:
+        f.write("      1     3s                                2  S    0.5          0.000          0.000\n"
+                "      2     3p                                2  P    0.5      53682.898      52661.000\n -1\n%file\n")
+    L = ai.parse_chianti_elvlc(el)
+    good = (len(I["Al"]) == 13 and len(I["Au"]) == 79 and len(I["Pb"]) == 82 and abs(I["Al"][0] - 5.985769) < 1e-9
+            and abs(g[0]["kR"] - 162.58) < 1e-9 and abs(g[0]["Zfree"] - 10.696) < 1e-9 and mg_[0]["kP_g"] == [1552.9, 813.47]
+            and len(L) == 2 and abs(L[1]["E_eV"] - 6.6558) < 1e-3 and L[1]["g"] == 2.0)
+    ok = ok and good
+    print(f"  parsers: NIST energies for Al, Cu, Au, Pb (all stages), TOPS grey and group pages, CHIANTI levels  [{'PASS' if good else 'FAIL'}]")
+    # hydrogen, low density: x^2 / (1 - x) = S / n_i
+    rho, T_ev = np.array(1e-6), np.array(1.0)
+    f, ne, zb = tb.saha_balance(np.array([13.598]), 1.008, rho, T_ev)
+    ni = 1e-6 * 1e-3 / (1.008 * 1.66053907e-24)
+    h_cgs, me_cgs, k_cgs = 6.62607015e-27, 9.1093837e-28, 1.602176634e-12     # independent of the code's prefactor
+    Sx = 2 * (2 * np.pi * me_cgs * k_cgs / h_cgs**2)**1.5 / ni * np.exp(-13.598)
+    xe = 0.5 * (-Sx + np.sqrt(Sx * Sx + 4 * Sx))
+    e1 = abs(float(zb) - xe) / xe
+    A, Z = ai.A_OF["Al"], 13
+    hi = abs(float(tb.cr_balance(I["Al"], Z, A, np.array(2e3), np.array(30.0))[2]) - float(tb.saha_balance(I["Al"], A, np.array(2e3), np.array(30.0))[2]))
+    lo = [float(tb.cr_balance(I["Al"], Z, A, np.array(r), np.array(100.0))[2]) for r in (1e-8, 1e-6)]
+    good = e1 < 3e-3 and hi < 0.25 and abs(lo[0] - lo[1]) / lo[0] < 0.01 and lo[0] < float(tb.saha_balance(I["Al"], A, np.array(1e-6), np.array(100.0))[2])
+    ok = ok and good
+    print(f"  ion balance: Saha vs exact hydrogen {e1:.0e}; collisional-radiative vs Saha at solid-like density within {hi:.2f} "
+          f"charges, coronal at low density (Z_bar {lo[0]:.2f}, {lo[1]:.2f})  [{'PASS' if good else 'FAIL'}]")
+    E = np.geomspace(0.05, 2e5, 4000)
+    txt = []
+    good = True
+    for e in ("Al", "Cu"):
+        d = ai.load_tops_csv(os.path.join(ai.DATA, f"tops_{e}.csv"))
+        Zn, An = ai.Z_OF[e], ai.A_OF[e]
+        sb = tb._bf_cross_sections(tb.fill_ionization(I[e]), Zn, E)
+        rows = []
+        for Tk, r, kr, kp, zf, z2 in d[::3]:
+            f, ne, zb = tb.saha_balance(I[e], An, np.array(r * 1e3), np.array(Tk * 1e3))
+            ka, ke = tb.atomic_opacity(I[e], Zn, An, r * 1e3, Tk * 1e3, f, float(ne), E, None, sb)
+            pP, pR = tb.group_means(ka, ke, E, Tk * 1e3, np.array([0.0, np.inf]))
+            rows.append((zf, float(zb), kr, pR[0], kp, pP[0]))
+        o = np.array(rows)
+        fac = lambda a, b: float(np.exp(np.mean(np.abs(np.log(a / b)))))
+        fz, fr, fp = fac(o[:, 1], o[:, 0]), fac(o[:, 3], o[:, 2]), fac(o[:, 5], o[:, 4])
+        good = good and fz < 1.15
+        txt.append(f"{e}: Z_bar {fz:.2f}, kappa_R {fr:.0f}, kappa_P {fp:.0f}")
+    ok = ok and good
+    print("  against TOPS, mean factor off (model without line data; opacities are lower bounds): " + "; ".join(txt)
+          + f"  [{'PASS' if good else 'FAIL'}]")
+    # GPU lookup
+    d = dict(np.load(os.path.join(ai.DATA, "tops_Al_groups.npz")))
+    G = tb.GroupOpacityTable(d, 1.0, 1.0, 1.0)
+    per = [tb.OpacityTable({"rho": d["rho"], "T": d["T"], "kappa_R": d["kappa_R_g"][k], "kappa_P": d["kappa_P_g"][k]}, 1.0, 1.0, 1.0)
+           for k in range(d["kappa_R_g"].shape[0])]
+    rng = np.random.default_rng(0)
+    rho = xp.asarray(10**rng.uniform(np.log10(d["rho"][0]), np.log10(d["rho"][-1]), (256, 256)))
+    th = xp.asarray(10**rng.uniform(np.log10(d["T"][0]), np.log10(d["T"][-1]), (256, 256)))
+    kR, kP = G(rho, th)
+    kk = [t_(rho, th) for t_ in per]
+    dv = float(xp.max(xp.abs(xp.log(kR) - xp.log(xp.stack([k[0] for k in kk])))))
+    r_, t_ = np.geomspace(1e-2, 1e2, 9), np.geomspace(1e3, 1e6, 12)
+    RR, TT = np.meshgrid(r_, t_, indexing="ij")
+    pw = dict(rho=r_, T=t_, kappa_R_g=(0.3 * RR**1.5 * TT**-2.0)[None], kappa_P_g=(RR * TT**-1.0)[None])
+    Gp = tb.GroupOpacityTable(pw, 1.0, 1.0, 1.0)
+    rr, tt = xp.asarray(np.array([0.37, 5.1])), xp.asarray(np.array([4.2e3, 7.7e4]))
+    ex = 0.3 * rr**1.5 * tt**-2.0
+    e_pw = float(xp.max(xp.abs(Gp(rr, tt)[0][0] / ex - 1)))
+    def _timed(f):
+        G(rho, th); [t_(rho, th) for t_ in per]
+        cp.cuda.Device().synchronize()
+        t0 = _t.perf_counter()
+        for _ in range(10):
+            f()
+        cp.cuda.Device().synchronize()
+        return (_t.perf_counter() - t0) / 10
+    ta, tb_ = _timed(lambda: G(rho, th)), _timed(lambda: [t_(rho, th) for t_ in per])
+    good = dv < 0.05 and e_pw < 1e-11 and ta < tb_
+    ok = ok and good
+    print(f"  GPU group lookup, 6 groups on 256^2: vs per-group tables within {dv:.1e} in ln(kappa), power law exact to "
+          f"{e_pw:.0e}; {1e3 * ta:.1f} ms against {1e3 * tb_:.1f} ms  [{'PASS' if good else 'FAIL'}]")
+    # a multigroup solve with the imported table
+    n = 32
+    cfg = Config(nx=n, ny=n, x_max=1.0, y_max=1.0, gamma=5 / 3, bc_x_type="periodic", bc_y_type="periodic", diag_interval=10**9,
+                 snapshot_times=[], fld=True, fld_c=1e3, fld_a=1e-6, fld_kr0=1.0, fld_advect=False, fld_tol=1e-10, fld_groups=6,
+                 fld_mg_table=os.path.join(ai.DATA, "tops_Al_groups.npz"), tab_rho_unit=1.0, tab_L_unit=1.0, tab_T_unit=1e5, fld_precond="mg")
+    x = (np.arange(n) + 0.5) / n
+    X, Y = np.meshgrid(x, x, indexing="ij")
+    W = xp.zeros((NVAR, n, n))
+    W[iRHO] = 1.0
+    W[iPR] = xp.asarray(1.0 + 3.0 * np.exp(-((X - .5)**2 + (Y - .5)**2) / 0.01))
+    U = prim_to_cons(W, 5 / 3)
+    Er = xp.full((6, n, n), 1e-3)
+    tot0 = float(xp.sum(U[EN]) + xp.sum(Er))
+    for _ in range(3):
+        mgr.step(Er, U, 5 / 3, cfg, (1 / n, 1 / n), (True, True), 1e-3, advect=False)
+    dE = abs(float(xp.sum(U[EN]) + xp.sum(Er)) - tot0) / tot0
+    good = dE < 1e-13 and float(xp.max(xp.abs(Er - 1e-3))) > 0
+    ok = ok and good
+    print(f"  multigroup FLD with the imported TOPS Al table: energy {dE:.0e}  [{'PASS' if good else 'FAIL'}]")
+    return ok
+
+
 def _mode_run(cfg, init, T, var_fn, k):
     """march a 1D-like periodic run to T, recording the complex amplitude of the k Fourier mode of var_fn(W) along
     x; returns (measured omega from the phase slope, final / initial amplitude, steps, dt limiter)"""
@@ -3709,6 +3836,7 @@ VERIFICATION_TESTS = {
     "cyl_filter": cyl_filter_test,
     "rlc_adjoint": rlc_adjoint_test,
     "literature": literature_test,
+    "atomic": atomic_test,
     "hall": hall_test,
     "ion_transport": ion_transport_test,
     "sesame": sesame_test,

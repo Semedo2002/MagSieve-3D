@@ -32,6 +32,7 @@ aegis/            solver package
   fno_subgrid.py  Fourier neural operator (inference + training on the autodiff tape), guarded radiation predictor
   parallel.py     MPI slab domain decomposition of the 2D and 3D solvers (halo and CT edge exchange)
   io3d.py         3D snapshots: VTK ImageData (.vti/.pvd) and HDF5
+  data/atomic/    NIST ionization energies and lines, Los Alamos TOPS benchmark and group tables
   tabular.py      tabulated EOS / opacities (SESAME ASCII, .npz) with GPU inversion and analytic fallback
   eos_fused.cu    device two-material / tabulated EOS, called inline by the HLLD kernel and the conversions
   eos_fused.py    its host side: packing, launches
@@ -375,6 +376,31 @@ impact on a Quadro P1000:
 | 256^2 | 286 ms/step | 759 ms/step (2.7x) | 70.7 ms/step | 68.8 ms/step | 0.97 |
 
 Interpolation is bilinear (bicubic is not implemented).
+
+### Open atomic data
+
+`tools/atomic_importer.py` and `aegis/tabular.py` build multigroup opacity and ionization tables from public data:
+- **Sources:**
+  - NIST ASD: ionization energies of every stage of Al, Cu, Au and Pb, and lines with f values (bundled in
+    `aegis/data/atomic/` with source and retrieval date; `--fetch-nist` and `--fetch-lines` work for other elements);
+  - Los Alamos TOPS: Rosseland, Planck and group opacities plus free-electron counts, Z <= 30 only (Al and Cu tables
+    bundled, `--tops-table`);
+  - CHIANTI `.elvlc` level files, parsed from a local copy of that database (Z <= 30). Levels are parsed only; no table
+    uses them yet. FAC output is not read.
+- **Ion balance (`saha_balance`, `cr_balance`):** Saha with ion-sphere continuum lowering and unit partition-function
+  ratios; a collisional-radiative steady state (Lotz ionization, radiative recombination, three-body by detailed
+  balance) that reduces to Saha at high density and to a coronal balance at low density. It has no dielectronic
+  recombination, no excitation-autoionization and no radiation field, so it is an optically thin estimate and not a
+  replacement for FLYCHK.
+- **Tables (`build_atomic_table`, `tops_groups_to_table`):** `.npz` in the `fld_mg_table` format, with `Zbar_lte` and
+  `Zbar_nlte`. `GroupOpacityTable` looks up all groups in one GPU kernel launch; `IonizationTable` gives Z_bar on the GPU.
+- **How good it is, against TOPS (LTE):**
+  - Z_bar from NIST energies is within about 2% on average for Al and Cu;
+  - the model's opacities are **not** reliable: without line data they are low by about 7-37x (Rosseland) and 20-150x
+    (Planck), because line absorption dominates. Adding NIST lines helps the Al Planck mean, but not Rosseland;
+  - for Al and Cu, use the imported TOPS tables;
+  - for Au and Pb there is no open table here and NIST lists only 32 and 43 lines with f values, so their opacities
+    are lower bounds with no benchmark. Their Z_bar is also unbenchmarked: TOPS stops at Z = 30.
 
 ### Generated material tables
 
@@ -761,6 +787,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | cyl_filter | the azimuthal filter keeps m <= m_crit exactly and leaves outer rings alone; the blob crossing the axis (32 x 64): 1254 -> 79 steps, centroid and field error unchanged to 1e-4, energy 3e-15, div B 2e-15 |
 | rlc_adjoint | r-z liner driven by an RLC bank: bank + resistor + grid energy 2e-16; d(yield proxy)/d(shape, V0, C, L, R) adjoint vs central differences 2e-10 to 9e-9 |
 | literature | digitized traces without a citation refused, sorting / scaling, HDF5 round trip; virtual probes on a manufactured state: B-dot exact (1e-12), VISAR velocity exact, framing radius within half a cell; synthetic traces: hidden speed recovered within 1%, marked [syn]; self-tests, not validation against an experiment |
+| atomic | parsers on real NIST, TOPS and CHIANTI formats; Saha vs an exact hydrogen result; collisional-radiative balance reduces to Saha at high density and is coronal at low density; Z_bar within about 2% of Los Alamos TOPS for Al and Cu, while line-free model opacities are low by 7-150x (reported, not hidden); vectorised GPU group lookup matches per-group tables to 2e-13; multigroup FLD with the imported TOPS Al table conserves energy |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |
 | hall | circularly polarized waves along B_0 with d_i k = 1: whistler and ion-cyclotron frequencies k (sqrt(1 + (k d_i/2)^2) -+ k d_i/2) to 8e-5 and 1.5e-3 at 64 cells (second order); a B_z ripple decays at eta_par k^2 (0.3945 vs 0.3948) with its current along B and at 1.96 eta_par k^2 (0.7685 vs 0.7738) across it; Hall + anisotropic resistivity in a sheared periodic box: energy 4e-15, div B 2e-15 |
 | ion_transport | a fast wave across B with gyroviscosity (eta_3 k^2 / rho = k c_f) follows omega^2 = k^2 c_f^2 + (eta_3 k^2 / rho)^2 to 2e-6 (and k c_f to 6.5e-4 without it); a T_i ripple decays at D k^2 to 0.1% and at D k^2 / (1 + x_i^2) across a field with x_i = 3, electron entropy untouched, energy 4e-16; gyroviscosity + ion conduction in a two-temperature box: energy 2e-15 |

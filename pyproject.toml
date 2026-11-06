@@ -32,4 +32,4 @@ cad = ["gmsh>=4.11"]                 # STEP / IGES import (OpenCASCADE); STL nee
 packages = ["aegis", "aegis.problems"]
 
 [tool.setuptools.package-data]
-aegis = ["hlld_kernel.cu", "eos_fused.cu", "data/experimental/*"]
+aegis = ["hlld_kernel.cu", "eos_fused.cu", "data/experimental/*", "data/atomic/*"]

@@ -126,13 +126,18 @@ def group_opacities(cfg, edges, rho, theta, open_):
         if key not in _TABLES:
             from . import tabular
             d = np.load(cfg.fld_mg_table)
-            tabs = [tabular.OpacityTable({"rho": d["rho"], "T": d["T"], "kappa_R": d["kappa_R_g"][g],
-                                          "kappa_P": d["kappa_P_g"][g]}, cfg.tab_rho_unit, cfg.tab_L_unit,
-                                         cfg.tab_T_unit) for g in range(d["kappa_R_g"].shape[0])]
-            _TABLES[key] = tabs
-        kk = [tb(rho, theta) for tb in _TABLES[key]]
-        kR = xp.stack([k[0] for k in kk])
-        kP = xp.stack([k[1] for k in kk])
+            try:                                     # one vectorised lookup for all groups (log-uniform table)
+                _TABLES[key] = tabular.GroupOpacityTable(d, cfg.tab_rho_unit, cfg.tab_L_unit, cfg.tab_T_unit)
+            except ValueError:                       # non-uniform grid: one interpolating table per group
+                _TABLES[key] = [tabular.OpacityTable({"rho": d["rho"], "T": d["T"], "kappa_R": d["kappa_R_g"][g],
+                                                      "kappa_P": d["kappa_P_g"][g]}, cfg.tab_rho_unit, cfg.tab_L_unit,
+                                                     cfg.tab_T_unit) for g in range(d["kappa_R_g"].shape[0])]
+        if isinstance(_TABLES[key], list):
+            kk = [tb(rho, theta) for tb in _TABLES[key]]
+            kR = xp.stack([k[0] for k in kk])
+            kP = xp.stack([k[1] for k in kk])
+        else:
+            kR, kP = _TABLES[key](rho, theta)
     else:
         kPg = fld.kappa(cfg.fld_kp0, cfg.fld_kp_rho, cfg.fld_kp_T, rho, theta)
         if model == "grey":
