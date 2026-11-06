@@ -282,7 +282,7 @@ def opacities(m, rho, T, nu_pts=300, band=None):
     else:                                            # per-cell u range of the band (log-spaced)
         kT = np.broadcast_to(T, shp)[..., None] / EV                # eV
         lo = np.maximum(band[0] / kT, 1e-4)
-        hi = (band[1] / kT) if np.isfinite(band[1]) else lo + 60.0
+        hi = np.minimum(band[1] / kT, lo + 60.0)     # the weights fall by e^-60 beyond lo + 60 (inf allowed)
         hi = np.maximum(hi, lo * (1 + 1e-9))
         s_ = np.linspace(0.0, 1.0, nu_pts)
         U = np.exp(np.log(lo) + (np.log(hi) - np.log(lo)) * s_)
@@ -306,8 +306,11 @@ def opacities(m, rho, T, nu_pts=300, band=None):
     a_bf = nic * N_out * sig * stim
     a_abs = (a_ff + a_bf) / rc                                      # absorption per mass
     k_es = 6.6524587e-29 * nec / rc
-    w_P = U**3 / np.expm1(U)                                        # Planck weight
-    w_R = U**4 * np.exp(U) / np.expm1(U)**2                         # dB/dT weight
+    # Planck and dB/dT weights, each scaled by e^U0 per cell: the means are ratios, and in the Wien tail of a cold cell the
+    # unscaled weights overflow or underflow (0/0) although the mean itself is finite
+    tail = np.exp(-(U - np.min(U, axis=-1, keepdims=True)))
+    w_P = U**3 * tail / stim
+    w_R = U**4 * tail / stim**2
     X = u if u is not None else U
     integ = (lambda f: np.trapz(f, u, axis=-1)) if u is not None else (lambda f: np.trapz(f, X, axis=-1))
     kP = integ(a_abs * w_P) / np.maximum(integ(w_P), 1e-300)

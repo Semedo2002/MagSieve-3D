@@ -2505,6 +2505,21 @@ def multigroup_test():
         gt = gs.group_table("al", [0.0, 10.0, 100.0, 1000.0, np.inf], nr=24, nt=24, pts=48)
     path = os.path.join(tempfile.mkdtemp(prefix="mg_"), "al_groups.npz")
     np.savez(path, **gt)
+    # cold cells: the band means stay finite in the Wien tail (no NaN, no floor), and the solver refuses a table that has them
+    clean = all(np.all(gt[k] > 1e-290) for k in ("kappa_R_g", "kappa_P_g"))
+    bad_path = path.replace("al_groups", "al_bad")
+    bad_kR = gt["kappa_R_g"].copy()
+    bad_kR[0, 0, 0] = np.nan
+    np.savez(bad_path, **{**gt, "kappa_R_g": bad_kR})
+    refused = False
+    try:
+        mg.group_opacities(Config(fld=True, fld_groups=4, fld_mg_table=bad_path), None, xp.ones(2), xp.ones(2), xp.ones(2, bool))
+    except ValueError:
+        refused = True
+    good = clean and refused
+    ok = ok and good
+    print(f"  generated group table: {sum(a.size for a in (gt['kappa_R_g'], gt['kappa_P_g']))} cold-to-hot entries finite and above the "
+          f"floor; a table with NaN refused: {refused}  [{'PASS' if good else 'FAIL'}]")
     # code units: rho in g/cc, theta in units of 1 eV, lengths in mm; opacity conversion via tab_* units
     c5 = Config(nx=32, ny=32, x_max=1.0, y_max=1.0, t_end=1.0, cfl=0.3, mach=1.0, gamma=5 / 3, B_transverse=0.0,
                 bc_x_type="periodic", bc_y_type="periodic", diag_interval=10**9, snapshot_times=[], fld=True,

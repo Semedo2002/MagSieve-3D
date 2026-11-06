@@ -126,7 +126,9 @@ def group_opacities(cfg, edges, rho, theta, open_):
         if key not in _TABLES:
             from . import tabular
             d = np.load(cfg.fld_mg_table)
-            try:                                     # one vectorised lookup for all groups (log-uniform table)
+            if not all(np.all(d[k] > 1e-290) for k in ("kappa_R_g", "kappa_P_g")):   # NaN fails this too
+                raise ValueError(f"{cfg.fld_mg_table}: NaN or floored opacities; interpolated in log they give absurd diffusion")
+            try:                                   # one vectorised lookup for all groups (log-uniform table)
                 _TABLES[key] = tabular.GroupOpacityTable(d, cfg.tab_rho_unit, cfg.tab_L_unit, cfg.tab_T_unit)
             except ValueError:                       # non-uniform grid: one interpolating table per group
                 _TABLES[key] = [tabular.OpacityTable({"rho": d["rho"], "T": d["T"], "kappa_R": d["kappa_R_g"][g],

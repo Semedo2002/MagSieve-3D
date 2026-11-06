@@ -657,19 +657,19 @@ extern "C" __global__ void group_lookup(const double* __restrict__ rho, const do
                                         double* __restrict__ oR, double* __restrict__ oP, const long N, const int G,
                                         const int nr, const int nt, const double lr0, const double dlr, const double lt0,
                                         const double dlt, const double T1) {
-    long t = (long)blockDim.x * blockIdx.x + threadIdx.x;
-    if (t >= N * G) return;
-    long g = t / N, c = t % N;
+    long c = (long)blockDim.x * blockIdx.x + threadIdx.x;
+    if (c >= N) return;
     double fr = (log10(fmax(rho[c], 1e-300)) - lr0) / dlr, ft = (log10(fmax(th[c] * T1, 1e-300)) - lt0) / dlt;
     fr = fmin(fmax(fr, 0.0), nr - 1 - 1e-9);
     ft = fmin(fmax(ft, 0.0), nt - 1 - 1e-9);
     long i = (long)fr, j = (long)ft;
     double a = fr - i, b = ft - j;
-    long o = g * nr * nt + i * nt + j;
-    double r = (1 - a) * (1 - b) * KR[o] + a * (1 - b) * KR[o + nt] + (1 - a) * b * KR[o + 1] + a * b * KR[o + nt + 1];
-    double p = (1 - a) * (1 - b) * KP[o] + a * (1 - b) * KP[o + nt] + (1 - a) * b * KP[o + 1] + a * b * KP[o + nt + 1];
-    oR[t] = pow(10.0, r);
-    oP[t] = pow(10.0, p);
+    double w00 = (1 - a) * (1 - b), w10 = a * (1 - b), w01 = (1 - a) * b, w11 = a * b;
+    for (long g = 0; g < G; g++) {
+        long o = g * nr * nt + i * nt + j;
+        oR[g * N + c] = pow(10.0, w00 * KR[o] + w10 * KR[o + nt] + w01 * KR[o + 1] + w11 * KR[o + nt + 1]);
+        oP[g * N + c] = pow(10.0, w00 * KP[o] + w10 * KP[o + nt] + w01 * KP[o + 1] + w11 * KP[o + nt + 1]);
+    }
 }
 """
 _GROUP_K = []
@@ -703,7 +703,7 @@ class GroupOpacityTable:
         rho, theta = xp.ascontiguousarray(rho), xp.ascontiguousarray(theta)
         G, N = self.kR.shape[0], rho.size
         oR, oP = xp.empty((G,) + rho.shape), xp.empty((G,) + rho.shape)
-        _group_kernel()(((N * G + 255) // 256,), (256,),
+        _group_kernel()(((N + 255) // 256,), (256,),
                         (rho, theta, self.kR, self.kP, oR, oP, np.int64(N), np.int32(G), np.int32(self.nr), np.int32(self.nt),
                          float(self.lr[0]), float(self.dlr), float(self.lt[0]), float(self.dlt), float(self.T1)))
         return oR, oP
