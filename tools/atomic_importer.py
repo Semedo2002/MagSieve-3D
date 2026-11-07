@@ -227,6 +227,274 @@ def fetch_tops_groups(element, t_kev, rho_gcc, nr, edges_kev):
     return _get(TOPS + "results", urllib.parse.urlencode(res).encode(), timeout=600)
 
 
+def _tops_form():
+    """the TOPS form's default fields (radio buttons at their checked values)"""
+    page = _get(TOPS + "apps/")
+    form = page[page.index('<form method="POST"'):]
+    d = {}
+    for m in re.finditer(r"<input\b[^>]*>", form, re.I):
+        t = m.group(0)
+        n, v, ty = (re.search(rf'{k}="([^"]*)"', t, re.I) for k in ("name", "value", "type"))
+        if n and not (ty and ty.group(1).lower() == "radio" and "checked" not in t.lower()):
+            d[n.group(1)] = v.group(1) if v else ""
+    return d
+
+
+def parse_tops_offtable(text):
+    """(T_keV, rho) pairs TOPS flags as beyond its tables ("WARNING - Requested densities ... went off table
+    boundaries"): there it reuses the cross sections of the highest tabulated density, so these values are not data"""
+    t = html.unescape(re.sub(r"<[^>]+>", "\n", text)).replace("\xa0", " ")
+    num = r"[-+]?\d\.\d+E[-+]\d+"
+    out, on = set(), False
+    for line in t.splitlines():
+        if "off table boundaries" in line:
+            on = True
+            continue
+        if on:
+            v = re.findall(num, line)
+            if len(v) == 3 and line.split()[0] == v[0]:
+                out.add((float(v[0]), float(v[1])))
+            elif line.strip():
+                on = False
+    return out
+
+
+def tops_query(mixture, t_kev, rho_gcc, nr, edges_kev=None, fractype="atomic", isotope=False, retries=3):
+    """one TOPS request: grey means (and group means for edges_kev) at every TOPS temperature in t_kev = (low, high)
+    and nr log-spaced densities in rho_gcc = (low, high). mixture in TOPS syntax ("1. al", "1 c 1 h", with isotope=True
+    "1 h 2.0141 1 h 3.0160"). Returns (grey rows, group rows or None, off-table set, raw page)."""
+    d = _tops_form()
+    d.update(mixture=mixture, fractype=fractype, isotope="isotope" if isotope else "noniso", tgrid="range",
+             tlow=str(t_kev[0]), tup=str(t_kev[1]), rgrid="range", rlow="%.6g" % rho_gcc[0], rup="%.6g" % rho_gcc[1],
+             nr=str(nr), rspace="log", datype="gray", nthin="1")
+    if edges_kev is not None:
+        d.update(datype="groups", egrid="specific", energies=" ".join("%.6g" % e for e in edges_kev))
+    for k in range(retries):
+        try:
+            s = _get(TOPS + "submit", urllib.parse.urlencode(d).encode(), timeout=300)
+            res = _form_fields(s, 'action="./results"')
+            r = _get(TOPS + "results", urllib.parse.urlencode(res).encode(), timeout=900)
+            return parse_tops(r), (parse_tops_groups(r) if edges_kev is not None else None), parse_tops_offtable(r), r
+        except (OSError, ValueError):
+            if k == retries - 1:
+                raise
+            time.sleep(10 * (k + 1))
+
+
+def fetch_tops_dense(mixture, rho_gcc=(1e-6, 1e2), per_decade=32, t_kev=(0.0005, 100.0), edges_kev=None,
+                     fractype="atomic", isotope=False, pause=2.0, log=print):
+    """a dense TOPS table: every TOPS temperature in t_kev, densities log-spaced at per_decade points per decade.
+    Requests are split so each stays within TOPS's limits (100 densities; T x rho x group bounds <= 50000).
+    Returns dict(T_keV (nt,), rho_gcc (nr,), kR, kP, Zfree (nr, nt) in cm^2/g, offtable (nr, nt) bool, and kR_g, kP_g
+    (G, nr, nt) with edges_keV when edges_kev is given)."""
+    lo, hi = np.log10(rho_gcc[0]), np.log10(rho_gcc[1])
+    n = int(round((hi - lo) * per_decade)) + 1
+    nb = 1 if edges_kev is None else len(edges_kev)
+    chunk = min(100, max(2, 50000 // (74 * nb)))     # densities per request (74 TOPS temperatures at most)
+    grey, groups, off, k = {}, {}, set(), 0
+    while k < n - 1:
+        m = min(chunk, n - k)
+        a, b = 10 ** (lo + (hi - lo) * k / (n - 1)), 10 ** (lo + (hi - lo) * (k + m - 1) / (n - 1))
+        g, gg, o, _ = tops_query(mixture, t_kev, (a, b), m, edges_kev, fractype, isotope)
+        for r in g:
+            grey[(r["T_keV"], r["rho"])] = r
+        for r in gg or []:
+            groups[(r["T_keV"], r["rho"])] = r
+        off |= o
+        log(f"  TOPS {mixture!r}: densities {k + 1}-{k + m} of {n} ({a:.3g}-{b:.3g} g/cc), {len(g)} rows")
+        k += m - 1
+        time.sleep(pause)
+    T = np.array(sorted({t for t, _ in grey}))
+    rho = np.array(sorted({r for _, r in grey}))
+    it, ir = {t: j for j, t in enumerate(T)}, {r: i for i, r in enumerate(rho)}
+    out = dict(T_keV=T, rho_gcc=rho, mixture=mixture, fractype=fractype)
+    for q in ("kR", "kP", "Zfree"):
+        out[q] = np.full((len(rho), len(T)), np.nan)
+    out["offtable"] = np.zeros((len(rho), len(T)), bool)
+    for (t, r), x in grey.items():
+        for q in ("kR", "kP", "Zfree"):
+            out[q][ir[r], it[t]] = x[q]
+    for t, r in off:                                 # the warning lists T and rho rounded alike
+        i = np.argmin(abs(np.log(rho / r))) if len(rho) else None
+        j = np.argmin(abs(np.log(T / t)))
+        if i is not None and abs(np.log(rho[i] / r)) < 1e-3 and abs(np.log(T[j] / t)) < 1e-3:
+            out["offtable"][i, j] = True
+    if np.isnan(out["kR"]).any():
+        raise ValueError(f"TOPS table for {mixture!r} has {int(np.isnan(out['kR']).sum())} missing points")
+    if edges_kev is not None:
+        G = len(edges_kev) - 1
+        out["kR_g"], out["kP_g"] = np.zeros((G, len(rho), len(T))), np.zeros((G, len(rho), len(T)))
+        for (t, r), x in groups.items():
+            out["kR_g"][:, ir[r], it[t]], out["kP_g"][:, ir[r], it[t]] = x["kR_g"][:G], x["kP_g"][:G]
+        out["edges_keV"] = np.asarray(edges_kev, float)
+    return out
+
+
+def _tops_range(mixture, t_kev, a, b, n, edges_kev=None, fractype="atomic", isotope=False):
+    """one TOPS range request (n log-spaced densities from a to b). TOPS's 'specific densities' input is not honoured
+    by the server (it answers with a fixed default list), so every density request goes through a range. Rows come
+    back in order of the n intended densities: {(T_keV, i): grey}, {(T_keV, i): groups}, {(T_keV, i)} off table."""
+    g, gg, off, _ = tops_query(mixture, t_kev, (a, b), n, edges_kev, fractype, isotope)
+    lv = np.linspace(np.log(a), np.log(b), n)
+
+    def idx(rho):
+        i = int(np.argmin(abs(lv - np.log(rho))))
+        if abs(lv[i] - np.log(rho)) > 2e-4:
+            raise ValueError(f"TOPS returned density {rho}, not in the requested range grid")
+        return i
+    return ({(x["T_keV"], idx(x["rho"])): x for x in g}, {(x["T_keV"], idx(x["rho"])): x for x in gg or []},
+            {(t, idx(r)) for t, r in off})
+
+
+def _runs(idx, step, limit):
+    """split sorted integer grid indices into runs of consecutive indices step apart, at most limit per run"""
+    out, i = [], 0
+    while i < len(idx):
+        j = i
+        while j + 1 < len(idx) and idx[j + 1] - idx[j] == step and j + 1 - i < limit - 1:
+            j += 1
+        out.append((idx[i], idx[j]))
+        i = j + 1
+    return out
+
+
+def fetch_tops_adaptive(mixture, rho_gcc=(1e-6, 1e2), per_decade=32, tol=0.01, max_split=5, t_kev=(0.0005, 100.0),
+                        fractype="atomic", isotope=False, pause=2.0, log=print):
+    """a TOPS grey table on TOPS's temperatures and an adaptive density grid. Start from per_decade log-spaced
+    densities; fetch the midpoint (in log rho) of every interval; where log-log linear interpolation misses TOPS at that
+    midpoint by more than tol in kappa_R, kappa_P or Z_free at any temperature, the midpoint becomes a node and both
+    halves are tested again (up to max_split bisections). Intervals that pass keep their midpoint out of the table as
+    held-out evidence. Linear interpolation across a single slope kink errs at most twice as much as at the midpoint,
+    so the table holds TOPS to about 2 tol between its nodes, at TOPS's temperatures (nothing tests between those:
+    TOPS does not compute there). Densities are integer indices on the finest grid, so requests that overlap agree.
+    Returns the table dict of fetch_tops_dense plus the held-out midpoints."""
+    lo, hi = np.log10(rho_gcc[0]), np.log10(rho_gcc[1])
+    n0 = int(round((hi - lo) * per_decade))
+    F = n0 * 2 ** (max_split + 1)                    # finest grid: F intervals
+
+    def rho(m):
+        return 10 ** (lo + (hi - lo) * m / F)
+    cols = {}                                        # finest-grid index -> {T: row}
+
+    def get(a, b, n, step):
+        if n == 1:                                   # one density: the 3-point range centred on it
+            a, b, n = a - step, a + step, 3
+        g, gg, off = _tops_range(mixture, t_kev, rho(a), rho(b), n, None, fractype, isotope)
+        return a, step, g, off
+
+    def fetch(need, step):
+        """fetch grid indices need (multiples of step apart), filling gaps of up to 5 steps to save requests"""
+        need = sorted(set(need) - set(cols))
+        if not need:
+            return
+        full = []
+        for a, b in zip(need[:-1], need[1:]):
+            full.append(a)
+            if b - a <= 5 * step:
+                full += list(range(a + step, b, step))
+        full.append(need[-1])
+        for a, b in _runs(sorted(set(full)), step, 100):
+            n = (b - a) // step + 1
+            a0, s0, g, off = get(a, b, n, step)
+            for (t, i), x in g.items():
+                cols.setdefault(a0 + i * s0, {})[t] = dict(x, off=(t, i) in off)
+            log(f"  TOPS {mixture!r}: {n} densities {rho(a):.4g}-{rho(b):.4g} g/cc ({len(cols)} columns)")
+            time.sleep(pause)
+    step0 = F // n0
+    fetch(range(0, F + 1, step0 // 2), step0 // 2)  # nodes and every first-level midpoint
+    T = np.array(sorted({t for c in cols.values() for t in c}))
+    Q = ("kR", "kP", "Zfree")
+
+    def vec(m):
+        c = cols[m]
+        return np.log10(np.array([[c[t][q] for t in T] for q in Q]))
+    nodes = set(range(0, F + 1, step0))
+    todo, held = [(a, a + step0, 0) for a in range(0, F, step0)], []
+    while todo:
+        w = todo[0][1] - todo[0][0]
+        fetch([(a + b) // 2 for a, b, _ in todo], w // 2)
+        nxt = []
+        for a, b, lev in todo:
+            m = (a + b) // 2
+            err = float(np.max(np.abs(10 ** (0.5 * (vec(a) + vec(b)) - vec(m)) - 1)))
+            if err <= tol or lev >= max_split:
+                held.append((m, err, lev >= max_split and err > tol))
+            else:
+                nodes.add(m)
+                nxt += [(a, m, lev + 1), (m, b, lev + 1)]
+        todo = nxt
+        log(f"  {len(nodes)} nodes, {len(todo)} intervals to test at the next level")
+    nodes = sorted(nodes)
+    out = dict(T_keV=T, rho_gcc=np.array([rho(m) for m in nodes]), mixture=mixture, fractype=fractype, tol=tol,
+               node_index=np.array(nodes), finest=F, log_range=(lo, hi))
+    for q in Q:
+        out[q] = np.array([[cols[m][t][q] for t in T] for m in nodes])
+    out["offtable"] = np.array([[cols[m][t]["off"] for t in T] for m in nodes])
+    hm = [h[0] for h in held]
+    out["heldout_rho_gcc"] = np.array([rho(m) for m in hm])
+    for q in Q:
+        out["heldout_" + q] = np.array([[cols[m][t][q] for t in T] for m in hm])
+    out["heldout_split_capped"] = np.array([h[2] for h in held])
+    return out
+
+
+def fetch_tops_groups_at(tab, edges_kev, t_kev=(0.0005, 100.0), isotope=False, pause=2.0, log=print):
+    """group means (G, nr, nt) at the nodes of a fetch_tops_adaptive table, every TOPS temperature, within TOPS's
+    request limit (T x rho x group bounds <= 50000)"""
+    lo, hi = tab["log_range"]
+    F, nodes = int(tab["finest"]), [int(m) for m in tab["node_index"]]
+
+    def rho(m):
+        return 10 ** (lo + (hi - lo) * m / F)
+    per = max(2, min(100, 50000 // (74 * len(edges_kev))))
+    pos = {m: i for i, m in enumerate(nodes)}
+    G = len(edges_kev) - 1
+    kR, kP = np.zeros((G, len(nodes), len(tab["T_keV"]))), np.zeros((G, len(nodes), len(tab["T_keV"])))
+    it = {t: j for j, t in enumerate(tab["T_keV"])}
+    got, i = set(), 0
+    while i < len(nodes):                            # runs of equally spaced nodes
+        j = i
+        while j + 1 < len(nodes) and j + 1 - i < per - 1 and (j == i or nodes[j + 1] - nodes[j] == nodes[i + 1] - nodes[i]):
+            j += 1
+        a, b, n = nodes[i], nodes[j], j - i + 1
+        step = (b - a) // (n - 1) if n > 1 else 1
+        if n == 1:                                   # a lone node: a 3-point range centred on it, keep the middle
+            a, b, n = a - 1, a + 1, 3
+        _, gg, _ = _tops_range(tab["mixture"], t_kev, rho(a), rho(b), n, edges_kev, tab["fractype"], isotope)
+        for (t, k), x in gg.items():
+            if j == i and k != 1:
+                continue
+            if len(x["kR_g"]) < G:
+                raise ValueError(f"TOPS returned {len(x['kR_g'])} groups, expected {G}")
+            m = a + k * step
+            kR[:, pos[m], it[t]], kP[:, pos[m], it[t]] = x["kR_g"][:G], x["kP_g"][:G]
+            got.add((m, t))
+        log(f"  TOPS groups {tab['mixture']!r}: {n} densities {rho(a):.4g}-{rho(b):.4g} g/cc")
+        time.sleep(pause)
+        i = j + 1
+    if len(got) != len(nodes) * len(tab["T_keV"]):
+        raise ValueError(f"group table incomplete: {len(got)} of {len(nodes) * len(tab['T_keV'])} points")
+    return kR, kP
+
+
+def tops_dense_to_npz(tab, path, note=""):
+    """write a dense TOPS table in SI for the solver: rho (kg/m^3), T (K), kappa_R, kappa_P (m^2/kg), Zbar_lte, and
+    the group means (kappa_R_g, kappa_P_g, group_edges_eV) when present. TOPS's own (rho, T) points are kept as the
+    grid (no resampling), so a lookup at a TOPS point returns TOPS's value."""
+    d = dict(rho=tab["rho_gcc"] * 1e3, T=tab["T_keV"] * 1e3 * 11604.518, kappa_R=tab["kR"] * 0.1,
+             kappa_P=tab["kP"] * 0.1, Zbar_lte=tab["Zfree"], offtable=tab["offtable"],
+             source=np.array("Los Alamos TOPS (aphysics2.lanl.gov/apps; Magee et al., ASP Conf. Ser. 78, 51, 1995), "
+                             f"mixture {tab['mixture']!r} by {tab['fractype']} fraction, retrieved "
+                             f"{time.strftime('%Y-%m-%d')}. {note}".strip()))
+    if "kR_g" in tab:
+        d.update(kappa_R_g=tab["kR_g"] * 0.1, kappa_P_g=tab["kP_g"] * 0.1, group_edges_eV=tab["edges_keV"] * 1e3)
+    if "heldout_rho_gcc" in tab:                     # TOPS at the midpoints between nodes, not in the table
+        d.update(heldout_rho=tab["heldout_rho_gcc"] * 1e3, heldout_kappa_R=tab["heldout_kR"] * 0.1,
+                 heldout_kappa_P=tab["heldout_kP"] * 0.1, heldout_Zbar=tab["heldout_Zfree"], tol=tab["tol"])
+    np.savez_compressed(path, **d)
+    return d
+
+
 def save_tops_csv(path, element, rows, retrieved=None):
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(f"# Los Alamos TOPS grey opacities of {element} (cm^2/g), https://aphysics2.lanl.gov/apps/\n"
@@ -388,8 +656,33 @@ def main():
                     "(chianti: fitted rates, Z <= 30, recommended; burgess: General Formula, see aegis/tabular.py)")
     ap.add_argument("--fetch-chianti-dr", nargs="*", default=[], help="refresh the bundled CHIANTI DR fits")
     ap.add_argument("--nonlte", action="store_true", help="opacity from the collisional-radiative ion balance")
+    ap.add_argument("--tops", help="Z <= 30: TOPS table on TOPS's temperatures and an adaptive density grid, for the "
+                    "solver (FLD fld_opacity_table, multigroup fld_mg_table with --tops-groups). An element (Al) or a "
+                    "TOPS mixture string ('1 c 1 h')")
+    ap.add_argument("--tops-rho", type=float, nargs=2, default=[1e-6, 1e2], help="density range, g/cc")
+    ap.add_argument("--tops-tol", type=float, default=0.01, help="bisect where midpoint interpolation misses by more")
+    ap.add_argument("--tops-groups", type=float, nargs="*", default=None,
+                    help="inner group edges in eV for group means as well (outer groups run to 0 and infinity)")
+    ap.add_argument("--mass-fraction", action="store_true", help="the --tops mixture is by mass, not by number")
+    ap.add_argument("--isotope", action="store_true", help="the --tops mixture gives isotopic weights")
     ap.add_argument("--out")
     a = ap.parse_args()
+    if a.tops:
+        mix = a.tops if " " in a.tops.strip() else f"1. {a.tops.lower()}"
+        tab = fetch_tops_adaptive(mix, tuple(a.tops_rho), tol=a.tops_tol,
+                                  fractype="mass" if a.mass_fraction else "atomic", isotope=a.isotope)
+        note = (f"Adaptive density grid: every interval's midpoint is within {a.tops_tol:.0%} of TOPS in kappa_R, "
+                "kappa_P and Z_free (held-out midpoints stored as heldout_*).")
+        if a.tops_groups:
+            ek = np.array([1e-5] + [1e-3 * g for g in a.tops_groups] + [3000.0])
+            tab["kR_g"], tab["kP_g"] = fetch_tops_groups_at(tab, ek, isotope=a.isotope)
+            tab["edges_keV"] = np.concatenate([[0.0], ek[1:-1], [np.inf]])
+            note += " Group means from TOPS with outer edges 0.01 eV and 3 MeV, used as 0 and infinity."
+        name = re.sub(r"[^a-z0-9]+", "", a.tops.lower())
+        p = a.out or os.path.join(DATA, f"tops_{name}_table.npz")
+        tops_dense_to_npz(tab, p, note)
+        print(f"wrote {p}: {len(tab['rho_gcc'])} densities x {len(tab['T_keV'])} TOPS temperatures, "
+              f"{len(tab['heldout_rho_gcc'])} held-out midpoints, {int(tab['offtable'].sum())} points off TOPS's tables")
     for el in a.fetch_nist:
         I = fetch_nist_ie(el, cache=False)
         print(f"{el}: {np.sum(np.isfinite(I))} of {Z_OF.get(el, len(I))} ionization energies, I_0 = {I[0]} eV")

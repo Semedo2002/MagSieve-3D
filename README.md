@@ -30,10 +30,11 @@ aegis/            solver package
   cad_importer.py STL / STEP / IGES import, ray-column volume fractions and apertures, immersed walls
   agent_monitor.py  automatic run diagnostics: interface mode growth, flux / insulation loss, numerical health
   ml/             additive models: amr_trigger.py (CNN refinement flags), pinn_diagnostics.py (inverse diagnostics)
+                  deeponet_rad.py (spectrometer surrogate)
   ml/fno_subgrid.py  Fourier neural operator (inference + training on the autodiff tape), guarded radiation predictor
   parallel.py     MPI slab domain decomposition of the 2D and 3D solvers (halo and CT edge exchange)
   io3d.py         3D snapshots: VTK ImageData (.vti/.pvd) and HDF5
-  data/atomic/    NIST ionization energies and lines, Los Alamos TOPS benchmark and group tables
+  data/atomic/    NIST ionization energies and lines, Los Alamos TOPS tables (Al, Cu: the opacity source) and checks
   tabular.py      tabulated EOS / opacities (SESAME ASCII, .npz) with GPU inversion and analytic fallback
   eos_fused.cu    device two-material / tabulated EOS, called inline by the HLLD kernel and the conversions
   eos_fused.py    its host side: packing, launches
@@ -71,7 +72,7 @@ See `CONTRIBUTING.md` for the development workflow.
 ## Usage
 
 ```
-python main.py --test all                     # verification suite, ~20 min on a Quadro P1000
+python main.py --test all                     # verification suite, ~60-75 min on a Quadro P1000
 python main.py --case striped --B0 3.5 --gap-fraction 0.9 --compare-hydro
 python main.py --help
 ```
@@ -152,7 +153,7 @@ difference and the transverse gradients are van Leer limited (Sharma & Hammett 2
 anisotropic conduction from creating new temperature extrema. It is a split step integrated with RKL2
 super-time-stepping (Meyer, Balsara & Aslam 2014), about sqrt(dt/dt_explicit) stages, so it never limits the
 hydrodynamic time step. `units.braginskii_kwargs` gives the Spitzer-Braginskii coefficients in code units (k_par
-at 1 keV within 1.1% of the Spitzer value). Ion conduction is left out.
+at 1 keV within 1.1% of the Spitzer value). Ion conduction is a separate term (two-temperature mode, below).
 
 ### Nernst and Ettingshausen effects
 
@@ -477,19 +478,40 @@ Interpolation is bilinear (bicubic is not implemented).
   replacement for FLYCHK.
 - **Tables (`build_atomic_table`, `tops_groups_to_table`):** `.npz` in the `fld_mg_table` format, with `Zbar_lte` and
   `Zbar_nlte`. `GroupOpacityTable` looks up all groups in one GPU kernel launch; `IonizationTable` gives Z_bar on the GPU.
-- **How good it is** (`examples/atomic_vs_tops.py`, full table in `results/atomic_lines/summary.md`), against TOPS
-  (LTE, 96 points each for Al and Cu, 10 eV - 1 keV, 1e-3 - 1e-1 g/cc):
+- **TOPS as the opacity source (Z <= 30, the recommended path):** `aegis/data/atomic/tops_al_table.npz` and
+  `tops_cu_table.npz` hold TOPS's grey Rosseland and Planck means, Z_free and 6 group means (edges 30, 100, 300 eV,
+  1, 3 keV) at TOPS's own 74 temperatures (0.5 eV - 100 keV) and 409-423 densities (1e-6 - 100 g/cc). Use one as
+  `fld_opacity_table` (grey FLD), `fld_mg_table` (multigroup) or with `IonizationTable`; `tabular.tops_table_path("Al")`
+  finds it. `python tools/atomic_importer.py --tops Fe` (or a mixture, `--tops "1 c 1 h"`, `--tops-groups` for other
+  group edges) makes one for any element or mixture TOPS has (Z = 1-30), in 15-30 minutes of polite requests.
+  - **Grid:** no resampling. The lookup works on uneven axes (bisection in the GPU kernel), so it returns TOPS's value
+    at every table point (to 1e-13). Densities are bisected until log-log interpolation reproduces TOPS at the midpoint
+    of every interval to 1% in kappa_R, kappa_P and Z_free at every temperature; those midpoints stay out of the table
+    as held-out data. A uniform grid would need hundreds of points per decade, because TOPS's curves have slope kinks.
+  - **Measured through the solver's lookup** (`examples/tops_table_accuracy.py`, `results/tops_tables/summary.md`):
+    the 31,228 (Al) and 30,192 (Cu) held-out TOPS points are within 0.99% and 1.25%; a separate TOPS request at 37
+    densities off the grid at all 74 temperatures (2,738 points each) is within 1.64% (Al) and 1.34% (Cu), median
+    3e-5. **Every TOPS value tested is within 5%**, and within 2%.
+  - **Between TOPS temperatures** TOPS computes nothing (its web form refuses other temperatures), so nothing can be
+    compared there. Dropping every other temperature (twice the real spacing) gives median errors of 0.4-8% and 95th
+    percentiles up to 40-60% below 300 eV, where ionization changes quickly; this is a property of TOPS's temperature
+    grid, shared by every code that uses TOPS, and an overestimate of the error at the real spacing.
+  - **What TOPS does:** LTE opacities from the Los Alamos ATOMIC / LEDCOP codes (Magee et al. 1995), with a plasma
+    cutoff (groups reaching below the plasma frequency hold 1e10 cm^2/g). It is not checked against experiment here.
+    The service's "specific densities" input is ignored by the server, so the importer uses density ranges only.
+- **The model, for comparison and for Z > 30** (`examples/atomic_vs_tops.py`, full table in
+  `results/atomic_lines/summary.md`), against TOPS (LTE, 96 points each for Al and Cu, 10 eV - 1 keV, 1e-3 - 1e-1 g/cc):
   - Z_bar from NIST energies is within about 2% on average;
   - Planck mean: from 12x (Al) and 57x (Cu) low without lines to within about 2x with the line model;
   - Rosseland mean: only from 8x to 4x (Al) and 36x to 19x (Cu) low. Complete tabulated line lists do not close this
-    (CHIANTI Al, 72k lines: 4.8x), so the remaining gap is continuum and broadening physics. **Nothing here is within 5%
-    of TOPS** (5% was a target for this module; reaching it needs a detailed-configuration opacity code);
+    (CHIANTI Al, 72k lines: 4.8x), so the remaining gap is continuum and broadening physics. The model is not within
+    5% of TOPS (that needs a detailed-configuration opacity code), which is why the TOPS tables above are the source
+    for Z <= 30;
   - coronal mean charge against CHIANTI's ion balance: mean error 0.32 -> 0.22 (Al) and 1.09 -> 0.82 (Cu) with the
     CHIANTI DR fits; the Burgess formula with the model's core transitions makes it worse (0.38, 1.38), so the
     default is no DR;
-  - for Al and Cu, use the imported TOPS tables;
   - for Au and Pb there is no open table or DR fit here, so their opacities (with model lines) and Z_bar are
-    unbenchmarked: TOPS and CHIANTI stop at Z = 30.
+    unbenchmarked: TOPS and CHIANTI stop at Z = 30, and no open opacity table for them was found.
 
 ### Generated material tables
 
@@ -930,7 +952,7 @@ under Windows a 128 x 128 ideal MHD step went from about 140 ms to 22 ms, a 16 x
 | cyl_filter | the azimuthal filter keeps m <= m_crit exactly and leaves outer rings alone; the blob crossing the axis (32 x 64): 1254 -> 79 steps, centroid and field error unchanged to 1e-4, energy 3e-15, div B 2e-15 |
 | rlc_adjoint | r-z liner driven by an RLC bank: bank + resistor + grid energy 2e-16; d(yield proxy)/d(shape, V0, C, L, R) adjoint vs central differences 2e-10 to 9e-9 |
 | literature | digitized traces without a citation refused, sorting / scaling, HDF5 round trip; virtual probes on a manufactured state: B-dot exact (1e-12), VISAR velocity exact, framing radius within half a cell; synthetic traces: hidden speed recovered within 1%, marked [syn]; self-tests, not validation against an experiment |
-| atomic | parsers on real NIST, TOPS and CHIANTI formats; Saha vs an exact hydrogen result; collisional-radiative balance reduces to Saha at high density and is coronal at low density; Z_bar within about 2% of Los Alamos TOPS for Al and Cu; model lines bring the Planck mean within about 2-3x of TOPS (from 12-57x) and do not worsen Rosseland (still 4-20x low, reported); hydrogen f values, pseudo-Voigt vs an exact convolved Voigt, line strength exact on the grid; Burgess formula vs ADAS's worked values; CHIANTI DR fits improve the coronal mean charge against CHIANTI's ion balance; vectorised GPU group lookup matches per-group tables to 2e-13; multigroup FLD with the imported TOPS Al table conserves energy |
+| atomic | parsers on real NIST, TOPS and CHIANTI formats; Saha vs an exact hydrogen result; collisional-radiative balance reduces to Saha at high density and is coronal at low density; Z_bar within about 2% of Los Alamos TOPS for Al and Cu; model lines bring the Planck mean within about 2-3x of TOPS (from 12-57x) and do not worsen Rosseland (still 4-20x low, reported); hydrogen f values, pseudo-Voigt vs an exact convolved Voigt, line strength exact on the grid; Burgess formula vs ADAS's worked values; CHIANTI DR fits improve the coronal mean charge against CHIANTI's ion balance; vectorised GPU group lookup matches per-group tables to 2e-13; multigroup FLD with the imported TOPS Al table conserves energy; TOPS Al and Cu tables through the solver lookup: exact at their points (1e-13), 30k held-out TOPS points within 1.25% and a separate off-grid TOPS request (2,738 points each) within 1.64%; a multigroup solve on the uneven TOPS grid conserves energy |
 | bridge | native graph loop bit-identical to the Python solver with the GIL released; whole native steps bit-identical to the Python step for 2D r-z, resistive + Hall, conduction, viscosity, 3D Cartesian and cylindrical, 3D resistive, conduction, viscosity; planned RKL2 stages: energy at round-off, recapture when dt grows; FLD refused; overlap stepper on one periodic rank matches to 4e-15; 2 MPI ranks through the native exchange: 2e-15 vs serial, energy 2e-15, div B 4e-14, shared faces identical (one shared GPU, so no scaling claim) |
 | ml_additive | the numerical core imports no model; rejected sub-grid predictions leave the state bit-identical to the solver, accepted ones keep mass, momentum, energy and div B at round-off; AMR with trigger cells keeps conservation; surrogate optimizer spends exactly its budget and beats a same-budget scan on Branin; CNN and PINN gradients vs finite differences; does not depend on trained weights |
 | amr_transport | Hall + anisotropic resistivity, Nernst + Ettingshausen, two-temperature (electron and ion conduction, equilibration), gyroviscosity, viscosity and thin radiation each with three touching patches moving every 4 steps: conservation 6e-16 to 8e-16 (3e-7 to 1e-3 with the registers off), div B 2e-15; a feature in a patch matches a uniform fine run to 1e-2 to 1e-5 of the coarse error; the electron register keeps refluxed electron heat out of the ions (T_i change within 8e-4 of the fine run, 7e-3 without it) |

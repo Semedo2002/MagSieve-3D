@@ -3683,6 +3683,42 @@ Useful Links"""
     good = dE < 1e-13 and float(xp.max(xp.abs(Er - 1e-3))) > 0
     ok = ok and good
     print(f"  multigroup FLD with the imported TOPS Al table: energy {dE:.0e}  [{'PASS' if good else 'FAIL'}]")
+    # TOPS as the opacity source: the bundled tables on TOPS's temperatures and an adaptive density grid, through the
+    # solver's lookup (uneven axes, bisection kernel)
+    for elm in ("Al", "Cu"):
+        path = os.path.join(ai.DATA, f"tops_{elm.lower()}_table.npz")
+        d = tb.load(path)
+        op, zt = tb.OpacityTable(d, 1.0, 1.0, 1.0), tb.IonizationTable(d, 1.0, 1.0)
+
+        def look(r, T_):
+            r, T_ = xp.asarray(r), xp.asarray(T_)
+            a, b = op(r, T_)
+            return [np.asarray(v.get() if hasattr(v, "get") else v) for v in (a, b, zt(r, T_))]
+        R_, T_ = np.meshgrid(d["rho"], d["T"], indexing="ij")
+        e_node = max(float(np.max(np.abs(v / d[k] - 1))) for v, k in zip(look(R_, T_), ("kappa_R", "kappa_P", "Zbar_lte")))
+        HR, HT = np.meshgrid(d["heldout_rho"], d["T"], indexing="ij")
+        e_held = max(float(np.max(np.abs(v / d[k] - 1))) for v, k in
+                     zip(look(HR, HT), ("heldout_kappa_R", "heldout_kappa_P", "heldout_Zbar")))
+        a = ai.load_tops_csv(os.path.join(ai.DATA, f"tops_{elm}_check.csv"))   # off-grid densities, every TOPS T
+        v = look(a[:, 1] * 1e3, a[:, 0] * 1.1604518e7)
+        e_ind = max(float(np.max(np.abs(v[0] / (0.1 * a[:, 2]) - 1))), float(np.max(np.abs(v[1] / (0.1 * a[:, 3]) - 1))),
+                    float(np.max(np.abs(v[2] / a[:, 4] - 1))))
+        good = e_node < 1e-9 and e_held <= 2 * float(d["tol"]) and e_ind < 0.05
+        ok = ok and good
+        print(f"  TOPS {elm} table ({len(d['rho'])} densities x {len(d['T'])} TOPS temperatures): nodes {e_node:.0e}, "
+              f"{HR.size} held-out TOPS points within {e_held:.2%}, {len(a)} TOPS points of a separate off-grid request "
+              f"within {e_ind:.2%} (5% target)  [{'PASS' if good else 'FAIL'}]")
+    cfg.fld_mg_table = os.path.join(ai.DATA, "tops_al_table.npz")
+    mgr._TABLES.clear()
+    U = prim_to_cons(W, 5 / 3)
+    Er = xp.full((6, n, n), 1e-3)
+    tot0 = float(xp.sum(U[EN]) + xp.sum(Er))
+    for _ in range(3):
+        mgr.step(Er, U, 5 / 3, cfg, (1 / n, 1 / n), (True, True), 1e-3, advect=False)
+    dE = abs(float(xp.sum(U[EN]) + xp.sum(Er)) - tot0) / tot0
+    good = dE < 1e-13 and bool(xp.all(xp.isfinite(Er)))
+    ok = ok and good
+    print(f"  multigroup FLD with the TOPS Al table on its uneven grid: energy {dE:.0e}  [{'PASS' if good else 'FAIL'}]")
     return ok
 
 

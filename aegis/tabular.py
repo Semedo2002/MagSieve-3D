@@ -83,7 +83,7 @@ def load(path, material=None):
     p, e and optionally cs, kappa_R, kappa_P ((nr, nt) arrays, rho [kg/m^3], T [K], SI values)"""
     if path.endswith(".npz"):
         d = np.load(path)
-        return {k: np.asarray(d[k], dtype=float) for k in d.files}
+        return {k: np.asarray(d[k], dtype=float) for k in d.files if d[k].dtype.kind in "biuf"}
     out = {}
     try:
         _, w = read_sesame(path, 301, material)
@@ -392,11 +392,21 @@ class OpacityTable:
         if "kappa_R" not in f:
             raise ValueError("opacity table needs kappa_R")
         f.setdefault("kappa_P", f["kappa_R"])
-        self.g = Grid(rho, T, {**f, "zero": np.ones_like(f["kappa_R"])}, refine)
         self.T1 = T1
+        self.exact = None
+        if not (_log_uniform(rho) and _log_uniform(T)):
+            # an uneven grid (TOPS's own temperatures, an adaptive density grid): look it up on its own nodes,
+            # piecewise log-bilinear, so a lookup at a node returns the tabulated value (no resampling)
+            self.exact = GroupOpacityTable(dict(rho=rho, T=T, kappa_R_g=f["kappa_R"][None], kappa_P_g=f["kappa_P"][None]),
+                                           1.0, 1.0, T1)
+            return
+        self.g = Grid(rho, T, {**f, "zero": np.ones_like(f["kappa_R"])}, refine)
 
     def __call__(self, rho, theta):
         """(kappa_R, kappa_P) per unit mass, code units; clamped to the table edges"""
+        if self.exact is not None:
+            kR, kP = self.exact(rho, theta)
+            return kR[0], kP[0]
         lr = xp.clip(xp.log10(xp.maximum(rho, 1e-300)), self.g.LR[0], self.g.LR[-1])
         lt = xp.clip(xp.log10(xp.maximum(theta * self.T1, 1e-300)), self.g.LT[0], self.g.LT[-1])
         ft = (lt - self.g.lt0) / self.g.dlt
@@ -888,6 +898,20 @@ def build_atomic_table(Z, A, I_eV, edges_eV, rho=None, T_eV=None, lines=None, no
                 group_edges_eV=edges, Zbar_lte=zb_l, Zbar_nlte=zb_n, Z=Z, A=A, source=src)
 
 
+def tops_table_path(element):
+    """the bundled Los Alamos TOPS table for an element (aegis/data/atomic/tops_<el>_table.npz): grey kappa_R,
+    kappa_P, Z_free and 6 group means at TOPS's temperatures (0.5 eV - 100 keV) on an adaptive density grid
+    (1e-6 - 100 g/cc), within 2% of TOPS between its densities (examples/tops_table_accuracy.py). Use it as
+    fld_opacity_table or fld_mg_table. Other elements and mixtures with Z <= 30: python tools/atomic_importer.py --tops.
+    TOPS stops at Z = 30, so there is no such table for Au or Pb; build_atomic_table's model is unbenchmarked there."""
+    import os
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "atomic", f"tops_{element.lower()}_table.npz")
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"no bundled TOPS table for {element}: make one with python tools/atomic_importer.py "
+                                f"--tops {element} (Z <= 30 only)")
+    return p
+
+
 def tops_groups_to_table(rows, edges_eV, n_rho=None, n_T=None):
     """a table in the fld_mg_table format from parsed TOPS group output (tools/atomic_importer.parse_tops_groups),
     resampled log-linearly onto a log-uniform rho x T grid for GroupOpacityTable"""
@@ -934,41 +958,103 @@ extern "C" __global__ void group_lookup(const double* __restrict__ rho, const do
     }
 }
 """
-_GROUP_K = []
+_GROUP_NU_SRC = r"""
+__device__ int seg(const double* __restrict__ x, int n, double v) {      // x[i] <= v < x[i + 1], clamped
+    if (v <= x[0]) return 0;
+    if (v >= x[n - 1]) return n - 2;
+    int lo = 0, hi = n - 1;
+    while (hi - lo > 1) { int m = (lo + hi) >> 1; if (x[m] <= v) lo = m; else hi = m; }
+    return lo;
+}
+extern "C" __global__ void group_lookup_nu(const double* __restrict__ rho, const double* __restrict__ th,
+                                           const double* __restrict__ KR, const double* __restrict__ KP,
+                                           double* __restrict__ oR, double* __restrict__ oP, const long N, const int G,
+                                           const int nr, const int nt, const double* __restrict__ LR,
+                                           const double* __restrict__ LT, const double T1) {
+    long c = (long)blockDim.x * blockIdx.x + threadIdx.x;
+    if (c >= N) return;
+    double lr = log10(fmax(rho[c], 1e-300)), lt = log10(fmax(th[c] * T1, 1e-300));
+    int i = seg(LR, nr, lr), j = seg(LT, nt, lt);
+    double a = fmin(fmax((lr - LR[i]) / (LR[i + 1] - LR[i]), 0.0), 1.0);
+    double b = fmin(fmax((lt - LT[j]) / (LT[j + 1] - LT[j]), 0.0), 1.0);
+    double w00 = (1 - a) * (1 - b), w10 = a * (1 - b), w01 = (1 - a) * b, w11 = a * b;
+    for (long g = 0; g < G; g++) {
+        long o = g * nr * nt + (long)i * nt + j;
+        oR[g * N + c] = pow(10.0, w00 * KR[o] + w10 * KR[o + nt] + w01 * KR[o + 1] + w11 * KR[o + nt + 1]);
+        oP[g * N + c] = pow(10.0, w00 * KP[o] + w10 * KP[o + nt] + w01 * KP[o + 1] + w11 * KP[o + nt + 1]);
+    }
+}
+"""
+_GROUP_K = {}
 
 
-def _group_kernel():
-    if not _GROUP_K:
+def _group_kernel(nonuniform=False):
+    if nonuniform not in _GROUP_K:
         import cupy as cp
-        _GROUP_K.append(cp.RawKernel(_GROUP_SRC, "group_lookup"))
-    return _GROUP_K[0]
+        _GROUP_K[nonuniform] = (cp.RawKernel(_GROUP_NU_SRC, "group_lookup_nu") if nonuniform
+                                else cp.RawKernel(_GROUP_SRC, "group_lookup"))
+    return _GROUP_K[nonuniform]
+
+
+def _log_uniform(x):
+    lx = np.log10(np.asarray(x, float))
+    return len(lx) > 1 and bool(np.allclose(np.diff(lx), lx[1] - lx[0], rtol=1e-6, atol=1e-12))
+
+
+def _seg_host(x, v):
+    """host twin of the kernel's seg(): interval index and clamped weight"""
+    i = np.clip(np.searchsorted(x, v, side="right") - 1, 0, len(x) - 2)
+    return i, np.clip((v - x[i]) / (x[i + 1] - x[i]), 0.0, 1.0)
 
 
 class GroupOpacityTable:
     """every group's (kappa_P, kappa_R) at once from one device array: bilinear in (log rho, log T), clamped to the
-    table, in code units as OpacityTable. One vectorised lookup instead of one table lookup per group."""
+    table, in code units as OpacityTable. One vectorised lookup instead of one table lookup per group. The axes may be
+    uneven (TOPS's own temperatures, an adaptive density grid): the interval is then found by bisection, and a lookup
+    at a table node returns the tabulated value exactly."""
 
     def __init__(self, data, rho_unit, L0, T1):
         rho, T = np.asarray(data["rho"], float) / rho_unit, np.asarray(data["T"], float)
         self.lr, self.lt = np.log10(rho), np.log10(T)
         self.nr, self.nt = len(rho), len(T)
-        if not (np.allclose(np.diff(self.lr), self.lr[1] - self.lr[0]) and np.allclose(np.diff(self.lt), self.lt[1] - self.lt[0])):
-            raise ValueError("GroupOpacityTable needs log-uniform rho and T")
+        if np.any(np.diff(self.lr) <= 0) or np.any(np.diff(self.lt) <= 0):
+            raise ValueError("GroupOpacityTable needs increasing rho and T")
+        self.uniform = _log_uniform(rho) and _log_uniform(T)
         self.dlr, self.dlt = self.lr[1] - self.lr[0], self.lt[1] - self.lt[0]
         s = rho_unit * L0
         self.kR = xp.ascontiguousarray(xp.asarray(np.log10(np.maximum(data["kappa_R_g"], 1e-300) * s)))
         self.kP = xp.ascontiguousarray(xp.asarray(np.log10(np.maximum(data["kappa_P_g"], 1e-300) * s)))
+        self.LR, self.LT = xp.asarray(self.lr), xp.asarray(self.lt)
         self.T1 = T1
 
     def __call__(self, rho, theta):
         """(kappa_R, kappa_P), arrays (G, ...), one kernel launch"""
+        if xp is np:
+            return self._host(np.asarray(rho, float), np.asarray(theta, float))
         rho, theta = xp.ascontiguousarray(rho), xp.ascontiguousarray(theta)
         G, N = self.kR.shape[0], rho.size
         oR, oP = xp.empty((G,) + rho.shape), xp.empty((G,) + rho.shape)
-        _group_kernel()(((N + 255) // 256,), (256,),
-                        (rho, theta, self.kR, self.kP, oR, oP, np.int64(N), np.int32(G), np.int32(self.nr), np.int32(self.nt),
-                         float(self.lr[0]), float(self.dlr), float(self.lt[0]), float(self.dlt), float(self.T1)))
+        if self.uniform:
+            _group_kernel()(((N + 255) // 256,), (256,),
+                            (rho, theta, self.kR, self.kP, oR, oP, np.int64(N), np.int32(G), np.int32(self.nr),
+                             np.int32(self.nt), float(self.lr[0]), float(self.dlr), float(self.lt[0]), float(self.dlt),
+                             float(self.T1)))
+        else:
+            _group_kernel(True)(((N + 255) // 256,), (256,),
+                                (rho, theta, self.kR, self.kP, oR, oP, np.int64(N), np.int32(G), np.int32(self.nr),
+                                 np.int32(self.nt), self.LR, self.LT, float(self.T1)))
         return oR, oP
+
+    def _host(self, rho, theta):
+        """NumPy path (no GPU): the same piecewise log-bilinear lookup"""
+        i, a = _seg_host(self.lr, np.log10(np.maximum(rho, 1e-300)))
+        j, b = _seg_host(self.lt, np.log10(np.maximum(theta * self.T1, 1e-300)))
+
+        def ev(K):
+            K = K.get() if hasattr(K, "get") else K
+            return 10 ** ((1 - a) * (1 - b) * K[:, i, j] + a * (1 - b) * K[:, i + 1, j] + (1 - a) * b * K[:, i, j + 1]
+                          + a * b * K[:, i + 1, j + 1])
+        return ev(self.kR), ev(self.kP)
 
 
 class IonizationTable:
